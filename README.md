@@ -41,12 +41,12 @@ only thing that stops a release from shipping under the wrong major.
 - **A data refresh is reviewable.** It is a pull request whose diff is the new
   `index.db`, so the file reviewed is the file published.
 
-**Measured cost (2026-09-12):**
+**Measured cost, for the `3.0.0` index (2026-09-12):**
 
 | Measurement | Size |
 |---|---|
-| `index.db` on disk | 18,038,784 bytes |
-| One committed build, as a git pack | 5.35 MiB |
+| `index.db` on disk | 18,042,880 bytes |
+| One committed build, as a git pack | 5.36 MiB |
 | The npm tarball | 5.38 MiB |
 | A second real build added to the same repository, after `git gc --aggressive` | +0.48 MiB |
 
@@ -71,7 +71,13 @@ reproduced byte for byte. Three values identify it:
 - `generate_time` in the same table, which records when the index was generated.
   It is a timestamp, not a wiki revision. The generator records no revision.
 
-To read them:
+What each release was built from:
+
+| Release | Generator `version` | `generate_time` |
+|---|---|---|
+| `3.0.0` | `9.0.0` | `2026-09-12T19:53:53.020856+00:00` |
+
+To read them from any index:
 
 ```bash
 node -e "const { DatabaseSync } = require('node:sqlite'); const db = new DatabaseSync('index.db', { readOnly: true }); console.log(db.prepare(\"select key, value from database_info where key in ('version', 'generate_time')\").all())"
@@ -88,18 +94,26 @@ Those gates cover coverage, parse failures, image resolution and spell shapes, a
 they are defined and tested in the server. They are not repeated here.
 
 ```bash
-TIBIAWIKI_MCP_DB="$PWD/index.db" pnpm exec tibiawiki-mcp build-index
+pnpm build-index
 ```
 
+That builds `dist/`, then `scripts/build.ts` runs the devDependency's
+`tibiawiki-mcp build-index` with `TIBIAWIKI_MCP_DB` set to `DB_PATH`, so the build
+writes exactly the file this package ships and exports.
+
 `build-index` needs [`uv`](https://docs.astral.sh/uv/) and network access to
-TibiaWiki. It validates the new index before replacing `index.db`. While it works,
-it writes `.tibiawiki.db.<pid>.<hex>.tmp` next to the target. `.gitignore` excludes
-that file, and must never exclude `index.db`.
+TibiaWiki. It validates the new index before replacing `index.db`, so a build that
+trips a gate exits non-zero and leaves the committed `index.db` as it was. While it
+works, it writes `.tibiawiki.db.<pid>.<hex>.tmp` next to the target, and SQLite keeps
+its journal beside that. `.gitignore` excludes both, and must never exclude
+`index.db`. The `3.0.0` build took just under six minutes, most of it the generator's
+crawl.
 
 ## The devDependency on the server
 
 `@tibia.sh/tibiawiki-mcp` is a devDependency for two jobs: its `build-index` produces
-the index, and its `serve` validates it in `pnpm test`.
+the index, and its `serve` validates it, in `pnpm test` here and in `pnpm smoke`
+against an installed copy.
 
 **When to bump it.** On a `0.x` version, `^0.1.0` means `>=0.1.0 <0.2.0`. Left alone,
 it pins every rebuild to the 0.1 generator and its gates while the server moves on.
@@ -128,8 +142,9 @@ pnpm test
 `pnpm test` does three things, in this order:
 
 1. It builds `dist/`.
-2. It typechecks. This must come after the build: the test imports this package by
-   its own name, so it typechecks against the built declarations, as a consumer does.
+2. It typechecks `src/`, `test/` and `scripts/`, the JavaScript in `scripts/`
+   included. This must come after the build: the test imports this package by its own
+   name, so it typechecks against the built declarations, as a consumer does.
 3. It runs `test/data.test.ts`. That test spawns the server from the devDependency
    against `index.db`, and makes a real query.
 
@@ -143,6 +158,20 @@ run scripts until you do.
 The tarball ships `index.db` and `dist/`, plus the `package.json`, `README.md` and
 `LICENSE` that npm always adds. `@tibia.sh/*` packages are exempt from this
 repository's seven-day install cooldown. `pnpm-workspace.yaml` says why.
+
+### Checking a release, before and after publishing
+
+```bash
+pnpm smoke ./tibia.sh-tibiawiki-data-3.0.0.tgz   # a packed tarball, before publishing
+pnpm smoke @tibia.sh/tibiawiki-data@3.0.0        # the published version, after
+```
+
+`pnpm smoke` installs the package under test into a throwaway directory, together with
+the server and the MCP client at the versions `package.json` names, and runs
+`test/data.test.ts` there. Inside that directory the test's imports land on the
+installed package and it spawns the installed server, so it checks the artefact rather
+than this checkout. That is why the test file imports only node builtins and packages
+by name.
 
 ## Licence
 

@@ -32,6 +32,8 @@
     "typecheck": "tsc --noEmit",
     "build": "tsc -p tsconfig.build.json",
     "test": "pnpm build && pnpm typecheck && node --test test/*.test.ts",
+    "build-index": "pnpm build && node scripts/build.ts",
+    "smoke": "node scripts/smoke.mjs",
     "prepublishOnly": "pnpm test"
   },
   "devDependencies": {

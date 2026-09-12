@@ -1,3 +1,13 @@
+/**
+ * The package's contract, checked through the published server.
+ *
+ * `pnpm test` runs this file against this checkout. scripts/smoke.mjs copies it
+ * unchanged beside an installed tarball or registry version and runs it there. The
+ * same imports then land on the installed package and the installed server. So this
+ * file imports only node builtins and packages by name, and reaches the server through
+ * ../node_modules/.bin. A relative import would break the smoke check. A path into this
+ * repository would make it quietly check this checkout instead of the artefact.
+ */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
@@ -84,9 +94,11 @@ test('the published server serves the shipped index and answers a real query', a
  * reason: derived from package.json, this would compare a value with itself.
  */
 test('SCHEMA_VERSION is the package major version', () => {
-  const { version } = JSON.parse(
-    readFileSync(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8'),
-  ) as { version: string };
+  // The manifest of the package under test, found through the package's own entry
+  // point (dist/index.js, one level below it). The file beside this test is only the
+  // same file in this checkout. Where the smoke check runs, it is the scratch consumer's.
+  const manifest = new URL('../package.json', import.meta.resolve('@tibia.sh/tibiawiki-data'));
+  const { version } = JSON.parse(readFileSync(manifest, 'utf8')) as { version: string };
   assert.equal(SCHEMA_VERSION, Number(version.split('.')[0]),
     `package.json is at ${version}, but SCHEMA_VERSION is ${SCHEMA_VERSION}`);
 });
