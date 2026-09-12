@@ -1,0 +1,43 @@
+{
+  "name": "@tibia.sh/tibiawiki-data",
+  "version": "3.0.0",
+  "description": "The prebuilt TibiaWiki index served by @tibia.sh/tibiawiki-mcp. Its major version is the index schema version.",
+  "type": "module",
+  "license": "(CC-BY-SA-3.0 AND MIT)",
+  "homepage": "https://tibia.sh",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tibia-sh/tibiawiki-data.git"
+  },
+  "bugs": {
+    "url": "https://github.com/tibia-sh/tibiawiki-data/issues"
+  },
+  "packageManager": "pnpm@10.33.0",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./index.db": "./index.db"
+  },
+  "types": "./dist/index.d.ts",
+  "files": [
+    "index.db",
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "tsc -p tsconfig.build.json",
+    "test": "pnpm build && pnpm typecheck && node --test test/*.test.ts",
+    "prepublishOnly": "pnpm test"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/client": "2.0.0",
+    "@tibia.sh/tibiawiki-mcp": "^0.1.0",
+    "@types/node": "24.13.3",
+    "typescript": "7.0.2"
+  }
+}

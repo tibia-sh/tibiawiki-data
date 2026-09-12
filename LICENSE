@@ -1,0 +1,56 @@
+@tibia.sh/tibiawiki-data contains two works under two licences: the TibiaWiki
+index (index.db), under CC BY-SA 3.0 Unported, and the JavaScript module that
+locates it (dist/), under MIT.
+
+
+1. The index: index.db
+======================
+
+index.db is an adaptation of text from TibiaWiki (https://tibia.fandom.com),
+written by TibiaWiki and its contributors. Its content comes from wiki pages,
+each found at https://tibia.fandom.com/wiki/ followed by the page title with
+spaces replaced by underscores. A page's history credits its authors.
+
+TibiaWiki licenses its text under Fandom's licensing terms
+(https://www.fandom.com/licensing): Creative Commons Attribution-ShareAlike 3.0
+Unported (CC BY-SA 3.0). Its own copyright page is
+https://tibia.fandom.com/wiki/TibiaWiki:Copyrights. This adaptation is released
+under the same licence, CC BY-SA 3.0 Unported:
+
+  https://creativecommons.org/licenses/by-sa/3.0/
+
+What was changed: the wiki's page wikitext was parsed into SQLite tables by
+tibiawiki-sql. Derived data was then added: creature ability area grids, spell
+area shapes decoded from the wiki's own animations, and links to the wiki's
+images. The images themselves are not included.
+
+Tibia and its game content are copyright CipSoft GmbH. Those rights are not
+TibiaWiki's to license, and nothing in this package licenses them.
+
+The index is provided as is, without warranty of any kind.
+
+
+2. The JavaScript module: dist/
+===============================
+
+MIT License
+
+Copyright (c) 2026 Jakub Mucha
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

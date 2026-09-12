@@ -1,0 +1,155 @@
+# tibiawiki-data
+
+The prebuilt TibiaWiki index served by
+[`@tibia.sh/tibiawiki-mcp`](https://github.com/tibia-sh/tibiawiki-mcp). It is one
+SQLite file, plus a module that gives its path and its schema version.
+
+## Use
+
+```js
+import { DB_PATH, SCHEMA_VERSION } from '@tibia.sh/tibiawiki-data';
+```
+
+- `DB_PATH` is the absolute path to `index.db` inside the installed package.
+- `SCHEMA_VERSION` is the index's enrichment schema version (its `mcp_schema_version`
+  row), and always equals this package's major version.
+
+The file is also exported as the subpath `@tibia.sh/tibiawiki-data/index.db`. The
+server finds the packaged index by resolving that subpath, so it must stay in
+`exports`. Without it, Node throws `ERR_PACKAGE_PATH_NOT_EXPORTED`.
+
+## The major version is the schema version
+
+The first release is `3.0.0`, not `1.0.0`, because the server's `MCP_SCHEMA_VERSION`
+is `3`. Do not reset it. A server that reads schema N depends on `^N`, so npm refuses
+to install an index the server cannot read. Without that, the server would only find
+out at startup, and would then answer every query with an error. Releases within a
+major are data refreshes of the same schema.
+
+`SCHEMA_VERSION` is a literal in `src/index.ts`, and `pnpm test` asserts that it
+equals both the `package.json` major and the index's `mcp_schema_version` row.
+Change all three together. The literal is deliberate. Derived from `package.json`,
+that assertion would compare a value with itself and could never fail, and it is the
+only thing that stops a release from shipping under the wrong major.
+
+## Why the index is committed
+
+`index.db` is committed to this repository in plain git.
+
+- **A fresh clone is a complete package.** It has an index to test and to pack, so
+  publishing a release packs the committed file and never needs a crawl.
+- **A data refresh is reviewable.** It is a pull request whose diff is the new
+  `index.db`, so the file reviewed is the file published.
+
+**Measured cost (2026-09-12):**
+
+| Measurement | Size |
+|---|---|
+| `index.db` on disk | 18,038,784 bytes |
+| One committed build, as a git pack | 5.35 MiB |
+| The npm tarball | 5.38 MiB |
+| A second real build added to the same repository, after `git gc --aggressive` | +0.48 MiB |
+
+SQLite does not diff as text, but git's binary deltas are effective on it. The second
+build was generated the same day as the first, so a refresh after a week of wiki
+edits may delta less well. Budget for a full 5.4 MiB per committed refresh as the
+upper bound.
+
+**Why not Git LFS.** Plain git is self-contained: there is no LFS storage or bandwidth
+quota, every checkout gets the index without extra configuration, and a clone is
+everything needed to test and pack. Move to LFS only if clone times become a real
+complaint.
+
+## Identifying a release
+
+A release is a snapshot of a wiki that keeps changing. It can be identified, but not
+reproduced byte for byte. Three values identify it:
+
+- the package version;
+- `version` in the index's `database_info` table, which is the tibiawiki-sql
+  generator version;
+- `generate_time` in the same table, which records when the index was generated.
+  It is a timestamp, not a wiki revision. The generator records no revision.
+
+To read them:
+
+```bash
+node -e "const { DatabaseSync } = require('node:sqlite'); const db = new DatabaseSync('index.db', { readOnly: true }); console.log(db.prepare(\"select key, value from database_info where key in ('version', 'generate_time')\").all())"
+```
+
+The server reports the same two values. Its MCP instructions name both, and every
+tool response carries `generate_time` as `indexGeneratedAt`.
+
+## How the index is built
+
+The index is built by the server's own `build-index` command, run from this
+repository's devDependency. The server's gates decide whether a build is good enough.
+Those gates cover coverage, parse failures, image resolution and spell shapes, and
+they are defined and tested in the server. They are not repeated here.
+
+```bash
+TIBIAWIKI_MCP_DB="$PWD/index.db" pnpm exec tibiawiki-mcp build-index
+```
+
+`build-index` needs [`uv`](https://docs.astral.sh/uv/) and network access to
+TibiaWiki. It validates the new index before replacing `index.db`. While it works,
+it writes `.tibiawiki.db.<pid>.<hex>.tmp` next to the target. `.gitignore` excludes
+that file, and must never exclude `index.db`.
+
+## The devDependency on the server
+
+`@tibia.sh/tibiawiki-mcp` is a devDependency for two jobs: its `build-index` produces
+the index, and its `serve` validates it in `pnpm test`.
+
+**When to bump it.** On a `0.x` version, `^0.1.0` means `>=0.1.0 <0.2.0`. Left alone,
+it pins every rebuild to the 0.1 generator and its gates while the server moves on.
+Bump it whenever the server's indexer changes: `build-index`, its enrichment, its
+gates, or the schema. Write the new range by hand. This repository saves exact
+versions, so `pnpm add` records a pin instead.
+
+**The dependency cycle is intentional.** The server depends on this package, and this
+package devDepends on the server. npm and pnpm allow it because this side is
+dev-only and never resolved at runtime. Do not "fix" it. Once the server depends on
+this package, `node_modules` here also holds a published copy of this package,
+installed as the server's dependency. The server's default index resolution could
+find that copy instead of `index.db`. So the test always passes `TIBIAWIKI_MCP_DB`
+explicitly, and checks that the answer's `indexGeneratedAt` matches `index.db`.
+
+## Development
+
+Requires Node 22.18 or later, because the tests run TypeScript directly, and pnpm
+10.33.0, pinned in `packageManager`.
+
+```bash
+pnpm install --frozen-lockfile
+pnpm test
+```
+
+`pnpm test` does three things, in this order:
+
+1. It builds `dist/`.
+2. It typechecks. This must come after the build: the test imports this package by
+   its own name, so it typechecks against the built declarations, as a consumer does.
+3. It runs `test/data.test.ts`. That test spawns the server from the devDependency
+   against `index.db`, and makes a real query.
+
+`prepublishOnly` runs `pnpm test` too, so publishing from the directory always builds
+`dist/` first.
+
+After changing `version` in `package.json`, run `pnpm install` before `pnpm test`.
+`verifyDepsBeforeRun` treats a version change as a workspace change and refuses to
+run scripts until you do.
+
+The tarball ships `index.db` and `dist/`, plus the `package.json`, `README.md` and
+`LICENSE` that npm always adds. `@tibia.sh/*` packages are exempt from this
+repository's seven-day install cooldown. `pnpm-workspace.yaml` says why.
+
+## Licence
+
+`index.db` is adapted from TibiaWiki (https://tibia.fandom.com), whose text is
+licensed [CC BY-SA 3.0 Unported](https://creativecommons.org/licenses/by-sa/3.0/)
+by TibiaWiki and its contributors, and it is released under the same licence. Tibia
+is made by CipSoft, and its game content is copyright CipSoft GmbH. The index is
+generated by [tibiawiki-sql](https://github.com/Galarzaa90/tibiawiki-sql).
+
+The JavaScript module in `dist/` is MIT licensed. See `LICENSE` for both.
