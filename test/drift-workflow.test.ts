@@ -157,6 +157,15 @@ test('neither job restores or saves a cache', () => {
   assert.match(uvs[0]!, /^ *enable-cache: *false$/m, 'setup-uv caches');
 });
 
+test('the build job installs an exact uv version', () => {
+  // setup-uv checks a download only against the checksums it ships, which stop at the uv
+  // versions out when that setup-uv was released. It skips the check for any later uv, and
+  // `latest` or a range can resolve to one.
+  const uvs = steps(buildJob()).filter((step) => /uses: *astral-sh\/setup-uv@/.test(step));
+  assert.equal(uvs.length, 1, 'expected one setup-uv, in the build job');
+  assert.match(uvs[0]!, /^ *version: *'?\d+\.\d+\.\d+'?$/m, 'setup-uv does not install an exact uv version');
+});
+
 test('the build job digests the committed index before build-index overwrites it', () => {
   const list = steps(buildJob());
   const committed = stepIndex(list, 'committed');
