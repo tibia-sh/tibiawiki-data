@@ -31,4 +31,4 @@ A push right after a publish can also read a version list from before that publi
 
 ## Schema bumps
 
-A schema bump publishes one release by hand, outside this workflow. Follow [Bumping the schema version](../README.md#bumping-the-schema-version).
+A schema bump publishes one release by hand, outside this workflow. That release has no trusted publisher, so pnpm refuses it in both repositories until each excludes it from its trust policy. Follow [Bumping the schema version](../README.md#bumping-the-schema-version).

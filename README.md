@@ -260,29 +260,64 @@ pipeline. It is this package, because no published server installs `N.0.0`. Serv
    `npm pack`, or the tarball carries a stale `dist/` or none.
 2. The maintainer publishes this package's `N.0.0` by hand, from the validated tarball.
    `npm publish` runs no lifecycle scripts for a tarball, so step 1 is the only gate it
-   gets. The release carries no provenance.
+   gets. The release carries no provenance and no trusted publisher.
 3. The server's pull request sets `MCP_SCHEMA_VERSION` to N and its dependency range to
-   `^N`. Its CI passes against the registry, and its release PR publishes it through the
+   `^N`. It also adds `trustPolicyExclude` for exactly `@tibia.sh/tibiawiki-data@N.0.0`
+   to the server's `pnpm-workspace.yaml`, with the reason in a comment:
+
+   ```yaml
+   # @tibia.sh/tibiawiki-data N.0.0 was published by hand, so it has no trusted publisher.
+   trustPolicyExclude:
+     - '@tibia.sh/tibiawiki-data@N.0.0'
+   ```
+
+   Its CI passes against the registry, and its release PR publishes it through the
    server's pipeline.
 4. This repository's pull request commits that exact `index.db`, with `SCHEMA_VERSION` N,
-   `version` `N.0.0`, and the devDependency moved to the new server. Its CI passes, and
-   merging it publishes nothing, because npm already has `N.0.0`.
+   `version` `N.0.0`, and the devDependency moved to the new server. The new server
+   depends on `^N`, so the install here resolves the hand-published `N.0.0` too, and the
+   pull request adds the same exclude to this repository's `pnpm-workspace.yaml`. Its CI
+   passes, and merging it publishes nothing, because npm already has `N.0.0`.
 
 Do not merge a data refresh here between steps 2 and 4. `main` is still on N-1 then, and
 npm refuses to publish a version below `N.0.0` without a dist-tag, so its release run
 fails.
 
+Both repositories set `trustPolicy: no-downgrade`, which makes pnpm refuse a version with
+weaker trust evidence than any version published before it. The release workflow publishes
+with a trusted publisher, and a publish by hand has none. So once npm has a release of this
+package from the release workflow, an install that resolves `N.0.0` without the exclude
+fails with `ERR_PNPM_TRUST_DOWNGRADE`. pnpm reads only the first `trustPolicyExclude` entry
+that names a package, so keep one entry for it.
+
+Once npm has `N.0.1` or later from the release workflow, remove both excludes. In each
+repository, remove it in the pull request that moves the lockfile off `N.0.0` with
+`pnpm update @tibia.sh/tibiawiki-data --no-save`. Without `--no-save`, pnpm also raises the
+server's `^N` to the new version, such as `^N.0.1`, and the server's
+`test/data-package.test.ts` rejects that. Without the exclude, a lockfile still on `N.0.0`
+fails the next `pnpm dedupe`.
+
 **Verify the deadlock before relying on this.** On a scratch branch, set the server's
 `MCP_SCHEMA_VERSION` to N: its `test/data-package.test.ts` and regression sweep must
 fail. Here, set `SCHEMA_VERSION` and `version` to N against the schema-(N-1)
 devDependency: the suite must fail before anything is published. If either suite passes,
-it is not checking what this procedure assumes, so stop and find out why.
+it is not checking what this procedure assumes, so stop and find out why. Once npm has a
+release of this package from the release workflow, the server's install of the
+hand-published `N.0.0` fails with `ERR_PNPM_TRUST_DOWNGRADE` without the exclude from
+step 3. Do not try to reproduce that against the real registry, because it takes a real
+publish by hand.
 
 This repository's half was checked on 2026-09-13 for N = 4, on a clone. `pnpm test`
 fails at `the shipped index carries SCHEMA_VERSION`. With the index's
 `mcp_schema_version` row set to 4 as well, it fails at the server test instead, because
 the schema-3 server refuses a schema-4 index. Either way `npm publish` stops in
 `prepublishOnly` and packs nothing.
+
+The trust failure was checked on 2026-09-13 with pnpm 10.33.0, against a local stand-in
+for the registry and never the real one. With `3.0.1` from a trusted publisher and `4.0.0`
+published by hand after it, the server's install of `^4` and this repository's install of
+a server that depends on `^4` both fail with `ERR_PNPM_TRUST_DOWNGRADE`. An exclude for
+exactly `@tibia.sh/tibiawiki-data@4.0.0` lets both through.
 
 ## Licence
 
