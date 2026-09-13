@@ -24,12 +24,22 @@ const PUBLISH_GATE = `\${{ steps.${CHECK_ID}.outputs.publish == 'true' }}`;
 
 /**
  * Runs the existence check the way a runner does, in a checkout whose package.json has
- * `version`. The npm it finds first on PATH prints `npmStdout` and exits `npmExit`.
+ * `version`. The npm it finds first on PATH prints `npmStdout`, writes `npmStderr` to stderr
+ * and exits `npmExit`.
  */
-function runCheck({ version, npmStdout, npmExit }: { version: string; npmStdout: string; npmExit: number }) {
+function runCheck({ version, npmStdout, npmStderr = '', npmExit }: {
+  version: string;
+  npmStdout: string;
+  npmStderr?: string;
+  npmExit: number;
+}) {
   return runStep(stepScript(workflow(), CHECK_ID), {
     files: { 'package.json': JSON.stringify({ name: '@tibia.sh/tibiawiki-data', version }) },
-    commands: { npm: `process.stdout.write(${JSON.stringify(npmStdout)});\nprocess.exitCode = ${npmExit};\n` },
+    commands: {
+      npm: `process.stdout.write(${JSON.stringify(npmStdout)});\n` +
+        `process.stderr.write(${JSON.stringify(npmStderr)});\n` +
+        `process.exitCode = ${npmExit};\n`,
+    },
   });
 }
 
@@ -150,15 +160,26 @@ test('the existence check fails, and asks for nothing, when npm gives no version
   // A registry that cannot be read must end the run red, never read as a missing version.
   // The runner's default bash -e is what stops the script, so no step may swap the shell.
   assert.doesNotMatch(code(workflow()), /^ *shell:/m, 'a shell override can drop the -e the check relies on');
-  const replies: Array<[string, string, number]> = [
+  const version = '3.0.1';
+  // For a package the registry does not have, npm 12.0.2 exits 1 and reports E404 and Not Found
+  // on stderr and again as JSON on stdout, measured. This package is on npm already, so that
+  // answer never means a first release to publish.
+  const notFound = 'Not Found - GET https://registry.npmjs.org/@tibia.sh%2ftibiawiki-data - Not found';
+  const replies: Array<[string, string, number, string?]> = [
     ['npm cannot read the registry', '', 1],
+    ['npm answers E404', `${JSON.stringify({ error: { code: 'E404', summary: notFound } }, null, 2)}\n`, 1,
+      `npm error code E404\nnpm error 404 ${notFound}\n`],
     ['npm prints nothing, as it does for a registry answering {}', '', 0],
+    // Unlike nothing, {} parses, so the check itself has to reject it.
+    ['npm prints {}', '{}\n', 0],
     ['npm prints an empty list', '[]\n', 0],
     ['npm prints something other than a list', '"3.0.0"\n', 0],
+    // Unlike the string above, this one holds the version, so includes finds it there.
+    ['npm prints the version itself, not a list holding it', `"${version}"\n`, 0],
     ['npm prints what is not JSON', 'npm error\n', 0],
   ];
-  for (const [reply, npmStdout, npmExit] of replies) {
-    const run = runCheck({ version: '3.0.1', npmStdout, npmExit });
+  for (const [reply, npmStdout, npmExit, npmStderr] of replies) {
+    const run = runCheck({ version, npmStdout, npmStderr, npmExit });
     assert.notEqual(run.status, 0, `the check passed when ${reply}\n${run.log}`);
     assert.equal(run.output, '', `the check asked to publish when ${reply}`);
   }
