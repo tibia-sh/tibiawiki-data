@@ -26,15 +26,19 @@ import { DB_PATH } from '@tibia.sh/tibiawiki-data';
 const SERVER_BIN = fileURLToPath(new URL('../node_modules/.bin/tibiawiki-mcp', import.meta.url));
 
 /**
- * uvx resolves the generator's unpinned PyPI dependencies afresh on every build, so a
- * release waits out the same 7 days pnpm-workspace.yaml gives npm packages. It reaches uv
- * as UV_EXCLUDE_NEWER, and a UV_EXCLUDE_NEWER already in the environment wins.
+ * From 0.3.1 the server installs the generator from its own hash-locked requirements. That
+ * lock was compiled with a cutoff 7 days before its compile date, so every pin in it is
+ * already older than this cooldown and the cooldown changes nothing there. It stays as a
+ * backstop for a server older than 0.3.1, which resolves the generator's PyPI
+ * dependencies afresh on every build, so a release waits out the same 7 days
+ * pnpm-workspace.yaml gives npm packages. It reaches uv as UV_EXCLUDE_NEWER, and a
+ * UV_EXCLUDE_NEWER already in the environment wins.
  */
 const PYPI_COOLDOWN = '7 days';
 
 // The environment passes through and wins over the cooldown default: build-index shells
-// out to `uvx`, which needs PATH, its cache under HOME, and any proxy settings to reach
-// TibiaWiki.
+// out to `uv`, which needs PATH, its cache under HOME, and any proxy settings to reach
+// PyPI and TibiaWiki.
 const result = spawnSync(SERVER_BIN, ['build-index'], {
   stdio: 'inherit',
   env: { UV_EXCLUDE_NEWER: PYPI_COOLDOWN, ...process.env, TIBIAWIKI_MCP_DB: DB_PATH },
@@ -42,7 +46,7 @@ const result = spawnSync(SERVER_BIN, ['build-index'], {
 
 if (result.error) {
   // The binary itself could not start, so the devDependency is missing. A missing
-  // `uvx` does not land here: build-index runs and reports that itself.
+  // `uv` does not land here: build-index runs and reports that itself.
   process.stderr.write(
     `Could not run ${SERVER_BIN}: ${result.error.message}\n` +
       'Install the devDependencies with `pnpm install --frozen-lockfile`.\n',

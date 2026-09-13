@@ -41,9 +41,9 @@ function build(env: NodeJS.ProcessEnv) {
 }
 
 test('every build gives the generator the PyPI cooldown pnpm gives npm packages', () => {
-  // uvx resolves the generator's unpinned dependencies afresh on every build, and reads a
-  // relative duration from UV_EXCLUDE_NEWER. minimumReleaseAge in pnpm-workspace.yaml is
-  // this repository's cooldown, in minutes.
+  // A server older than 0.3.1 resolves the generator's dependencies afresh on every build,
+  // and uv reads a relative duration from UV_EXCLUDE_NEWER. minimumReleaseAge in
+  // pnpm-workspace.yaml is this repository's cooldown, in minutes.
   const workspace = readFileSync(new URL('../pnpm-workspace.yaml', import.meta.url), 'utf8');
   const minutes = Number(/^minimumReleaseAge: *(\d+)$/m.exec(workspace)?.[1]);
   assert.ok(minutes > 0, 'pnpm-workspace.yaml sets no minimumReleaseAge');
