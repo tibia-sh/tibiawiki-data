@@ -13,6 +13,9 @@ const workflow = (): string => read('release.yml');
 
 const releaseJob = (): string => under(under(code(workflow()), 'jobs'), 'release');
 
+/** The job that pages every item through the oldest published server before anything is published. */
+const gateJob = (): string => under(under(code(workflow()), 'jobs'), 'oldest-consumer');
+
 /** The release job's steps, one string per list item. */
 const releaseSteps = (): string[] => steps(releaseJob());
 
@@ -82,6 +85,33 @@ test('only a push to main runs the release workflow', () => {
   const push = under(on, 'push');
   assert.deepEqual(keys(push), ['branches'], 'the push trigger filters on more than its branch');
   assert.match(push, /^ *branches: *\[ *main *\]$/m, 'the push trigger is not limited to main');
+});
+
+test('the release job runs only after the oldest-consumer gate passes', () => {
+  // Without needs, the release job starts beside the gate and can publish before the gate fails.
+  // A condition on the release job, such as always(), runs it even when the gate failed.
+  assert.ok(keys(under(code(workflow()), 'jobs')).includes('oldest-consumer'), 'release.yml has no oldest-consumer job');
+  assert.equal(scalar(releaseJob(), 'needs'), 'oldest-consumer', 'the release job does not need the oldest-consumer job');
+  assert.equal(scalar(releaseJob(), 'if'), undefined, 'the release job has a condition, which can run it after the gate failed');
+});
+
+test('the oldest-consumer job holds exactly contents: read, and no id-token', () => {
+  // It runs a published server over the index, and publishes nothing.
+  const permissions = under(gateJob(), 'permissions');
+  assert.deepEqual(keys(permissions), ['contents'], 'the oldest-consumer job does not hold exactly one permission, contents');
+  assert.equal(scalar(permissions, 'contents'), 'read', 'the oldest-consumer job holds more than contents: read');
+  assert.doesNotMatch(gateJob(), /\bid-token\b/, 'the oldest-consumer job can mint an OIDC token');
+});
+
+test('the oldest-consumer job runs pnpm oldest-consumer unconditionally, bounded at 30 minutes', () => {
+  // A condition or continue-on-error on the job or on one of its steps can hide a failed or
+  // skipped sweep. The script's own bounds add up to 1170 s, and the rest of the half hour is
+  // checkout and setup.
+  assert.ok(steps(gateJob()).some((step) => /^ *(?:- +)?run: *pnpm oldest-consumer$/m.test(step)),
+    'the oldest-consumer job never runs pnpm oldest-consumer');
+  assert.doesNotMatch(gateJob(), /^ *(?:- +)?(?:if|continue-on-error):/m,
+    'the oldest-consumer job or one of its steps has a condition or continue-on-error');
+  assert.equal(scalar(gateJob(), 'timeout-minutes'), '30', 'the oldest-consumer job is not bounded at 30 minutes');
 });
 
 test('the release job can mint the OIDC token npm publish authenticates with', () => {
@@ -276,18 +306,20 @@ test('every step after the existence check is gated on it, and nothing before it
   assert.ok(after.some(installsFromLockfile), 'no gated step installs from the lockfile');
 });
 
-test('setup-node restores no dependency cache into the job that publishes', () => {
-  // A restored cache is input no one reviewed, in a job holding id-token: write. The pinned
-  // setup-node restores one by itself whenever package.json names a packageManager, so the
-  // input has to switch it off by name. The one cache the job keeps is pnpm/setup's
-  // lockfile-verification record, which holds no package. The action saves it right after its
-  // frozen install, and its post step tries again at the end of the job only when that save does
-  // not go through.
-  const setups = releaseSteps().filter((step) => /^ *(?:- +)?uses: *actions\/setup-node@/m.test(step));
-  assert.ok(setups.length > 0, 'the release job never sets up node');
-  for (const step of setups) {
-    assert.match(step, /^ *package-manager-cache: *false$/m, 'setup-node caches the package manager store');
-    assert.doesNotMatch(step, /^ *cache:/m, 'setup-node restores a dependency cache');
+test('setup-node restores no dependency cache into the job that publishes, or into its gate', () => {
+  // A restored cache is input no one reviewed, in a job holding id-token: write, or in the gate
+  // that decides whether that job publishes. The pinned setup-node restores one by itself whenever
+  // package.json names a packageManager, so the input has to switch it off by name. The one cache
+  // each job keeps is pnpm/setup's lockfile-verification record, which holds no package. The action
+  // saves it right after its frozen install, and its post step tries again at the end of the job
+  // only when that save does not go through.
+  for (const [job, jobSteps] of [['release', releaseSteps()], ['oldest-consumer', steps(gateJob())]] as const) {
+    const setups = jobSteps.filter((step) => /^ *(?:- +)?uses: *actions\/setup-node@/m.test(step));
+    assert.ok(setups.length > 0, `the ${job} job never sets up node`);
+    for (const step of setups) {
+      assert.match(step, /^ *package-manager-cache: *false$/m, `setup-node in the ${job} job caches the package manager store`);
+      assert.doesNotMatch(step, /^ *cache:/m, `setup-node in the ${job} job restores a dependency cache`);
+    }
   }
 });
 
