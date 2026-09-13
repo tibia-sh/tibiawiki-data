@@ -174,12 +174,17 @@ test('a failed install fails the smoke, shows npm\'s reason, and removes the scr
 });
 
 test('an install that ignores SIGTERM is killed at the time bound', () => {
-  const box = makeBox(1_000);
+  const bound = 1_000;
+  const box = makeBox(bound);
   try {
     const run = runSmoke(box, { FAKE_NPM: 'stubborn' });
     assert.equal(run.status, 1, `a hung install did not fail the smoke\n${run.output}`);
+    // Each of these rules out a fixture that failed early for some other reason.
+    assert.ok(entries(box).some((entry) => entry.role === 'npm'), 'the stubborn npm never started');
+    assert.match(run.output, /^spawnSync npm ETIMEDOUT$/m, `the install did not end on its time bound\n${run.output}`);
+    assert.ok(run.ms >= bound, `the smoke ended after ${run.ms} ms, before its ${bound} ms bound`);
     // SIGTERM alone would leave the smoke waiting until the fake npm gave up by itself.
-    assert.ok(run.ms < HANG_MS / 2, `the smoke took ${run.ms} ms against a 1000 ms bound, so the install was not killed`);
+    assert.ok(run.ms < HANG_MS / 2, `the smoke took ${run.ms} ms against a ${bound} ms bound, so the install was not killed`);
     assertScratchRemoved(box, run.output);
   } finally {
     rmSync(box.root, { recursive: true, force: true });
@@ -190,11 +195,15 @@ test('a check that hangs is stopped at the time bound', () => {
   // The bound is wider than the install's because the check's node --test has to start
   // first. The runner exits on SIGTERM by itself, measured on node 24.19.0, so this pins
   // the bound on this step, not the SIGKILL.
-  const box = makeBox(2_000);
+  const bound = 2_000;
+  const box = makeBox(bound);
   try {
     const run = runSmoke(box, { FAKE_NPM: 'ok', FAKE_CHECK: 'stubborn' });
     assert.equal(run.status, 1, `a hung check did not fail the smoke\n${run.output}`);
-    assert.ok(run.ms < HANG_MS / 2, `the smoke took ${run.ms} ms against a 2000 ms bound, so the check was not stopped`);
+    assert.ok(entries(box).some((entry) => entry.role === 'check'), 'the stubborn stand-in check never started');
+    assert.ok(run.output.includes(`spawnSync ${process.execPath} ETIMEDOUT`), `the check did not end on its time bound\n${run.output}`);
+    assert.ok(run.ms >= bound, `the smoke ended after ${run.ms} ms, before its ${bound} ms bound`);
+    assert.ok(run.ms < HANG_MS / 2, `the smoke took ${run.ms} ms against a ${bound} ms bound, so the check was not stopped`);
     assertScratchRemoved(box, run.output);
   } finally {
     rmSync(box.root, { recursive: true, force: true });
