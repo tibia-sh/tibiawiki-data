@@ -129,19 +129,19 @@ shows both digests.
 
 When the digests match, the run ends green and opens nothing. When they differ, the
 content changed. The run pushes the rebuilt `index.db` to the `drift/index` branch, with
-`version` set to the next patch npm does not have, and opens a pull request carrying both
+`version` set to the next patch npm does not have. It opens a pull request carrying both
 digests, or updates the one already open. Merging that pull request publishes the new
 patch.
 
 - The pull request is opened with `GITHUB_TOKEN`, so its CI waits for you. Click
   "Approve workflows to run" on it, then review the pull request before you merge it.
-- Nothing merges it for you. The workflow never merges and never turns on auto-merge, so
-  a bad day on the wiki can at most open a pull request.
-- A red run is a signal, not noise. A tripped gate, a failing test, an unreadable
-  registry, or a `version` on `main` that npm does not list yet each end the run red, and
-  nothing is pushed or opened. Find out why before the next run.
-- Each run that finds a change replaces `drift/index`, so a newer rebuild replaces the one
-  in an open pull request.
+- The workflow never merges and never turns on auto-merge, so a bad day on the wiki can at
+  most open a pull request.
+- A red run is a signal. A tripped gate, a failing test, an unreadable registry, or a
+  `version` on `main` that npm does not list yet each end the run red, and nothing is
+  pushed or opened. Find out why before the next run.
+- Each run that finds a change replaces `drift/index`, so an open pull request always
+  carries the newest rebuild.
 - GitHub turns off a schedule after 60 days without activity in a public repository, and
   that stops the job without a red run. Turn it back on from the Actions tab.
 
