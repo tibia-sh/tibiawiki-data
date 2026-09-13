@@ -43,6 +43,12 @@ export const under = (yaml: string, key: string): string => {
   return new RegExp(`^ {${depth}}${key}:\\n((?: {${depth + 1},}.*(?:\\n|$))*)`, 'm').exec(yaml)?.[1] ?? '';
 };
 
+/** A scalar key's value at a block's shallowest indentation. */
+export const scalar = (block: string, key: string): string | undefined => {
+  const depth = Math.min(...block.split('\n').filter((line) => line.trim() !== '').map((line) => line.search(/\S/)));
+  return new RegExp(`^ {${depth}}${key}: *(.*)$`, 'm').exec(block)?.[1];
+};
+
 /** The keys at a block's shallowest indentation, in order. */
 export const keys = (yaml: string): string[] => {
   const lines = yaml.split('\n').filter((line) => line.trim() !== '');
@@ -55,6 +61,22 @@ export const steps = (job: string): string[] => {
   const block = under(job, 'steps');
   const marker = /^ *- /.exec(block)?.[0];
   return marker ? block.split(new RegExp(`^(?=${marker})`, 'm')) : [];
+};
+
+/**
+ * The inputs under a step's `with:`, whichever of the step's keys sits on the `- ` line. The runner
+ * takes an input whose key is quoted, capitalised or followed by a space before its colon, and
+ * `scalar` finds none of those. So each input has to be a plain lowercase key, written once, or
+ * the calling test fails, and a check that an input is absent cannot pass on a spelling it misses.
+ */
+export const stepInputs = (step: string): string => {
+  const inputs = under(step.replace(/^( *)- /, '$1  '), 'with');
+  const names = keys(inputs);
+  for (const name of names) {
+    assert.match(name, /^[a-z][a-z0-9-]*$/, `${stepName(step)} has an input written in a form this test cannot read: ${name}`);
+  }
+  assert.equal(new Set(names).size, names.length, `${stepName(step)} sets an input more than once`);
+  return inputs;
 };
 
 /** A step's `if:`, whether it is the first key on the `- ` line or a later one. */

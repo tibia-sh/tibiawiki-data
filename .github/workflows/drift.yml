@@ -37,14 +37,21 @@ jobs:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
-      - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0
-      # No cache, restored or saved. A cache saved here would carry whatever the generator run
-      # left into later runs. This setup-node caches by itself whenever package.json names a
-      # packageManager, so it is switched off by name.
+      # No cache, restored or saved, but pnpm/setup's lockfile-verification record. A cache saved
+      # after the generator ran would carry whatever that run left into later runs. This setup-node
+      # caches by itself whenever package.json names a packageManager, so it is switched off by name.
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
-          node-version: '24'
+          node-version: '26'
           package-manager-cache: false
+      # Installs the pnpm that `packageManager` names, then runs `pnpm install --frozen-lockfile`.
+      # It leaves the pnpm store uncached, and saves its lockfile-verification record right after
+      # the install, before the generator runs. When that save does not go through, its post step
+      # tries again at the end of the job, after the generator.
+      - uses: pnpm/setup@703c52620218391530e48b9e8870d5c0082e1b9b # v2.1.0
+        with:
+          install: true
+          require-lockfile: true
       # build-index installs and runs the generator with uv. This setup-uv ships a checksum for uv 0.12.4
       # and installs no download that fails it. It has no checksum for a later uv, and skips the
       # check for one, so the version stays exact and no newer than the action.
@@ -52,7 +59,6 @@ jobs:
         with:
           version: '0.12.4'
           enable-cache: false
-      - run: pnpm install --frozen-lockfile
       # Before the build, which overwrites index.db in place.
       - name: Digest the committed index
         id: committed
@@ -128,7 +134,7 @@ jobs:
       # installs, and fail.
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
-          node-version: '24'
+          node-version: '26'
           package-manager-cache: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:

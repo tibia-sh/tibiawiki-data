@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { code, keys, read, runScripts, runStep, stepIf, stepIndex, stepName, steps, stepScript, under, workflowFiles } from './workflow.ts';
+import { code, keys, read, runScripts, runStep, scalar, stepIf, stepIndex, stepInputs, stepName, steps, stepScript, under, workflowFiles } from './workflow.ts';
 
 /**
  * The release workflow cannot run inside the suite, and a mistake in it surfaces only when
@@ -21,6 +21,30 @@ const CHECK_ID = 'registry';
 
 /** The condition every step after that check carries. */
 const PUBLISH_GATE = `\${{ steps.${CHECK_ID}.outputs.publish == 'true' }}`;
+
+const isPnpmSetup = (step: string): boolean => /^ *(?:- +)?uses: *pnpm\/setup@/m.test(step);
+
+/**
+ * Whether a step installs from the lockfile: a script running `pnpm install --frozen-lockfile`,
+ * or pnpm/setup with install and require-lockfile, which runs that command itself.
+ */
+const installsFromLockfile = (step: string): boolean =>
+  /\bpnpm install --frozen-lockfile\b/.test(step) ||
+  (isPnpmSetup(step) && scalar(stepInputs(step), 'install') === 'true' && scalar(stepInputs(step), 'require-lockfile') === 'true');
+
+/**
+ * Every pnpm/setup step in every workflow, with the file and the job it runs in. A pnpm/setup step
+ * these readers cannot find, such as one written as a flow mapping, fails the calling test.
+ */
+const pnpmSetupSteps = (): Array<{ file: string; job: string; step: string }> => {
+  const found = workflowFiles().flatMap((file) => {
+    const jobs = under(code(read(file)), 'jobs');
+    return keys(jobs).flatMap((job) => steps(under(jobs, job)).filter(isPnpmSetup).map((step) => ({ file, job, step })));
+  });
+  const written = workflowFiles().reduce((count, file) => count + code(read(file)).split('pnpm/setup@').length - 1, 0);
+  assert.equal(found.length, written, 'a pnpm/setup step is written in a form this test cannot read, such as a flow mapping');
+  return found;
+};
 
 /**
  * Runs the existence check the way a runner does, in a checkout whose package.json has
@@ -92,6 +116,36 @@ test('every action in every workflow is pinned to a full commit SHA', () => {
     }
   }
   assert.ok(code(workflow()).includes('uses:'), 'release.yml uses no actions, so this check proves nothing for it');
+});
+
+test('every pnpm/setup step in every workflow runs a frozen install, and takes the pnpm version and Node from elsewhere', () => {
+  // With install and require-lockfile, the action runs `pnpm install --frozen-lockfile` itself and
+  // saves its lockfile-verification record right after it. With `install: false` the record is
+  // saved only at the end of the job, after the generator and the tests. A version input would be
+  // a second source for the pnpm version beside packageManager. A runtime input would put a second
+  // Node on PATH, ahead of the one setup-node installs.
+  const setups = pnpmSetupSteps();
+  assert.ok(setups.length > 0, 'no workflow sets up pnpm with pnpm/setup, so this check proves nothing');
+  for (const { file, job, step } of setups) {
+    const inputs = stepInputs(step);
+    const where = `pnpm/setup in the ${job} job of ${file}`;
+    assert.equal(scalar(inputs, 'install'), 'true', `${where} does not set install: true`);
+    assert.equal(scalar(inputs, 'require-lockfile'), 'true', `${where} does not set require-lockfile: true`);
+    assert.equal(scalar(inputs, 'version'), undefined, `${where} sets a pnpm version beside packageManager`);
+    assert.equal(scalar(inputs, 'runtime'), undefined, `${where} installs a runtime`);
+  }
+});
+
+test('only the ci.yml test job caches the pnpm store', () => {
+  // pnpm/setup saves the store at the end of the job, after everything the job ran, and restores it
+  // in every job that asks. The ci.yml test job can only read the repository and publishes nothing.
+  // In the release job a restored store would be input no one reviewed, beside id-token: write, and
+  // the drift build job would save one after the generator ran.
+  const cached = pnpmSetupSteps().flatMap(({ file, job, step }) => {
+    const cache = scalar(stepInputs(step), 'cache');
+    return cache === undefined ? [] : [`${file} ${job} cache: ${cache}`];
+  });
+  assert.deepEqual(cached, ['ci.yml test cache: true'], 'pnpm/setup caches the store somewhere other than the ci.yml test job');
 });
 
 test('no run script in any workflow interpolates an expression', () => {
@@ -200,7 +254,8 @@ test('the release job checks out the commit that triggered the run', () => {
 
 test('every step after the existence check is gated on it, and nothing before it installs, tests or publishes', () => {
   // A merge that leaves version alone must publish nothing and stay green, and every later
-  // step is what would publish. Nothing that installs, tests or publishes may run first.
+  // step is what would publish. Nothing that installs, tests or publishes may run first, and
+  // pnpm/setup installs.
   const steps = releaseSteps();
   const check = stepIndex(steps, CHECK_ID);
   const after = steps.slice(check + 1);
@@ -208,20 +263,24 @@ test('every step after the existence check is gated on it, and nothing before it
     assert.equal(stepIf(step), PUBLISH_GATE, `${stepName(step)} is not gated on the existence check`);
   }
   for (const step of steps.slice(0, check)) {
-    assert.doesNotMatch(step, /\bnpm publish\b|\bpnpm (?:install|i|test)\b/, `${stepName(step)} runs before the existence check`);
+    assert.doesNotMatch(step, /\bnpm publish\b|\bpnpm (?:install|i|test)\b|uses: *pnpm\/setup@/,
+      `${stepName(step)} runs before the existence check`);
   }
   const publish = after.findIndex((step) => /\bnpm publish\b/.test(step));
   const suite = after.findIndex((step) => /\bpnpm test\b/.test(step));
   assert.notEqual(publish, -1, 'no gated step runs npm publish');
   assert.notEqual(suite, -1, 'no gated step runs pnpm test, the major-version guard');
   assert.ok(suite < publish, 'pnpm test runs after npm publish');
-  assert.ok(after.some((step) => /\bpnpm install --frozen-lockfile\b/.test(step)), 'no gated step installs from the lockfile');
+  assert.ok(after.some(installsFromLockfile), 'no gated step installs from the lockfile');
 });
 
 test('setup-node restores no dependency cache into the job that publishes', () => {
   // A restored cache is input no one reviewed, in a job holding id-token: write. The pinned
   // setup-node restores one by itself whenever package.json names a packageManager, so the
-  // input has to switch it off by name.
+  // input has to switch it off by name. The one cache the job keeps is pnpm/setup's
+  // lockfile-verification record, which holds no package. The action saves it right after its
+  // frozen install, and its post step tries again at the end of the job only when that save does
+  // not go through.
   const setups = releaseSteps().filter((step) => /^ *(?:- +)?uses: *actions\/setup-node@/m.test(step));
   assert.ok(setups.length > 0, 'the release job never sets up node');
   for (const step of setups) {
