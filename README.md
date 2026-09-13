@@ -176,7 +176,7 @@ explicitly, and checks that the answer's `indexGeneratedAt` matches `index.db`.
 ## Development
 
 Requires Node 22.18 or later, because the tests run TypeScript directly, and pnpm
-10.33.0, pinned in `packageManager`.
+12.4.1, pinned in `packageManager`.
 
 ```bash
 pnpm install --frozen-lockfile
@@ -303,7 +303,12 @@ repository, remove it in the pull request that moves the lockfile off `N.0.0` wi
 `pnpm update @tibia.sh/tibiawiki-data --no-save`. Without `--no-save`, pnpm also raises the
 server's `^N` to the new version, such as `^N.0.1`, and the server's
 `test/data-package.test.ts` rejects that. Without the exclude, a lockfile still on `N.0.0`
-fails the next `pnpm dedupe`.
+fails the next `pnpm dedupe`. pnpm 12.4.1 fails `update --no-save` with
+`ERR_PNPM_STRICT_MIN_RELEASE_AGE_REQUIRES_SAVE` whenever `minimumReleaseAge` is set
+([pnpm#14835](https://github.com/pnpm/pnpm/issues/14835)). Until `packageManager` names a
+pnpm with the fix, run `pnpm update @tibia.sh/tibiawiki-data` without `--no-save`, restore
+`^N` in the server's `package.json`, then run `pnpm install`. The lockfile moves and the range
+stays.
 
 **Verify the deadlock before relying on this.** On a scratch branch, set the server's
 `MCP_SCHEMA_VERSION` to N: its `test/data-package.test.ts` and regression sweep must
