@@ -116,11 +116,38 @@ is anything but `9.0.0`. The major version covers only the server's enrichment t
 and no version covers the tables tibiawiki-sql writes yet, so a rebuild with another
 generator waits until that is decided.
 
+### Drift
+
+`.github/workflows/drift.yml` rebuilds the index every Monday at 06:17 UTC, and when you
+run it by hand from the Actions tab. It digests the committed `index.db` with the
+devDependency's `tibiawiki-mcp index-digest`, runs `pnpm build-index`, digests the
+rebuilt index, and runs `pnpm test` against it. The digest covers what the server reads,
+and leaves out stamps that change on every run, such as `generate_time`. The run's log
+shows both digests.
+
+When the digests match, the run ends green and opens nothing. When they differ, the
+content changed. The run pushes the rebuilt `index.db` to the `drift/index` branch, with
+`version` set to the next patch npm does not have, and opens a pull request carrying both
+digests, or updates the one already open. Merging that pull request publishes the new
+patch.
+
+- The pull request is opened with `GITHUB_TOKEN`, so its CI waits for you. Click
+  "Approve workflows to run" on it, then review the pull request before you merge it.
+- Nothing merges it for you. The workflow never merges and never turns on auto-merge, so
+  a bad day on the wiki can at most open a pull request.
+- A red run is a signal, not noise. A tripped gate, a failing test, an unreadable
+  registry, or a `version` on `main` that npm does not list yet each end the run red, and
+  nothing is pushed or opened. Find out why before the next run.
+- Each run that finds a change replaces `drift/index`, so a newer rebuild replaces the one
+  in an open pull request.
+- GitHub turns off a schedule after 60 days without activity in a public repository, and
+  that stops the job without a red run. Turn it back on from the Actions tab.
+
 ## The devDependency on the server
 
-`@tibia.sh/tibiawiki-mcp` is a devDependency for two jobs: its `build-index` produces
-the index, and its `serve` validates it, in `pnpm test` here and in `pnpm smoke`
-against an installed copy.
+`@tibia.sh/tibiawiki-mcp` is a devDependency for three jobs: its `build-index` produces
+the index, its `index-digest` tells the drift job whether a rebuild changed it, and its
+`serve` validates it, in `pnpm test` here and in `pnpm smoke` against an installed copy.
 
 **When to bump it.** On a `0.x` version, `^0.3.0` means `>=0.3.0 <0.4.0`. Left alone,
 it pins every rebuild to the 0.3 generator and its gates while the server moves on.
@@ -154,7 +181,7 @@ pnpm test
    name, so it typechecks against the built declarations, as a consumer does.
 3. It runs every `test/*.test.ts`. `test/data.test.ts` spawns the server from the
    devDependency against `index.db`, and makes a real query. The other files check the
-   release workflow, the smoke check and the test floor, with no network.
+   release and drift workflows, the smoke check and the test floor, with no network.
 
 The run fails when fewer than `MIN_TESTS` tests pass. `node --test` still exits 0 for a
 file that declares no tests, for a skipped test, and for a `--test-name-pattern` that
