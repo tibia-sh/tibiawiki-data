@@ -1,6 +1,6 @@
 {
   "name": "@tibia.sh/tibiawiki-data",
-  "version": "3.0.0",
+  "version": "3.0.1",
   "description": "The prebuilt TibiaWiki index served by @tibia.sh/tibiawiki-mcp. Its major version is the index schema version.",
   "type": "module",
   "license": "(CC-BY-SA-3.0 AND MIT)",
