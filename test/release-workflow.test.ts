@@ -1,10 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
-import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { delimiter, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { code, keys, read, runScripts, runStep, stepIf, stepIndex, stepName, steps, stepScript, under, workflowFiles } from './workflow.ts';
 
 /**
  * The release workflow cannot run inside the suite, and a mistake in it surfaces only when
@@ -13,60 +9,12 @@ import { fileURLToPath } from 'node:url';
  * The existence check's decision is not, so its script runs here against a fake npm.
  */
 
-const root = fileURLToPath(new URL('..', import.meta.url));
-const WORKFLOWS = `${root}.github/workflows`;
-
-/** Every workflow in the repository, by file name. */
-const workflowFiles = (): string[] => readdirSync(WORKFLOWS).filter((name) => /\.ya?ml$/.test(name));
-const read = (name: string): string => readFileSync(`${WORKFLOWS}/${name}`, 'utf8');
 const workflow = (): string => read('release.yml');
-
-/**
- * A workflow without comments or blank lines. The prose in a comment names the very
- * things these tests look for, such as id-token: write, so a presence check against the
- * raw text would pass with the setting itself deleted. A YAML comment starts at a `#`
- * preceded by whitespace, and none of these workflows' values contain one.
- */
-const code = (yaml: string): string =>
-  yaml
-    .split('\n')
-    .map((line) => line.replace(/(^|\s)#.*$/, '').trimEnd())
-    .filter((line) => line !== '')
-    .join('\n');
-
-/**
- * The lines nested under `key:` where it is a direct child of `yaml`, a key at the block's
- * shallowest indentation, or '' when there is none. A deeper key of the same name, such as
- * a job's own `permissions:`, does not count.
- */
-const under = (yaml: string, key: string): string => {
-  const indents = yaml.split('\n').filter((line) => line.trim() !== '').map((line) => line.search(/\S/));
-  if (indents.length === 0) return '';
-  const depth = Math.min(...indents);
-  return new RegExp(`^ {${depth}}${key}:\\n((?: {${depth + 1},}.*(?:\\n|$))*)`, 'm').exec(yaml)?.[1] ?? '';
-};
-
-/** The keys at a block's shallowest indentation, in order. */
-const keys = (yaml: string): string[] => {
-  const lines = yaml.split('\n').filter((line) => line.trim() !== '');
-  const depth = Math.min(...lines.map((line) => line.search(/\S/)));
-  return lines.filter((line) => line.search(/\S/) === depth).map((line) => line.trim().replace(/:.*$/, ''));
-};
 
 const releaseJob = (): string => under(under(code(workflow()), 'jobs'), 'release');
 
 /** The release job's steps, one string per list item. */
-const releaseSteps = (): string[] => {
-  const steps = under(releaseJob(), 'steps');
-  const marker = /^ *- /.exec(steps)?.[0];
-  return marker ? steps.split(new RegExp(`^(?=${marker})`, 'm')) : [];
-};
-
-/** A step's `if:`, whether it is the first key on the `- ` line or a later one. */
-const stepIf = (step: string): string | undefined => /^ *(?:- +)?if: *(.*)$/m.exec(step)?.[1];
-
-const stepName = (step: string): string =>
-  /^ *(?:- +)?(?:name|id|uses|run): *(.*)$/m.exec(step)?.[1] ?? step.trim();
+const releaseSteps = (): string[] => steps(releaseJob());
 
 /** The step that asks the registry whether this version exists. Every publishing step waits on it. */
 const CHECK_ID = 'registry';
@@ -74,101 +22,16 @@ const CHECK_ID = 'registry';
 /** The condition every step after that check carries. */
 const PUBLISH_GATE = `\${{ steps.${CHECK_ID}.outputs.publish == 'true' }}`;
 
-/** The index of the existence check among the release job's steps. */
-const checkIndex = (steps: string[]): number => {
-  const matches = steps.flatMap((step, index) => (new RegExp(`^ *(?:- +)?id: *${CHECK_ID}$`, 'm').test(step) ? [index] : []));
-  assert.equal(matches.length, 1, `expected exactly one step with id: ${CHECK_ID}`);
-  return matches[0]!;
-};
-
 /**
- * The existence check's `run: |` script as the runner receives it: its lines from the raw
- * workflow, comments included, with the block's indentation removed.
- */
-const checkScript = (): string => {
-  const lines = workflow().split('\n');
-  const idLine = lines.findIndex((line) => new RegExp(`^ *(?:- +)?id: *${CHECK_ID}(?: +#.*)?$`).test(line));
-  assert.notEqual(idLine, -1, `no step has id: ${CHECK_ID}`);
-  let start = idLine;
-  while (start > 0 && !/^ *- /.test(lines[start]!)) start--;
-  const item = lines[start]!.indexOf('-');
-  const step = [lines[start]!];
-  for (const line of lines.slice(start + 1)) {
-    if (line.trim() !== '' && line.search(/\S/) <= item) break;
-    step.push(line);
-  }
-  const run = step.findIndex((line) => /^ *(?:- +)?run: *\|$/.test(line));
-  assert.notEqual(run, -1, 'the existence check is not a run: | block');
-  const key = step[run]!.indexOf('run:');
-  const body: string[] = [];
-  for (const line of step.slice(run + 1)) {
-    if (line.trim() !== '' && line.search(/\S/) <= key) break;
-    body.push(line);
-  }
-  const depth = Math.min(...body.filter((line) => line.trim() !== '').map((line) => line.search(/\S/)));
-  return `${body.map((line) => line.slice(depth)).join('\n')}\n`;
-};
-
-/**
- * Runs the existence check the way a runner does, `bash -e` with GITHUB_OUTPUT set, in a
- * checkout whose package.json has `version`. The npm it finds first on PATH prints
- * `npmStdout` and exits `npmExit`, and records how it was called.
+ * Runs the existence check the way a runner does, in a checkout whose package.json has
+ * `version`. The npm it finds first on PATH prints `npmStdout` and exits `npmExit`.
  */
 function runCheck({ version, npmStdout, npmExit }: { version: string; npmStdout: string; npmExit: number }) {
-  const dir = mkdtempSync(join(tmpdir(), 'tibiawiki-data-check-'));
-  try {
-    mkdirSync(join(dir, 'bin'));
-    writeFileSync(
-      join(dir, 'bin', 'npm'),
-      `#!${process.execPath}\n` +
-        "require('node:fs').appendFileSync(process.env.CHECK_NPM_LOG, JSON.stringify(process.argv.slice(2)) + '\\n');\n" +
-        'process.stdout.write(process.env.CHECK_NPM_STDOUT);\n' +
-        'process.exitCode = Number(process.env.CHECK_NPM_EXIT);\n',
-    );
-    chmodSync(join(dir, 'bin', 'npm'), 0o755);
-    mkdirSync(join(dir, 'checkout'));
-    writeFileSync(join(dir, 'checkout', 'package.json'), JSON.stringify({ name: '@tibia.sh/tibiawiki-data', version }));
-    writeFileSync(join(dir, 'check.sh'), checkScript());
-    const output = join(dir, 'github-output');
-    const log = join(dir, 'npm-calls.jsonl');
-    writeFileSync(output, '');
-    writeFileSync(log, '');
-    const run = spawnSync('bash', ['-e', join(dir, 'check.sh')], {
-      cwd: join(dir, 'checkout'),
-      encoding: 'utf8',
-      env: {
-        ...process.env,
-        PATH: `${join(dir, 'bin')}${delimiter}${process.env['PATH'] ?? ''}`,
-        GITHUB_OUTPUT: output,
-        CHECK_NPM_STDOUT: npmStdout,
-        CHECK_NPM_EXIT: String(npmExit),
-        CHECK_NPM_LOG: log,
-      },
-    });
-    const calls = readFileSync(log, 'utf8').split('\n').filter((line) => line !== '').map((line) => JSON.parse(line) as string[]);
-    return { status: run.status, output: readFileSync(output, 'utf8'), calls, log: `${run.stdout}${run.stderr}` };
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-}
-
-/**
- * Every `run:` script in the raw workflow text, block scalars included. Comments stay in,
- * because GitHub substitutes `${{ }}` inside a block scalar's comment lines too.
- */
-const runScripts = (yaml: string): string[] => {
-  const lines = yaml.split('\n');
-  return lines.flatMap((line, index) => {
-    const match = /^( *(?:- +)?)run:(.*)$/.exec(line);
-    if (!match) return [];
-    const script = [match[2]!];
-    for (const next of lines.slice(index + 1)) {
-      if (next.trim() !== '' && next.search(/\S/) <= match[1]!.length) break;
-      script.push(next);
-    }
-    return [script.join('\n')];
+  return runStep(stepScript(workflow(), CHECK_ID), {
+    files: { 'package.json': JSON.stringify({ name: '@tibia.sh/tibiawiki-data', version }) },
+    commands: { npm: `process.stdout.write(${JSON.stringify(npmStdout)});\nprocess.exitCode = ${npmExit};\n` },
   });
-};
+}
 
 test('the workflow file has the exact name the npm trusted publisher is registered with', () => {
   // npm matches the file name exactly and does not validate it when saved, so a rename
@@ -265,7 +128,7 @@ test('the release job checks the registry for this exact version, never latest',
   // The check reads the whole version list because npm 12.0.2's `npm view name@version`
   // exits 1 for a missing version and for an unreadable registry alike, measured.
   const steps = releaseSteps();
-  assert.match(steps[checkIndex(steps)]!, /\bnpm view "\$name" versions --json\b/,
+  assert.match(steps[stepIndex(steps, CHECK_ID)]!, /\bnpm view "\$name" versions --json\b/,
     'the existence check does not read the version list from the registry');
   assert.doesNotMatch(steps.join('\n'), /\blatest\b|dist-tags/, 'a release step compares against latest');
 });
@@ -275,7 +138,7 @@ test('the existence check asks to publish a version only when npm does not list 
   const present = runCheck({ version: '3.0.0', npmStdout: list, npmExit: 0 });
   assert.equal(present.status, 0, `the check failed for a version npm has\n${present.log}`);
   assert.equal(present.output, '', 'the check asked to publish a version npm already has');
-  assert.deepEqual(present.calls, [['view', '@tibia.sh/tibiawiki-data', 'versions', '--json']],
+  assert.deepEqual(present.calls, [{ command: 'npm', args: ['view', '@tibia.sh/tibiawiki-data', 'versions', '--json'] }],
     'the check did not read the version list of the package named in package.json');
 
   const absent = runCheck({ version: '3.0.1', npmStdout: list, npmExit: 0 });
@@ -318,7 +181,7 @@ test('every step after the existence check is gated on it, and nothing before it
   // A merge that leaves version alone must publish nothing and stay green, and every later
   // step is what would publish. Nothing that installs, tests or publishes may run first.
   const steps = releaseSteps();
-  const check = checkIndex(steps);
+  const check = stepIndex(steps, CHECK_ID);
   const after = steps.slice(check + 1);
   for (const step of after) {
     assert.equal(stepIf(step), PUBLISH_GATE, `${stepName(step)} is not gated on the existence check`);
