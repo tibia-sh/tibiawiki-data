@@ -1,11 +1,13 @@
 savePrefix: ''
 minimumReleaseAge: 10080
+# Strict is pnpm's default once minimumReleaseAge is set, and it is stated here so the
+# cooldown fails a resolution instead of falling back to an immature version.
+minimumReleaseAgeStrict: true
 # First-party packages skip the 7-day cooldown. The devDependency on
-# @tibia.sh/tibiawiki-mcp is installed minutes after each server release, and
-# pnpm 10.33.0 fails such an install with ERR_PNPM_NO_MATURE_MATCHING_VERSION
-# rather than waiting. The cooldown exists to let the ecosystem catch a
-# compromised upstream release; a first-party publish is gated by its own release
-# procedure instead.
+# @tibia.sh/tibiawiki-mcp is installed minutes after each server release, and pnpm
+# fails such an install rather than waiting. The cooldown exists to let the ecosystem
+# catch a compromised upstream release. A first-party publish is gated by its own
+# release procedure instead.
 minimumReleaseAgeExclude:
   - '@tibia.sh/*'
 trustPolicy: no-downgrade
@@ -13,5 +15,6 @@ blockExoticSubdeps: true
 strictDepBuilds: true
 allowBuilds: {}
 verifyDepsBeforeRun: error
-packageManagerStrictVersion: true
-managePackageManagerVersions: true
+# pnpm 11 replaced packageManagerStrictVersion and managePackageManagerVersions with this.
+# A pnpm other than packageManager's switches to that exact version.
+pmOnFail: download

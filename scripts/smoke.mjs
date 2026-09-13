@@ -29,10 +29,9 @@
  *   - It installs @modelcontextprotocol/client explicitly: it is a devDependency of
  *     the server, so it is NOT available transitively from the installed server.
  *   - It strips the lowercase npm_* keys from the child environment. A package manager
- *     running a script exports its own config that way, and npm rejects some of it
- *     outright (EALLOWSCRIPTS, from this repository's allowBuilds) while silently
- *     applying the rest, minimumReleaseAge and all, to an install meant to look like a
- *     stranger's. Case is load-bearing: npm reads NPM_CONFIG_* too, and those are the
+ *     or npx running a script can export its own config that way, and npm rejects some
+ *     of it outright (EALLOWSCRIPTS) while silently applying the rest to an install meant
+ *     to look like a stranger's. Case is load-bearing: npm reads NPM_CONFIG_* too, and those are the
  *     operator's own registry, proxy and CA settings, which a real consumer would have.
  *     NODE_OPTIONS goes with them, because it can filter every test away silently.
  *   - Both steps time out and kill with SIGKILL, so a child that ignores SIGTERM cannot
