@@ -1,12 +1,16 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readdirSync, readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { delimiter, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 /**
  * The release workflow cannot run inside the suite, and a mistake in it surfaces only when
  * a merge publishes, or fails to: a version npm never lets be reused, or a release that
- * quietly never happens. Each property pinned here is checkable from the files alone.
+ * quietly never happens. Most properties pinned here are checkable from the files alone.
+ * The existence check's decision is not, so its script runs here against a fake npm.
  */
 
 const root = fileURLToPath(new URL('..', import.meta.url));
@@ -76,6 +80,77 @@ const checkIndex = (steps: string[]): number => {
   assert.equal(matches.length, 1, `expected exactly one step with id: ${CHECK_ID}`);
   return matches[0]!;
 };
+
+/**
+ * The existence check's `run: |` script as the runner receives it: its lines from the raw
+ * workflow, comments included, with the block's indentation removed.
+ */
+const checkScript = (): string => {
+  const lines = workflow().split('\n');
+  const idLine = lines.findIndex((line) => new RegExp(`^ *(?:- +)?id: *${CHECK_ID}(?: +#.*)?$`).test(line));
+  assert.notEqual(idLine, -1, `no step has id: ${CHECK_ID}`);
+  let start = idLine;
+  while (start > 0 && !/^ *- /.test(lines[start]!)) start--;
+  const item = lines[start]!.indexOf('-');
+  const step = [lines[start]!];
+  for (const line of lines.slice(start + 1)) {
+    if (line.trim() !== '' && line.search(/\S/) <= item) break;
+    step.push(line);
+  }
+  const run = step.findIndex((line) => /^ *(?:- +)?run: *\|$/.test(line));
+  assert.notEqual(run, -1, 'the existence check is not a run: | block');
+  const key = step[run]!.indexOf('run:');
+  const body: string[] = [];
+  for (const line of step.slice(run + 1)) {
+    if (line.trim() !== '' && line.search(/\S/) <= key) break;
+    body.push(line);
+  }
+  const depth = Math.min(...body.filter((line) => line.trim() !== '').map((line) => line.search(/\S/)));
+  return `${body.map((line) => line.slice(depth)).join('\n')}\n`;
+};
+
+/**
+ * Runs the existence check the way a runner does, `bash -e` with GITHUB_OUTPUT set, in a
+ * checkout whose package.json has `version`. The npm it finds first on PATH prints
+ * `npmStdout` and exits `npmExit`, and records how it was called.
+ */
+function runCheck({ version, npmStdout, npmExit }: { version: string; npmStdout: string; npmExit: number }) {
+  const dir = mkdtempSync(join(tmpdir(), 'tibiawiki-data-check-'));
+  try {
+    mkdirSync(join(dir, 'bin'));
+    writeFileSync(
+      join(dir, 'bin', 'npm'),
+      `#!${process.execPath}\n` +
+        "require('node:fs').appendFileSync(process.env.CHECK_NPM_LOG, JSON.stringify(process.argv.slice(2)) + '\\n');\n" +
+        'process.stdout.write(process.env.CHECK_NPM_STDOUT);\n' +
+        'process.exitCode = Number(process.env.CHECK_NPM_EXIT);\n',
+    );
+    chmodSync(join(dir, 'bin', 'npm'), 0o755);
+    mkdirSync(join(dir, 'checkout'));
+    writeFileSync(join(dir, 'checkout', 'package.json'), JSON.stringify({ name: '@tibia.sh/tibiawiki-data', version }));
+    writeFileSync(join(dir, 'check.sh'), checkScript());
+    const output = join(dir, 'github-output');
+    const log = join(dir, 'npm-calls.jsonl');
+    writeFileSync(output, '');
+    writeFileSync(log, '');
+    const run = spawnSync('bash', ['-e', join(dir, 'check.sh')], {
+      cwd: join(dir, 'checkout'),
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PATH: `${join(dir, 'bin')}${delimiter}${process.env['PATH'] ?? ''}`,
+        GITHUB_OUTPUT: output,
+        CHECK_NPM_STDOUT: npmStdout,
+        CHECK_NPM_EXIT: String(npmExit),
+        CHECK_NPM_LOG: log,
+      },
+    });
+    const calls = readFileSync(log, 'utf8').split('\n').filter((line) => line !== '').map((line) => JSON.parse(line) as string[]);
+    return { status: run.status, output: readFileSync(output, 'utf8'), calls, log: `${run.stdout}${run.stderr}` };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
 
 /**
  * Every `run:` script in the raw workflow text, block scalars included. Comments stay in,
@@ -193,6 +268,50 @@ test('the release job checks the registry for this exact version, never latest',
   assert.match(steps[checkIndex(steps)]!, /\bnpm view "\$name" versions --json\b/,
     'the existence check does not read the version list from the registry');
   assert.doesNotMatch(steps.join('\n'), /\blatest\b|dist-tags/, 'a release step compares against latest');
+});
+
+test('the existence check asks to publish a version only when npm does not list it', () => {
+  const list = '[\n  "3.0.0"\n]\n';
+  const present = runCheck({ version: '3.0.0', npmStdout: list, npmExit: 0 });
+  assert.equal(present.status, 0, `the check failed for a version npm has\n${present.log}`);
+  assert.equal(present.output, '', 'the check asked to publish a version npm already has');
+  assert.deepEqual(present.calls, [['view', '@tibia.sh/tibiawiki-data', 'versions', '--json']],
+    'the check did not read the version list of the package named in package.json');
+
+  const absent = runCheck({ version: '3.0.1', npmStdout: list, npmExit: 0 });
+  assert.equal(absent.status, 0, `the check failed for a version npm lacks\n${absent.log}`);
+  assert.equal(absent.output, 'publish=true\n', 'the check did not ask to publish a version npm lacks');
+});
+
+test('the existence check fails, and asks for nothing, when npm gives no version list', () => {
+  // A registry that cannot be read must end the run red, never read as a missing version.
+  // The runner's default bash -e is what stops the script, so no step may swap the shell.
+  assert.doesNotMatch(code(workflow()), /^ *shell:/m, 'a shell override can drop the -e the check relies on');
+  const replies: Array<[string, string, number]> = [
+    ['npm cannot read the registry', '', 1],
+    ['npm prints nothing, as it does for a registry answering {}', '', 0],
+    ['npm prints an empty list', '[]\n', 0],
+    ['npm prints something other than a list', '"3.0.0"\n', 0],
+    ['npm prints what is not JSON', 'npm error\n', 0],
+  ];
+  for (const [reply, npmStdout, npmExit] of replies) {
+    const run = runCheck({ version: '3.0.1', npmStdout, npmExit });
+    assert.notEqual(run.status, 0, `the check passed when ${reply}\n${run.log}`);
+    assert.equal(run.output, '', `the check asked to publish when ${reply}`);
+  }
+});
+
+test('the release job checks out the commit that triggered the run', () => {
+  // npm provenance names GITHUB_SHA, the commit that triggered the run. Without a ref,
+  // checkout takes that same commit. Any ref could check out another commit, which would
+  // then publish under an attestation naming the wrong one.
+  const checkouts = releaseSteps().filter((step) => /^ *(?:- +)?uses: *actions\/checkout@/m.test(step));
+  assert.ok(checkouts.length > 0, 'the release job never checks out the code it publishes');
+  assert.equal(checkouts.length, releaseJob().split('actions/checkout@').length - 1,
+    'a checkout step is written in a form this test cannot read, such as a flow mapping');
+  for (const step of checkouts) {
+    assert.doesNotMatch(step, /^ *ref:/m, 'the release job checks out a ref instead of the triggering commit');
+  }
 });
 
 test('every step after the existence check is gated on it, and nothing before it installs, tests or publishes', () => {
