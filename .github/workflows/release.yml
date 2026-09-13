@@ -12,7 +12,7 @@ permissions:
 concurrency:
   group: release
   cancel-in-progress: false
-  queue: max  # a waiting run is kept, not replaced, so a version publishes from the merge that bumped it
+  queue: max  # a waiting run is kept rather than replaced by a newer one, though GitHub does not guarantee their order
 
 jobs:
   release:
