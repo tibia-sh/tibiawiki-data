@@ -122,15 +122,15 @@ generator waits until that is decided.
 the index, and its `serve` validates it, in `pnpm test` here and in `pnpm smoke`
 against an installed copy.
 
-**When to bump it.** On a `0.x` version, `^0.1.0` means `>=0.1.0 <0.2.0`. Left alone,
-it pins every rebuild to the 0.1 generator and its gates while the server moves on.
+**When to bump it.** On a `0.x` version, `^0.3.0` means `>=0.3.0 <0.4.0`. Left alone,
+it pins every rebuild to the 0.3 generator and its gates while the server moves on.
 Bump it whenever the server's indexer changes: `build-index`, its enrichment, its
 gates, or the schema. Write the new range by hand. This repository saves exact
 versions, so `pnpm add` records a pin instead.
 
 **The dependency cycle is intentional.** The server depends on this package, and this
 package devDepends on the server. npm and pnpm allow it because this side is
-dev-only and never resolved at runtime. Do not "fix" it. Once the server depends on
+dev-only and never resolved at runtime. Do not "fix" it. Because the server depends on
 this package, `node_modules` here also holds a published copy of this package,
 installed as the server's dependency. The server's default index resolution could
 find that copy instead of `index.db`. So the test always passes `TIBIAWIKI_MCP_DB`
