@@ -15,12 +15,18 @@ jobs:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
-      - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0
+      # pnpm/setup caches the pnpm store. This setup-node caches by itself whenever
+      # package.json names a packageManager, so it is switched off by name.
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
-          node-version: '24'
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
+          node-version: '26'
+          package-manager-cache: false
+      # Installs the pnpm that `packageManager` names, then runs `pnpm install --frozen-lockfile`.
+      - uses: pnpm/setup@703c52620218391530e48b9e8870d5c0082e1b9b # v2.1.0
+        with:
+          install: true
+          require-lockfile: true
+          cache: true
       # `pnpm test` builds, typechecks, and runs the suite - including the test that
       # spawns the server from the devDependency against the committed index.db and
       # makes a real query.

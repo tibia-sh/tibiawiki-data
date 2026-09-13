@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { code, keys, read, runScripts, runStep, stepIf, stepIndex, stepName, steps, stepScript, under } from './workflow.ts';
+import { code, keys, read, runScripts, runStep, scalar, stepIf, stepIndex, stepInputs, stepName, steps, stepScript, under } from './workflow.ts';
 
 /**
  * The drift workflow cannot run inside the suite, and its mistakes are quiet. A detector
@@ -14,12 +14,6 @@ const workflow = (): string => read('drift.yml');
 const jobs = (): string => under(code(workflow()), 'jobs');
 const buildJob = (): string => under(jobs(), 'build');
 const prJob = (): string => under(jobs(), 'pr');
-
-/** A scalar key's value at a block's shallowest indentation. */
-const scalar = (block: string, key: string): string | undefined => {
-  const depth = Math.min(...block.split('\n').filter((line) => line.trim() !== '').map((line) => line.search(/\S/)));
-  return new RegExp(`^ {${depth}}${key}: *(.*)$`, 'm').exec(block)?.[1];
-};
 
 /** A permissions block as sorted `scope: level` lines. */
 const grants = (block: string): string[] =>
@@ -141,9 +135,13 @@ test('every checkout keeps no credentials and takes the commit that triggered th
   }
 });
 
-test('neither job restores or saves a cache', () => {
-  // A cache the build job saved would carry whatever the generator run left into later
-  // runs, and into ci.yml. Both setup actions cache by themselves unless told not to.
+test("the only cache either job restores or saves is pnpm/setup's lockfile-verification record", () => {
+  // A cache the build job saved after the generator ran would carry whatever that run left into
+  // later runs, and into ci.yml. setup-node and setup-uv cache by themselves unless told not to.
+  // pnpm/setup restores and saves its lockfile-verification record whatever its inputs say. The
+  // record holds no package. With `install: true` the action saves it right after its frozen
+  // install, before the generator runs, and its post step tries again at the end of the job only
+  // when that save does not go through.
   const all = [...steps(buildJob()), ...steps(prJob())];
   assert.doesNotMatch(all.join('\n'), /uses: *actions\/cache/, 'a step uses actions/cache');
   const nodes = all.filter((step) => /uses: *actions\/setup-node@/.test(step));
@@ -155,6 +153,12 @@ test('neither job restores or saves a cache', () => {
   const uvs = all.filter((step) => /uses: *astral-sh\/setup-uv@/.test(step));
   assert.equal(uvs.length, 1, 'expected one setup-uv, in the build job');
   assert.match(uvs[0]!, /^ *enable-cache: *false$/m, 'setup-uv caches');
+  const pnpms = all.filter((step) => /uses: *pnpm\/setup@/.test(step));
+  assert.equal(pnpms.length, 1, 'expected one pnpm/setup, in the build job');
+  const inputs = stepInputs(pnpms[0]!);
+  assert.equal(scalar(inputs, 'cache'), undefined, 'pnpm/setup caches the pnpm store');
+  assert.equal(scalar(inputs, 'install'), 'true',
+    'pnpm/setup saves its lockfile-verification record only at the end of the job, after the generator ran');
 });
 
 test('the build job installs an exact uv version', () => {
