@@ -36,8 +36,13 @@
  *     operator's own registry, proxy and CA settings, which a real consumer would have.
  *     NODE_OPTIONS goes with them, because it can filter every test away silently.
  *   - Both steps time out and kill with SIGKILL, so a child that ignores SIGTERM cannot
- *     hold the check open past the bound.
- *   - The scratch directory is removed on every exit path: pass, fail, or interrupted.
+ *     hold the check open past the bound. Only that child is killed. The test file that
+ *     `node --test` runs in a process of its own survives it.
+ *   - The scratch directory is removed on every exit path: pass, fail, a timeout, and a
+ *     Ctrl-C. A Ctrl-C signals the whole process group, which kills the running step, so
+ *     the check fails and cleans up like any other failure. A signal sent to this
+ *     process alone interrupts nothing: every step blocks in execFileSync, so the
+ *     handlers below never run, and the check carries on to its normal end.
  */
 import { execFileSync } from 'node:child_process';
 import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -90,8 +95,10 @@ const dir = mkdtempSync(join(tmpdir(), 'tibiawiki-data-smoke-'));
 let failed = false;
 
 const clean = () => rmSync(dir, { recursive: true, force: true });
-// The try/finally below covers pass and fail. An interrupted run needs these: a
-// scratch install is ~20 MB, and this check takes long enough to be interrupted.
+// Without these, SIGINT or SIGTERM would end this process on the spot and leave the
+// scratch install, about 20 MB, behind. With them the signal waits for the step running
+// in execFileSync, so neither body ever runs. A Ctrl-C has killed that step as well, so
+// it fails, and the finally block below removes the directory.
 for (const [signal, code] of Object.entries({ SIGINT: 130, SIGTERM: 143 })) {
   process.on(signal, () => {
     clean();
