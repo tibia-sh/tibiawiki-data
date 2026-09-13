@@ -1,6 +1,6 @@
 # Releasing
 
-A push to `main` publishes the `version` in `package.json`, after `pnpm test`, when npm does not list that version yet. Nothing is tagged. [Releases](../README.md#releases) in the README has the details.
+A push to `main` publishes the `version` in `package.json`, after the `oldest-consumer` gate and `pnpm test`, when npm does not list that version yet. Nothing is tagged. [Releases](../README.md#releases) in the README has the details.
 
 ## When a release run fails
 
@@ -15,6 +15,15 @@ A failed run leaves nothing stranded. `main` holds a version npm does not have, 
 Never re-run a release run expecting a different result when nothing outside the repository changed.
 
 npm never accepts the same version twice, even after an unpublish, per its [unpublish policy](https://docs.npmjs.com/policies/unpublish). To replace a published version, bump to the next patch. An unpublished version needs the same bump. npm keeps refusing it, although `npm view` no longer lists it.
+
+## When the oldest-consumer job fails
+
+The release job waits for `oldest-consumer`, so a red gate blocks the publish. The gate installs the oldest published server that depends on `^N` together with the packed index, and pages every item through it. Its log says whether the sweep failed or npm could not be reached.
+
+| Cause | What to do |
+|---|---|
+| The sweep failed | A published `^N` server breaks on this index, so do not publish it as `N.x`. Fix the index or the generator, or treat the change as a new major under [Bumping the schema version](../README.md#bumping-the-schema-version). |
+| npm was unreachable | Re-run the run once npm is back. The run publishes only a version npm lacks. |
 
 ## Runs close together
 

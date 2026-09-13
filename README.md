@@ -121,10 +121,16 @@ crawl.
 is anything but `9.0.0`. The major version covers only the server's enrichment tables,
 and no version covers the tables tibiawiki-sql writes.
 
-A generator upgrade does not bump the major. Instead, before you release an index built by a
-new generator, the oldest published server that depends on `^N` has to pass its full item
-sweep in `test/regression.test.ts` against that index. Until that gate exists, the `9.0.0`
-guard blocks any generator change.
+A generator upgrade does not bump the major. A user who installed the oldest published server
+that depends on `^N` gets every new `N.x` of this package, so before every publish, and in CI,
+the `oldest-consumer` job installs that server package from npm together with the packed
+candidate, and pages every item through its `tibia_find_items`. The gate passes only when no
+page is an error, every page carries the candidate index's `generate_time`, and every item in
+the index comes back exactly once. `pnpm oldest-consumer` runs the same gate, and needs network
+access to npm.
+
+The sweep covers items only, not creatures, NPCs, quests or spells. So the `9.0.0` pin in
+`test/data.test.ts` stays as the explicit decision point for a generator upgrade.
 
 ### Drift
 
@@ -191,7 +197,8 @@ pnpm test
    name, so it typechecks against the built declarations, as a consumer does.
 3. It runs every `test/*.test.ts`. `test/data.test.ts` spawns the server from the
    devDependency against `index.db`, and makes a real query. The other files check the
-   release and drift workflows, the smoke check and the test floor, with no network.
+   workflows, the smoke check, the oldest-consumer gate's decisions and the test floor, with
+   no network.
 
 The run fails when fewer than `MIN_TESTS` tests pass. `node --test` still exits 0 for a
 file that declares no tests, for a skipped test, and for a `--test-name-pattern` that
@@ -228,11 +235,15 @@ by name.
 ## Releases
 
 Merging a commit to `main` publishes its `package.json` `version` if npm does not have
-that version yet. On every push to `main`, `.github/workflows/release.yml` asks npm
-whether it lists that exact version. If it does, the run publishes nothing and ends
-green. Every merge that leaves `version` alone ends this way. If it does not, the run
-installs from the lockfile, runs `pnpm test`, and runs `npm publish`.
+that version yet. On every push to `main`, `.github/workflows/release.yml` runs the
+`oldest-consumer` gate from [How the index is built](#how-the-index-is-built), and its release
+job waits for that gate. The release job then asks npm whether it lists that exact version. If
+it does, the run publishes nothing and ends green. Every merge that leaves `version` alone,
+and passes the gate, ends this way. If it does not, the run installs from the lockfile, runs
+`pnpm test`, and runs `npm publish`.
 
+- The gate runs on every push, whether the run publishes or not, so an index that breaks the
+  oldest published server turns the run red even when nothing is published.
 - The check is for existence, never a comparison with `latest`. A revert leaves
   `version` below `latest`, and `npm publish` moves `latest` itself.
 - A registry the check cannot read fails the run. It is never taken for a missing
@@ -243,7 +254,7 @@ installs from the lockfile, runs `pnpm test`, and runs `npm publish`.
   attaches a provenance attestation for the merged commit. The trusted publisher is
   registered for the file name `release.yml`, and renaming the file breaks publishing
   with no warning.
-- Every pull request runs the same `pnpm test`, in `.github/workflows/ci.yml`.
+- Every pull request runs the same `pnpm test` and the same gate, in `.github/workflows/ci.yml`.
 
 Nothing is tagged, so a failed publish leaves nothing stranded. When a release run fails,
 follow [docs/RELEASING.md](docs/RELEASING.md).
