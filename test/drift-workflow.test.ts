@@ -166,6 +166,23 @@ test('the build job installs an exact uv version', () => {
   assert.match(uvs[0]!, /^ *version: *'?\d+\.\d+\.\d+'?$/m, 'setup-uv does not install an exact uv version');
 });
 
+test('build-index resolves PyPI packages after the cooldown pnpm applies to npm packages', () => {
+  // uvx resolves the generator's unpinned dependencies from PyPI on every run, and reads a
+  // relative duration from UV_EXCLUDE_NEWER. minimumReleaseAge in pnpm-workspace.yaml is this
+  // repository's cooldown, in minutes.
+  const workspace = readFileSync(new URL('../pnpm-workspace.yaml', import.meta.url), 'utf8');
+  const minutes = Number(/^minimumReleaseAge: *(\d+)$/m.exec(workspace)?.[1]);
+  assert.ok(minutes > 0, 'pnpm-workspace.yaml sets no minimumReleaseAge');
+  const builds = steps(buildJob()).filter((step) => /\bpnpm build-index\b/.test(step));
+  assert.equal(builds.length, 1, 'expected one pnpm build-index step');
+  const value = /^ *UV_EXCLUDE_NEWER: *'?([^'\n]*?)'?$/m.exec(builds[0]!)?.[1];
+  assert.notEqual(value, undefined, 'the build-index step sets no UV_EXCLUDE_NEWER');
+  const duration = /^(\d+) *(days?|weeks?)$/.exec(value!) ?? /^P(\d+)([DW])$/.exec(value!);
+  assert.ok(duration, `UV_EXCLUDE_NEWER is ${value}, not a duration in days or weeks`);
+  const days = Number(duration[1]) * (/^w/i.test(duration[2]!) ? 7 : 1);
+  assert.equal(days * 24 * 60, minutes, `UV_EXCLUDE_NEWER is ${days} days, but minimumReleaseAge is ${minutes} minutes`);
+});
+
 test('the build job digests the committed index before build-index overwrites it', () => {
   const list = steps(buildJob());
   const committed = stepIndex(list, 'committed');
