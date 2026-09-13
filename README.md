@@ -28,9 +28,11 @@ major are data refreshes of the same schema.
 
 `SCHEMA_VERSION` is a literal in `src/index.ts`, and `pnpm test` asserts that it
 equals both the `package.json` major and the index's `mcp_schema_version` row.
-Change all three together. The literal is deliberate. Derived from `package.json`,
-that assertion would compare a value with itself and could never fail, and it is the
-only thing that stops a release from shipping under the wrong major.
+Change all three together, following
+[Bumping the schema version](#bumping-the-schema-version). The literal is deliberate.
+Derived from `package.json`, that assertion would compare a value with itself and could
+never fail, and it is the only thing that stops a release from shipping under the wrong
+major.
 
 ## Why the index is committed
 
@@ -109,6 +111,11 @@ its journal beside that. `.gitignore` excludes both, and must never exclude
 `index.db`. The `3.0.0` build took just under six minutes, most of it the generator's
 crawl.
 
+`pnpm test` pins the generator too. It fails for an index whose `database_info` `version`
+is anything but `9.0.0`. The major version covers only the server's enrichment tables,
+and no version covers the tables tibiawiki-sql writes yet, so a rebuild with another
+generator waits until that is decided.
+
 ## The devDependency on the server
 
 `@tibia.sh/tibiawiki-mcp` is a devDependency for two jobs: its `build-index` produces
@@ -145,8 +152,16 @@ pnpm test
 2. It typechecks `src/`, `test/` and `scripts/`, the JavaScript in `scripts/`
    included. This must come after the build: the test imports this package by its own
    name, so it typechecks against the built declarations, as a consumer does.
-3. It runs `test/data.test.ts`. That test spawns the server from the devDependency
-   against `index.db`, and makes a real query.
+3. It runs every `test/*.test.ts`. `test/data.test.ts` spawns the server from the
+   devDependency against `index.db`, and makes a real query. The other files check the
+   release workflow, the smoke check and the test floor, with no network.
+
+The run fails when fewer than `MIN_TESTS` tests pass. `node --test` still exits 0 for a
+file that declares no tests, for a skipped test, and for a `--test-name-pattern` that
+filters tests away, one inherited through `NODE_OPTIONS` included. Without the floor, an
+emptied test file would pass the gate every publish runs. Adding a test needs no change. When
+you remove or skip one on purpose, lower `MIN_TESTS` in `test/min-tests.ts` in the same
+commit.
 
 `prepublishOnly` runs `pnpm test` too, so publishing from the directory always builds
 `dist/` first.
@@ -172,6 +187,72 @@ the server and the MCP client at the versions `package.json` names, and runs
 installed package and it spawns the installed server, so it checks the artefact rather
 than this checkout. That is why the test file imports only node builtins and packages
 by name.
+
+## Releases
+
+Merging to `main` a commit whose `package.json` `version` npm does not have yet
+publishes that version. On every push to `main`, `.github/workflows/release.yml` asks
+npm whether it lists that exact version. If it does, the run publishes nothing and ends
+green, which is what every merge that leaves `version` alone does. If it does not, the
+run installs from the lockfile, runs `pnpm test`, and runs `npm publish`.
+
+- The check is for existence, never a comparison with `latest`. A revert leaves
+  `version` below `latest`, and `npm publish` moves `latest` itself.
+- A registry the check cannot read fails the run. It is never taken for a missing
+  version.
+- The run packs the committed `index.db` and never rebuilds it, so the file published is
+  the file reviewed in the pull request.
+- It publishes through npm trusted publishing, so no npm token exists to leak, and npm
+  attaches a provenance attestation for the merged commit. The trusted publisher is
+  registered for the file name `release.yml`, and renaming the file breaks publishing
+  with no warning.
+- Every pull request runs the same `pnpm test`, in `.github/workflows/ci.yml`.
+
+Nothing is tagged, so a failed publish leaves nothing stranded. Fix forward and merge
+again. If a publish half-succeeded, npm refuses that version from then on, so bump to the
+next patch instead.
+
+### Bumping the schema version
+
+**Not yet exercised.** No schema bump has gone through this procedure.
+
+A bump from N-1 to N cannot pass the automated gates. This package's `N.0.0` runs
+`pnpm test` against its devDependency server, which has to read schema N, so it needs a
+schema-N server on the registry. That server's CI needs this package's `N.0.0` on the
+registry: its `^N` dependency has to install, and its `test/data-package.test.ts` and
+regression sweep read the installed index. So one side is published outside its
+pipeline. It is this package, because every published server depends on `^(N-1)`, and
+none of them installs `N.0.0`.
+
+1. On the server's schema-N branch, `npm pack` the server, and build this repository's
+   index with that tarball's `build-index`. The published server stamps the index N-1,
+   which this repository's tests reject. Then cross-validate: install each repository's
+   counterpart from the other's local tarball, and run both full test suites.
+2. The maintainer publishes this package's `N.0.0` by hand, from the validated tarball.
+   `npm publish` runs no lifecycle scripts for a tarball, so step 1 is the only gate it
+   gets, and it carries no provenance.
+3. The server's pull request sets `MCP_SCHEMA_VERSION` to N and its dependency range to
+   `^N`. Its CI passes against the registry, and its release PR publishes it through the
+   server's pipeline.
+4. This repository's pull request commits that exact `index.db`, with `SCHEMA_VERSION` N,
+   `version` `N.0.0`, and the devDependency moved to the new server. Its CI passes, and
+   merging it publishes nothing, because npm already has `N.0.0`.
+
+Do not merge a data refresh here between steps 2 and 4. `main` is still on N-1 then, and
+npm refuses to publish a version below `N.0.0` without a dist-tag, so its release run
+fails.
+
+**Verify the deadlock before relying on this.** On a scratch branch, set the server's
+`MCP_SCHEMA_VERSION` to N: its `test/data-package.test.ts` and regression sweep must
+fail. Here, set `SCHEMA_VERSION` and `version` to N against the schema-(N-1)
+devDependency: the suite must fail before anything is published. If either suite passes,
+it is not checking what this procedure assumes, so stop and find out why.
+
+This repository's half was checked on 2026-09-13 for N = 4, on a clone. `pnpm test`
+fails at `the shipped index carries SCHEMA_VERSION`. With the index's
+`mcp_schema_version` row set to 4 as well, it fails at the server test instead, because
+the schema-3 server refuses a schema-4 index. Either way `npm publish` stops in
+`prepublishOnly` and packs nothing.
 
 ## Licence
 
