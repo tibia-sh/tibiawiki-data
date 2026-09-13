@@ -190,11 +190,11 @@ by name.
 
 ## Releases
 
-Merging to `main` a commit whose `package.json` `version` npm does not have yet
-publishes that version. On every push to `main`, `.github/workflows/release.yml` asks
-npm whether it lists that exact version. If it does, the run publishes nothing and ends
-green, which is what every merge that leaves `version` alone does. If it does not, the
-run installs from the lockfile, runs `pnpm test`, and runs `npm publish`.
+Merging a commit to `main` publishes its `package.json` `version` if npm does not have
+that version yet. On every push to `main`, `.github/workflows/release.yml` asks npm
+whether it lists that exact version. If it does, the run publishes nothing and ends
+green. Every merge that leaves `version` alone ends this way. If it does not, the run
+installs from the lockfile, runs `pnpm test`, and runs `npm publish`.
 
 - The check is for existence, never a comparison with `latest`. A revert leaves
   `version` below `latest`, and `npm publish` moves `latest` itself.
@@ -232,7 +232,7 @@ pipeline. It is this package, because no published server installs `N.0.0`. Serv
    `npm pack`, or the tarball carries a stale `dist/` or none.
 2. The maintainer publishes this package's `N.0.0` by hand, from the validated tarball.
    `npm publish` runs no lifecycle scripts for a tarball, so step 1 is the only gate it
-   gets, and it carries no provenance.
+   gets. The release carries no provenance.
 3. The server's pull request sets `MCP_SCHEMA_VERSION` to N and its dependency range to
    `^N`. Its CI passes against the registry, and its release PR publishes it through the
    server's pipeline.
