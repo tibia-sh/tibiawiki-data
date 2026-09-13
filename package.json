@@ -34,6 +34,7 @@
     "test": "pnpm build && pnpm typecheck && node --test --test-reporter=spec --test-reporter-destination=stdout --test-reporter=./test/min-tests.ts --test-reporter-destination=stderr test/*.test.ts",
     "build-index": "pnpm build && node scripts/build.ts",
     "smoke": "node scripts/smoke.mjs",
+    "oldest-consumer": "pnpm build && node scripts/oldest-consumer.ts",
     "prepublishOnly": "pnpm test"
   },
   "devDependencies": {
