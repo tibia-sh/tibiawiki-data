@@ -20,7 +20,7 @@ import type { TestEvent } from 'node:test/reporters';
  * skipping one does: lower this in the same commit, so the removal is a decision a
  * reviewer sees rather than something that happened quietly.
  */
-export const MIN_TESTS = 59;
+export const MIN_TESTS = 60;
 
 export default async function* minTests(source: AsyncIterable<TestEvent>): AsyncGenerator<string> {
   let passed = 0;

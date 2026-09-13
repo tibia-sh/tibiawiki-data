@@ -65,6 +65,9 @@ jobs:
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
       # A tripped gate fails the run here, and leaves index.db as it was.
       - run: pnpm build-index
+        env:
+          # uvx resolves the generator's unpinned PyPI dependencies on every run, so they wait out pnpm's 7-day cooldown.
+          UV_EXCLUDE_NEWER: 7 days
       - name: Digest the rebuilt index
         id: digests
         env:
