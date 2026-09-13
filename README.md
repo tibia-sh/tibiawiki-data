@@ -101,7 +101,9 @@ pnpm build-index
 
 That builds `dist/`, then `scripts/build.ts` runs the devDependency's
 `tibiawiki-mcp build-index` with `TIBIAWIKI_MCP_DB` set to `DB_PATH`, so the build
-writes exactly the file this package ships and exports.
+writes exactly the file this package ships and exports. Every build resolves the
+generator's PyPI dependencies after a 7-day cooldown, matching the one pnpm applies to npm
+packages, and setting `UV_EXCLUDE_NEWER` overrides it.
 
 `build-index` needs [`uv`](https://docs.astral.sh/uv/) and network access to
 TibiaWiki. It validates the new index before replacing `index.db`, so a build that
