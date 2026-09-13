@@ -221,13 +221,15 @@ A bump from N-1 to N cannot pass the automated gates. This package's `N.0.0` run
 schema-N server on the registry. That server's CI needs this package's `N.0.0` on the
 registry: its `^N` dependency has to install, and its `test/data-package.test.ts` and
 regression sweep read the installed index. So one side is published outside its
-pipeline. It is this package, because every published server depends on `^(N-1)`, and
-none of them installs `N.0.0`.
+pipeline. It is this package, because no published server installs `N.0.0`. Server
+`0.1.0` does not use this package, and every later server depends on a major below N.
 
-1. On the server's schema-N branch, `npm pack` the server, and build this repository's
-   index with that tarball's `build-index`. The published server stamps the index N-1,
-   which this repository's tests reject. Then cross-validate: install each repository's
-   counterpart from the other's local tarball, and run both full test suites.
+1. On the server's schema-N branch, run `pnpm build`, then `npm pack`. Build this
+   repository's index with that tarball's `build-index`. The published server stamps the
+   index N-1, which this repository's tests reject. Then cross-validate: install each
+   repository's counterpart from the other's local tarball, and run both full test
+   suites. Neither repository builds `dist/` when it packs, so build before every
+   `npm pack`, or the tarball carries a stale `dist/` or none.
 2. The maintainer publishes this package's `N.0.0` by hand, from the validated tarball.
    `npm publish` runs no lifecycle scripts for a tarball, so step 1 is the only gate it
    gets, and it carries no provenance.
