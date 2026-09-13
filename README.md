@@ -208,9 +208,8 @@ installs from the lockfile, runs `pnpm test`, and runs `npm publish`.
   with no warning.
 - Every pull request runs the same `pnpm test`, in `.github/workflows/ci.yml`.
 
-Nothing is tagged, so a failed publish leaves nothing stranded. Fix forward and merge
-again. If a publish half-succeeded, npm refuses that version from then on, so bump to the
-next patch instead.
+Nothing is tagged, so a failed publish leaves nothing stranded. When a release run fails,
+follow [docs/RELEASING.md](docs/RELEASING.md).
 
 ### Bumping the schema version
 
