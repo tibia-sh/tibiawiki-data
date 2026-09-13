@@ -45,7 +45,7 @@ jobs:
         with:
           node-version: '24'
           package-manager-cache: false
-      # build-index runs the generator through uvx. This setup-uv ships a checksum for uv 0.12.4
+      # build-index installs and runs the generator with uv. This setup-uv ships a checksum for uv 0.12.4
       # and installs no download that fails it. It has no checksum for a later uv, and skips the
       # check for one, so the version stays exact and no newer than the action.
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1

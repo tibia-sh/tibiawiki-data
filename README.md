@@ -78,6 +78,7 @@ What each release was built from:
 | Release | Generator `version` | `generate_time` |
 |---|---|---|
 | `3.0.0` | `9.0.0` | `2026-09-12T19:53:53.020856+00:00` |
+| `3.0.1` | `9.0.0` | `2026-09-13T07:02:58.860376+00:00` |
 
 To read them from any index:
 
@@ -101,9 +102,12 @@ pnpm build-index
 
 That builds `dist/`, then `scripts/build.ts` runs the devDependency's
 `tibiawiki-mcp build-index` with `TIBIAWIKI_MCP_DB` set to `DB_PATH`, so the build
-writes exactly the file this package ships and exports. Every build resolves the
-generator's PyPI dependencies after a 7-day cooldown, matching the one pnpm applies to npm
-packages, and setting `UV_EXCLUDE_NEWER` overrides it.
+writes exactly the file this package ships and exports. From `0.3.1`, the server installs
+the generator from its own requirements file, where every Python dependency is pinned and
+hashed, so every build runs the same packages. Builds still set a 7-day PyPI cooldown,
+matching the one pnpm applies to npm packages. It is a backstop for a server older than
+`0.3.1`, which resolves those dependencies fresh on every build. You can override it with
+`UV_EXCLUDE_NEWER`.
 
 `build-index` needs [`uv`](https://docs.astral.sh/uv/) and network access to
 TibiaWiki. It validates the new index before replacing `index.db`, so a build that
