@@ -1,0 +1,75 @@
+name: release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# Release runs take turns. Two in parallel would both find a new version missing and race
+# to publish it, and the loser would fail red. One in progress is never cancelled.
+concurrency:
+  group: release
+  cancel-in-progress: false
+  queue: max  # a waiting run is kept, not replaced, so a version publishes from the merge that bumped it
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read   # check out the merged commit
+      id-token: write  # OIDC for npm trusted publishing
+    steps:
+      # No ref: a push run checks out the commit that triggered it, which is the commit npm
+      # provenance names.
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: '24'
+          # No dependency cache in the job that publishes. This setup-node restores one by
+          # itself whenever package.json names a packageManager, so it is switched off by name.
+          package-manager-cache: false
+      # setup-node brings the npm bundled with the Node release, and trusted publishing needs
+      # >= 11.5.1. Pinned exactly, not @latest: this job holds id-token: write. It is
+      # installed before the check, so the npm that reads the registry is the one that publishes.
+      - run: npm install -g npm@12.0.2
+      # A version is published once, when npm does not have it yet. This checks existence and
+      # never compares with latest: a revert leaves version below latest, and npm publish
+      # moves latest itself.
+      - name: Check whether npm already has this version
+        id: registry
+        run: |
+          name=$(node -p 'require("./package.json").name')
+          version=$(node -p 'require("./package.json").version')
+          # npm view name@version exits 1 both for a version npm lacks and for a registry it
+          # cannot read, so this reads the whole version list instead. npm exits non-zero when
+          # it cannot read the list, and node throws unless it got a non-empty one. Either
+          # assignment then ends this step red under bash -e, so an outage is never mistaken
+          # for a missing version.
+          versions=$(npm view "$name" versions --json)
+          published=$(node -e '
+            const [list, version] = process.argv.slice(1);
+            const versions = JSON.parse(list);
+            if (!Array.isArray(versions) || versions.length === 0) throw new Error("npm listed no versions: " + list);
+            console.log(versions.includes(version));
+          ' "$versions" "$version")
+          if [ "$published" = true ]; then
+            echo "$name@$version is on npm already, so nothing is published."
+          else
+            echo "$name@$version is not on npm yet, so this run publishes it."
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0
+        if: ${{ steps.registry.outputs.publish == 'true' }}
+      - run: pnpm install --frozen-lockfile
+        if: ${{ steps.registry.outputs.publish == 'true' }}
+      # The suite is the major-version guard: SCHEMA_VERSION, the package major and the
+      # index's mcp_schema_version row must agree before anything is published.
+      - run: pnpm test
+        if: ${{ steps.registry.outputs.publish == 'true' }}
+      # Packs the committed index.db. prepublishOnly runs pnpm test once more first.
+      - run: npm publish
+        if: ${{ steps.registry.outputs.publish == 'true' }}
