@@ -136,16 +136,18 @@ test('every pnpm/setup step in every workflow runs a frozen install, and takes t
   }
 });
 
-test('only the ci.yml test job caches the pnpm store', () => {
+test('only the ci.yml test and oldest-consumer jobs cache the pnpm store', () => {
   // pnpm/setup saves the store at the end of the job, after everything the job ran, and restores it
-  // in every job that asks. The ci.yml test job can only read the repository and publishes nothing.
-  // In the release job a restored store would be input no one reviewed, beside id-token: write, and
-  // the drift build job would save one after the generator ran.
+  // in every job that asks. The ci.yml jobs can only read the repository and publish nothing. In
+  // release.yml a restored store would be input no one reviewed: its gate decides whether the release
+  // job publishes, and the release job holds id-token: write. The drift build job would save one
+  // after the generator ran.
   const cached = pnpmSetupSteps().flatMap(({ file, job, step }) => {
     const cache = scalar(stepInputs(step), 'cache');
     return cache === undefined ? [] : [`${file} ${job} cache: ${cache}`];
   });
-  assert.deepEqual(cached, ['ci.yml test cache: true'], 'pnpm/setup caches the store somewhere other than the ci.yml test job');
+  assert.deepEqual(cached, ['ci.yml test cache: true', 'ci.yml oldest-consumer cache: true'],
+    'pnpm/setup caches the store somewhere other than the ci.yml test and oldest-consumer jobs');
 });
 
 test('no run script in any workflow interpolates an expression', () => {

@@ -15,7 +15,40 @@ concurrency:
   queue: max  # a waiting run is kept rather than replaced by a newer one, though GitHub does not guarantee their order
 
 jobs:
+  # The oldest published server that depends on this package's major, installed together with
+  # the packed index, pages every item. scripts/oldest-consumer.ts says why. It runs on every
+  # push, not only on one that publishes, so an index that breaks that server shows red even
+  # when nothing is published.
+  oldest-consumer:
+    runs-on: ubuntu-latest
+    # Its own bounds add up to under 20 minutes. The rest is room for checkout and setup.
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      # No ref: the commit that triggered the run, which is the one the release job publishes.
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: '26'
+          # No dependency cache in the release workflow. This setup-node restores one by itself
+          # whenever package.json names a packageManager, so it is switched off by name.
+          package-manager-cache: false
+      # The npm the release job installs, so the gate packs and installs with that same npm.
+      - run: npm install -g npm@12.0.2
+      # Installs the pnpm that `packageManager` names, then runs `pnpm install --frozen-lockfile`.
+      # It leaves the pnpm store uncached.
+      - uses: pnpm/setup@703c52620218391530e48b9e8870d5c0082e1b9b # v2.1.0
+        with:
+          install: true
+          require-lockfile: true
+      - run: pnpm oldest-consumer
+
   release:
+    # Nothing is published unless the gate passed on this same commit.
+    needs: oldest-consumer
     runs-on: ubuntu-latest
     permissions:
       contents: read   # check out the merged commit
