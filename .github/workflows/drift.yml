@@ -1,0 +1,226 @@
+name: drift
+
+# Rebuilds index.db from the live wiki and compares its content with the committed index.
+# When the content changed, it opens one pull request with the rebuilt index and the next
+# patch version. Merging that pull request is what publishes, through release.yml, so
+# nothing here merges or publishes.
+
+on:
+  schedule:
+    - cron: '17 6 * * 1' # Mondays at 06:17 UTC
+  workflow_dispatch:
+
+# Each job asks for what it needs, and a job that asks for nothing gets nothing.
+permissions: {}
+
+# Runs take turns, so two cannot push drift/index at once. One in progress is never
+# cancelled. The group is not release.yml's, so a drift run never holds up a publish.
+concurrency:
+  group: drift
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # The 3.0.0 build took just under six minutes on a laptop. The rest is room for uv, and
+    # for the wiki API's retries.
+    timeout-minutes: 60
+    # It runs the generator over content anyone can edit, so it can only read.
+    permissions:
+      contents: read
+    outputs:
+      committed: ${{ steps.digests.outputs.committed }}
+      rebuilt: ${{ steps.digests.outputs.rebuilt }}
+      sha256: ${{ steps.digests.outputs.sha256 }}
+      changed: ${{ steps.digests.outputs.changed }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0
+      # No cache, restored or saved. A cache saved here would carry whatever the generator run
+      # left into later runs. This setup-node caches by itself whenever package.json names a
+      # packageManager, so it is switched off by name.
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      # build-index runs the generator through uvx. This action holds a checksum for this
+      # uv version and checks the download against it.
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          version: '0.12.10'
+          enable-cache: false
+      - run: pnpm install --frozen-lockfile
+      # Before the build, which overwrites index.db in place.
+      - name: Digest the committed index
+        id: committed
+        run: |
+          digest=$(node_modules/.bin/tibiawiki-mcp index-digest index.db)
+          if [[ ! $digest =~ ^[0-9a-f]{64}$ ]]; then
+            echo "index-digest did not print a SHA-256 hex digest for the committed index." >&2
+            exit 1
+          fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      # A tripped gate fails the run here, and leaves index.db as it was.
+      - run: pnpm build-index
+      - name: Digest the rebuilt index
+        id: digests
+        env:
+          COMMITTED: ${{ steps.committed.outputs.digest }}
+        run: |
+          rebuilt=$(node_modules/.bin/tibiawiki-mcp index-digest index.db)
+          # The pr job checks the artifact it downloads against this.
+          sha256=$(node -e 'process.stdout.write(require("node:crypto").createHash("sha256").update(require("node:fs").readFileSync("index.db")).digest("hex"))')
+          # COMMITTED too: a misspelt output reference arrives as an empty string, and two
+          # empty digests would compare equal on every run.
+          for value in "$COMMITTED" "$rebuilt"; do
+            if [[ ! $value =~ ^[0-9a-f]{64}$ ]]; then
+              echo "Not a SHA-256 hex digest: '$value'" >&2
+              exit 1
+            fi
+          done
+          echo "Committed index digest: $COMMITTED"
+          echo "Rebuilt index digest:   $rebuilt"
+          if [ "$COMMITTED" = "$rebuilt" ]; then
+            changed=false
+            echo "The content did not change, so no pull request is opened."
+          else
+            changed=true
+            echo "The content changed, so the pr job opens or updates the drift pull request."
+          fi
+          {
+            echo "committed=$COMMITTED"
+            echo "rebuilt=$rebuilt"
+            echo "sha256=$sha256"
+            echo "changed=$changed"
+          } >> "$GITHUB_OUTPUT"
+      # The suite, against the rebuilt index, before anything leaves this job.
+      - run: pnpm test
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ steps.digests.outputs.changed == 'true' }}
+        with:
+          name: index
+          path: index.db
+          if-no-files-found: error
+          # A re-run of the pr job can still download it until the next scheduled run.
+          retention-days: 7
+
+  pr:
+    needs: build
+    # A dispatch from another branch builds and tests, and opens nothing.
+    if: ${{ github.ref == 'refs/heads/main' && needs.build.outputs.changed == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # The only job that can write. It runs no pnpm script and nothing from the artifact, only
+    # git, gh, npm view and node one-liners.
+    permissions:
+      contents: write        # push drift/index
+      pull-requests: write   # open or update its pull request
+    steps:
+      # No ref: the commit that triggered the run, which is the one the build job rebuilt.
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      # Switched off by name here too. Left on, it would look for pnpm, which this job never
+      # installs, and fail.
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: index
+          path: ${{ runner.temp }}/index
+      - name: Take the rebuilt index the build job hashed
+        id: verify
+        env:
+          SHA256: ${{ needs.build.outputs.sha256 }}
+        run: |
+          file="$RUNNER_TEMP/index/index.db"
+          # node throws when the artifact holds no index.db, which ends this step red.
+          actual=$(node -e 'process.stdout.write(require("node:crypto").createHash("sha256").update(require("node:fs").readFileSync(process.argv[1])).digest("hex"))' "$file")
+          if [ "$actual" != "$SHA256" ]; then
+            echo "The artifact's sha256 is $actual, but the build job hashed '$SHA256'." >&2
+            exit 1
+          fi
+          mv "$file" index.db
+      - name: Set version to the next patch npm does not have
+        id: version
+        run: |
+          name=$(node -p 'require("./package.json").name')
+          # The whole version list, read as release.yml reads it. npm exits non-zero when it
+          # cannot read the list, and node throws unless it got a non-empty one. Either
+          # assignment then ends this step red, so an outage never passes for an empty list.
+          versions=$(npm view "$name" versions --json)
+          version=$(node -e '
+            const fs = require("node:fs");
+            const list = JSON.parse(process.argv[1]);
+            if (!Array.isArray(list)) throw new Error("npm printed no version list: " + process.argv[1]);
+            const manifest = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            // Only x.y.z counts. release.yml cannot publish a prerelease, and npm leaves prereleases
+            // out when it checks a new version against latest.
+            const parse = (version) => /^(\d+)\.(\d+)\.(\d+)$/.exec(version)?.slice(1).map(Number);
+            const current = parse(manifest.version);
+            if (!current) throw new Error("package.json version " + manifest.version + " is not x.y.z");
+            // The package major is SCHEMA_VERSION. The suite in the build job checked that on this commit.
+            const major = current[0];
+            const highest = list.map(parse).filter((v) => v && v[0] === major).sort((a, b) => b[1] - a[1] || b[2] - a[2])[0];
+            if (!highest) throw new Error("npm lists no " + major + ".x.y version");
+            // Above the highest version npm lists in the major, so npm does not have it.
+            const next = [major, highest[1], highest[2] + 1];
+            // A next patch at or below package.json means npm does not list that version yet, so
+            // its release is pending or failed. A pull request that kept it would publish nothing
+            // once that release lands.
+            if (next[1] < current[1] || (next[1] === current[1] && next[2] <= current[2])) {
+              throw new Error("npm does not list " + manifest.version + " from package.json yet. Let its release finish, or fix it, then run drift again.");
+            }
+            manifest.version = next.join(".");
+            fs.writeFileSync("package.json", JSON.stringify(manifest, null, 2) + "\n");
+            console.log(manifest.version);
+          ' "$versions")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Push drift/index and open or update its pull request
+        id: propose
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          COMMITTED: ${{ needs.build.outputs.committed }}
+          REBUILT: ${{ needs.build.outputs.rebuilt }}
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+        run: |
+          for value in "$COMMITTED" "$REBUILT"; do
+            if [[ ! $value =~ ^[0-9a-f]{64}$ ]]; then
+              echo "Not a SHA-256 hex digest: '$value'" >&2
+              exit 1
+            fi
+          done
+          if [[ ! $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Not a version: '$VERSION'" >&2
+            exit 1
+          fi
+          title="chore: release a refreshed index as $VERSION"
+          digests=$(printf 'Committed index digest: %s\nRebuilt index digest: %s' "$COMMITTED" "$REBUILT")
+          # shellcheck disable=SC2016 # the backticks are Markdown, not command substitution
+          body=$(printf 'The drift job rebuilt `index.db`, and its content changed. Merging this pull request publishes `%s`.\n\n- committed index digest: `%s`\n- rebuilt index digest: `%s`\n\nRun: %s/%s/actions/runs/%s\n' \
+            "$VERSION" "$COMMITTED" "$REBUILT" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")
+
+          git add index.db package.json
+          git commit --quiet -m "$title" -m "$digests"
+          # The stable branch, replaced on every run. The token reaches git through a credential
+          # helper that reads it from the environment, so it is never written to .git/config and
+          # never appears on a command line.
+          # shellcheck disable=SC2016 # git's shell expands $GH_TOKEN when it runs the helper
+          git -c credential.helper= \
+            -c 'credential.helper=!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f' \
+            push --force origin HEAD:refs/heads/drift/index
+
+          number=$(gh api "repos/$GITHUB_REPOSITORY/pulls?head=$GITHUB_REPOSITORY_OWNER:drift/index&base=main&state=open" --jq '.[0].number // empty')
+          if [ -n "$number" ]; then
+            gh api --method PATCH "repos/$GITHUB_REPOSITORY/pulls/$number" -f title="$title" -f body="$body" --jq .html_url
+          else
+            gh api --method POST "repos/$GITHUB_REPOSITORY/pulls" -f head=drift/index -f base=main -f title="$title" -f body="$body" --jq .html_url
+          fi
