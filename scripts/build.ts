@@ -12,7 +12,8 @@
  * What this script adds is the one thing the server cannot know: which file is this
  * package's index. It passes DB_PATH, the path the package itself exports, so the build
  * writes exactly the file that ships. It runs the devDependency's binary, the version
- * the lockfile pins, rather than a floating `npx`.
+ * the lockfile pins, rather than a floating `npx`. It also gives the generator's PyPI
+ * dependencies a cooldown, PYPI_COOLDOWN below.
  *
  * DB_PATH is imported by the package's own name, which resolves to the built dist/, so
  * `pnpm build-index` builds first.
@@ -24,12 +25,19 @@ import { DB_PATH } from '@tibia.sh/tibiawiki-data';
 /** The server CLI from the devDependency. The server has `bin` only, no library entry. */
 const SERVER_BIN = fileURLToPath(new URL('../node_modules/.bin/tibiawiki-mcp', import.meta.url));
 
-// The rest of the environment passes through untouched: build-index shells out to
-// `uvx`, which needs PATH, its cache under HOME, and any proxy settings to reach
+/**
+ * uvx resolves the generator's unpinned PyPI dependencies afresh on every build, so a
+ * release waits out the same 7 days pnpm-workspace.yaml gives npm packages. It reaches uv
+ * as UV_EXCLUDE_NEWER, and a UV_EXCLUDE_NEWER already in the environment wins.
+ */
+const PYPI_COOLDOWN = '7 days';
+
+// The environment passes through and wins over the cooldown default: build-index shells
+// out to `uvx`, which needs PATH, its cache under HOME, and any proxy settings to reach
 // TibiaWiki.
 const result = spawnSync(SERVER_BIN, ['build-index'], {
   stdio: 'inherit',
-  env: { ...process.env, TIBIAWIKI_MCP_DB: DB_PATH },
+  env: { UV_EXCLUDE_NEWER: PYPI_COOLDOWN, ...process.env, TIBIAWIKI_MCP_DB: DB_PATH },
 });
 
 if (result.error) {
