@@ -115,8 +115,12 @@ crawl.
 
 `pnpm test` pins the generator too. It fails for an index whose `database_info` `version`
 is anything but `9.0.0`. The major version covers only the server's enrichment tables,
-and no version covers the tables tibiawiki-sql writes yet, so a rebuild with another
-generator waits until that is decided.
+and no version covers the tables tibiawiki-sql writes.
+
+A generator upgrade does not bump the major. Instead, before you release an index built by a
+new generator, the oldest published server that depends on `^N` has to pass its full item
+sweep in `test/regression.test.ts` against that index. Until that gate exists, the `9.0.0`
+guard blocks any generator change.
 
 ### Drift
 
