@@ -289,13 +289,14 @@ function pack(spec: string[], cwd: string, destination: string, env: NodeJS.Proc
   return join(destination, written[0]!);
 }
 
-async function readRegistry(): Promise<unknown> {
+export async function readRegistry(): Promise<unknown> {
   try {
     const response = await fetch(REGISTRY_URL, {
       headers: { accept: 'application/vnd.npm.install-v1+json' },
       signal: AbortSignal.timeout(REGISTRY_TIMEOUT_MS),
     });
-    if (response.status !== 200) throw new Error(`The registry answered ${response.status} ${response.statusText}.`);
+    // An answer over HTTP/2 has no status text.
+    if (response.status !== 200) throw new Error(`The registry answered ${response.status} ${response.statusText}`.trimEnd() + '.');
     return await response.json();
   } catch (error) {
     throw new Error(`Could not read ${REGISTRY_URL}.`, { cause: error });

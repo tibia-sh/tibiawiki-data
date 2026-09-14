@@ -4,7 +4,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'no
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  checkConsumers, evaluateSweep, satisfiesCaret, selectConsumers, selectNewestConsumer, selectOldestConsumer,
+  checkConsumers, evaluateSweep, readRegistry, satisfiesCaret, selectConsumers, selectNewestConsumer, selectOldestConsumer,
   sweep,
 } from '../scripts/oldest-consumer.ts';
 
@@ -13,9 +13,9 @@ import {
  * published servers, so the suite cannot run it. These pin its decisions instead: which
  * published servers are the oldest and the newest consumer of a candidate, which of them the
  * gate lists to sweep, that it checks each listed server in turn and reports only the ones it
- * checked, and whether a sweep through a server was complete and clean. They also pin that a
- * sweep ends only once its server has exited, or at once when no server started, through a
- * stand-in server.
+ * checked, and whether a sweep through a server was complete and clean. They also pin what the
+ * gate says about a registry answer other than 200, and that a sweep ends only once its server
+ * has exited, or at once when no server started, through a stand-in server.
  * `pnpm oldest-consumer` runs the whole gate.
  */
 
@@ -248,6 +248,25 @@ test('a sweep of an index without items fails', () => {
   // Every other check passes on an empty index, and then the gate would have checked nothing.
   assert.equal(evaluateSweep([page([], { totalMatches: 0 })], { itemCount: 0, generateTime: STAMP }),
     'the sweep returned no items, so it checked nothing');
+});
+
+test('a registry answer other than 200 gives its status, and its status text only when there is one', async () => {
+  // Over HTTP/2 an answer has no status text, which is how the registry's own 404 came back.
+  const cases: Array<[ResponseInit, string]> = [
+    [{ status: 404 }, 'The registry answered 404.'],
+    [{ status: 503, statusText: 'Service Unavailable' }, 'The registry answered 503 Service Unavailable.'],
+  ];
+  const fetch = globalThis.fetch;
+  try {
+    for (const [init, message] of cases) {
+      globalThis.fetch = async () => new Response(null, init);
+      const error: unknown = await readRegistry().then(() => undefined, (thrown: unknown) => thrown);
+      assert.ok(error instanceof Error && error.cause instanceof Error, `a ${init.status} answer did not fail the read with a cause`);
+      assert.equal(error.cause.message, message);
+    }
+  } finally {
+    globalThis.fetch = fetch;
+  }
 });
 
 /** How long the stand-in server hangs before it exits by itself. A sweep that takes half as long had no bound. */
