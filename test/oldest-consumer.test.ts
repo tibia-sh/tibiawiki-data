@@ -1,14 +1,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  evaluateSweep, satisfiesCaret, selectConsumers, selectNewestConsumer, selectOldestConsumer,
+  checkConsumers, evaluateSweep, satisfiesCaret, selectConsumers, selectNewestConsumer, selectOldestConsumer,
 } from '../scripts/oldest-consumer.ts';
 
 /**
  * scripts/oldest-consumer.ts installs from the registry and serves every item through
  * published servers, so the suite cannot run it. These pin its decisions instead: which
  * published servers are the oldest and the newest consumer of a candidate, which of them the
- * gate lists to sweep, and whether a sweep through a server was complete and clean.
+ * gate lists to sweep, that it checks each listed server in turn and reports only the ones it
+ * checked, and whether a sweep through a server was complete and clean.
  * `pnpm oldest-consumer` runs the whole gate.
  */
 
@@ -161,6 +162,42 @@ test('a server that is both the oldest and the newest consumer is on the sweep l
   assert.equal(selectOldestConsumer(document, '3.0.2'), '0.2.0');
   assert.equal(selectNewestConsumer(document, '3.0.2'), '0.2.0');
   assert.deepEqual(selectConsumers(document, '3.0.2'), [{ version: '0.2.0', end: 'oldest and newest' }]);
+});
+
+/** A stand-in for the install and sweep of one consumer: it records each consumer, and fails for `failOn`. */
+function recordingCheck(failOn?: string) {
+  const checked: Array<{ version: string; end: string }> = [];
+  const check = async (consumer: { version: string; end: string }): Promise<void> => {
+    checked.push(consumer);
+    if (consumer.version === failOn) throw new Error(`the check of ${consumer.version} failed`);
+  };
+  return { checked, check };
+}
+
+test('the gate checks every listed consumer once, in order, and reports exactly the ones it checked', async () => {
+  for (const listed of [selectConsumers(PUBLISHED, '3.0.2'), selectConsumers(dependingOn({ '0.2.0': '^3' }), '3.0.2')]) {
+    const { checked, check } = recordingCheck();
+    const reported = await checkConsumers(listed, check);
+    // The report comes first, so a report that names a consumer the loop skipped fails on what it names.
+    assert.deepEqual(reported, checked, 'the gate reports consumers other than the ones it checked');
+    assert.deepEqual(checked, listed, 'the gate did not check every listed consumer, once and in order');
+  }
+});
+
+test('a failed check stops the gate at that consumer, with an error that names it', async () => {
+  const listed = selectConsumers(PUBLISHED, '3.0.2');
+  const cases = [
+    ['0.2.0', ['0.2.0'], 'The oldest consumer, @tibia.sh/tibiawiki-mcp@0.2.0, failed.'],
+    ['0.4.0', ['0.2.0', '0.4.0'], 'The newest consumer, @tibia.sh/tibiawiki-mcp@0.4.0, failed.'],
+  ] as const;
+  for (const [failOn, ran, message] of cases) {
+    const { checked, check } = recordingCheck(failOn);
+    await assert.rejects(checkConsumers(listed, check), (error: unknown) =>
+      error instanceof Error && error.message === message &&
+      error.cause instanceof Error && error.cause.message === `the check of ${failOn} failed`,
+    `a failed check of ${failOn} did not end the gate`);
+    assert.deepEqual(checked.map(({ version }) => version), ran, `the gate went on checking after ${failOn} failed`);
+  }
 });
 
 const STAMP = '2026-09-13T07:02:58.860376+00:00';
