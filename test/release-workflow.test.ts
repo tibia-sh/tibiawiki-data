@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { code, keys, read, runScripts, runStep, scalar, stepIf, stepIndex, stepInputs, stepName, steps, stepScript, under, workflowFiles } from './workflow.ts';
 
 /**
@@ -164,6 +165,13 @@ test('every pnpm/setup step in every workflow runs a frozen install, and takes t
     assert.equal(scalar(inputs, 'version'), undefined, `${where} sets a pnpm version beside packageManager`);
     assert.equal(scalar(inputs, 'runtime'), undefined, `${where} installs a runtime`);
   }
+  // Without a runtime input, pnpm/setup installs every runtime package.json declares in
+  // devEngines.runtime, so a runtime declared there lands on PATH ahead of setup-node's Node too.
+  const manifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as {
+    devEngines?: { runtime?: unknown };
+  };
+  assert.equal(manifest.devEngines?.runtime, undefined,
+    'package.json declares devEngines.runtime, which pnpm/setup installs ahead of setup-node');
 });
 
 test('only the ci.yml test and oldest-consumer jobs cache the pnpm store', () => {
