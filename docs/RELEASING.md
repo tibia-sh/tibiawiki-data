@@ -23,10 +23,10 @@ The release job waits for `oldest-consumer`, so a red gate blocks the publish. T
 | The log under `FAIL` says | Cause | What to do |
 |---|---|---|
 | `is an error, so the server could not serve it`, `came from an index generated at`, `matching items, but the index holds`, `came back on page`, `distinct items, but the index holds`, `the sweep returned no items` or `is not in the shape the gate reads` | The sweep failed | A published `^N` server breaks on this index, so do not publish it as `N.x`. Fix the index or the generator, or treat the change as a new major under [Bumping the schema version](../README.md#bumping-the-schema-version). |
-| `did not finish within`, `Request timed out`, `spawnSync npm ETIMEDOUT` or `The operation was aborted due to timeout` | A step timed out | Re-run the run once. When the same commit times out a second time, treat it as a failed sweep. |
+| `The sweep did not finish within` or `Request timed out` | The sweep timed out | Re-run the run once. When the same commit times out a second time, treat it as a failed sweep. |
 | `npm installed`, `resolves @tibia.sh/tibiawiki-data/index.db to`, `not the candidate`, `DB_PATH is` or `is not defined by "exports"` | An install check failed | The install did not come out the way a user gets it, for example because of the candidate's `exports` map or its `DB_PATH`. Fix the package shape, not the index. |
 | `No published @tibia.sh/tibiawiki-mcp depends on a range that` | No consumer | The candidate is a new major, and no published server depends on it yet. Follow the schema-bump procedure, [Bumping the schema version](../README.md#bumping-the-schema-version). |
-| `Could not read https://registry.npmjs.org/` followed by `fetch failed` or `The registry answered`, or `Command failed: npm` with a network error such as `ECONNREFUSED` | npm was unreachable | Re-run the run once npm is back. The run publishes only a version npm lacks. |
+| `Could not read https://registry.npmjs.org/`, `spawnSync npm ETIMEDOUT`, or `Command failed: npm` with a network error such as `ECONNREFUSED` | npm was unreachable or too slow | Re-run the run once npm is back. The run publishes only a version npm lacks. |
 
 ## Runs close together
 
