@@ -41,13 +41,20 @@
  *     to the installed candidate's DB_PATH, so no other index on the machine can answer.
  *   - Every step is bounded. npm pack gets 120 s and npm install 300 s, both killed with
  *     SIGKILL. The registry gets 30 s. The sweep gets 600 s, and inside it the connect and each
- *     call get 60 s. The server is stopped when the sweep ends, pass or fail. The candidate is
- *     packed once, and each of two consumers is packed, installed and swept, so the bounds add
- *     up to 2190 s. The gate jobs in ci.yml and release.yml leave room for that.
+ *     call get 60 s. The candidate is packed once, and each of two consumers is packed, installed
+ *     and swept, so the bounds add up to 2190 s. The gate jobs in ci.yml and release.yml leave
+ *     room for that.
+ *   - The sweep stops the server when it ends, pass or fail, and ends only once the server's
+ *     process has closed, which it does after the server exits, so nothing the server writes
+ *     reaches the log after the PASS or FAIL line. The MCP client ends the server's stdin, and a
+ *     server still running 2 s later gets SIGTERM, then SIGKILL 2 s after that. A stop takes a
+ *     little over 4 s at most, out of the room those jobs leave. A server that never started
+ *     leaves nothing to wait for.
  *   - A failure names the consumer it happened in, when it happened in one. PASS names the
  *     consumers whose sweep completed, never the list chosen for it.
- *   - The scratch directory is removed when the run ends, pass or fail. A signal that kills
- *     this process leaves it in the temp directory, which a CI runner discards.
+ *   - The scratch directory is removed when the run ends, pass or fail, and only after every
+ *     server the run started has exited, so none of them is still loading from it. A signal
+ *     that kills this process leaves it in the temp directory, which a CI runner discards.
  */
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
@@ -331,18 +338,28 @@ function readPage(content: unknown, number: number): { page: Page; nextCursor: s
 }
 
 /** Pages every item through the server at `entry`, serving the index at `dbPath`. */
-async function sweep(entry: string, dbPath: string, env: Record<string, string>): Promise<Page[]> {
+export async function sweep(entry: string, dbPath: string, env: Record<string, string>): Promise<Page[]> {
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [entry, 'serve'],
     env: { ...env, TIBIAWIKI_MCP_DB: dbPath },
   });
+  // Set before the connect, which wraps it rather than replacing it. The transport calls it when
+  // the server's process closes, and a process closes only after it has exited.
+  const closed = new Promise<void>((resolve) => {
+    transport.onclose = () => resolve();
+  });
   const client = new Client({ name: 'tibiawiki-data-oldest-consumer', version: '1.0.0' });
   const budget = AbortSignal.timeout(SWEEP_TIMEOUT_MS);
   const options = { timeout: CALL_TIMEOUT_MS, signal: budget };
   const pages: Page[] = [];
+  let server: number | null = null;
   try {
-    await client.connect(transport, options);
+    const connected = client.connect(transport, options);
+    // The connect starts the server before its first wait, and a server that failed to start has
+    // no pid. Read later, a failed connect has already cleared it.
+    server = transport.pid;
+    await connected;
     let cursor: string | undefined;
     do {
       const result = await client.callTool(
@@ -363,8 +380,12 @@ async function sweep(entry: string, dbPath: string, env: Record<string, string>)
     if (budget.aborted) throw new Error(`The sweep did not finish within ${SWEEP_TIMEOUT_MS / 1000} s, after ${pages.length} pages.`, { cause: error });
     throw error;
   } finally {
-    // Ends the server's stdin, then sends SIGTERM and SIGKILL to a server still running.
+    // Ends the server's stdin, then sends SIGTERM and SIGKILL to a server still running, but does
+    // not wait for the exit that SIGKILL brings. When the client has started that close itself,
+    // as a failed connect does, this call returns at once. So the sweep waits for the process to
+    // close, unless no server ever started.
     await client.close();
+    if (server !== null) await closed;
   }
 }
 

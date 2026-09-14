@@ -1,7 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   checkConsumers, evaluateSweep, satisfiesCaret, selectConsumers, selectNewestConsumer, selectOldestConsumer,
+  sweep,
 } from '../scripts/oldest-consumer.ts';
 
 /**
@@ -9,7 +13,9 @@ import {
  * published servers, so the suite cannot run it. These pin its decisions instead: which
  * published servers are the oldest and the newest consumer of a candidate, which of them the
  * gate lists to sweep, that it checks each listed server in turn and reports only the ones it
- * checked, and whether a sweep through a server was complete and clean.
+ * checked, and whether a sweep through a server was complete and clean. They also pin that a
+ * sweep ends only once its server has exited, or at once when no server started, through a
+ * stand-in server.
  * `pnpm oldest-consumer` runs the whole gate.
  */
 
@@ -242,4 +248,89 @@ test('a sweep of an index without items fails', () => {
   // Every other check passes on an empty index, and then the gate would have checked nothing.
   assert.equal(evaluateSweep([page([], { totalMatches: 0 })], { itemCount: 0, generateTime: STAMP }),
     'the sweep returned no items, so it checked nothing');
+});
+
+/** How long the stand-in server hangs before it exits by itself. A sweep that takes half as long had no bound. */
+const HANG_MS = 30_000;
+
+/**
+ * Stands in for a server whose connect fails. It closes its stderr at once, so a sweep that took
+ * the end of a stderr pipe for the exit would stop waiting while the stand-in still runs. It
+ * opens /dev/null in its place, because Node reopens stderr at the stdin EOF and would crash
+ * without one. It answers initialize with a protocol version no client speaks, so the client
+ * fails the connect and starts closing the server without waiting for it. It ignores the stdin
+ * EOF and the SIGTERM that close sends, so only SIGKILL stops it before HANG_MS. It records its
+ * pid in STAND_IN_PID.
+ */
+const STUBBORN_SERVER = `import { closeSync, openSync, writeFileSync } from 'node:fs';
+closeSync(2);
+openSync('/dev/null', 'w');
+writeFileSync(process.env.STAND_IN_PID, String(process.pid));
+process.on('SIGTERM', () => {});
+let buffered = '';
+process.stdin.setEncoding('utf8').on('data', (chunk) => {
+  buffered += chunk;
+  let end = buffered.indexOf('\\n');
+  while (end !== -1) {
+    const { id, method } = JSON.parse(buffered.slice(0, end));
+    buffered = buffered.slice(end + 1);
+    end = buffered.indexOf('\\n');
+    if (method !== 'initialize') continue;
+    const result = { protocolVersion: '1999-01-01', capabilities: {}, serverInfo: { name: 'stand-in', version: '0.0.0' } };
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id, result }) + '\\n');
+  }
+});
+setTimeout(() => {}, ${HANG_MS});
+`;
+
+/** The pid the stand-in recorded, or undefined before it has. Never 0, which `process.kill` reads as the process group. */
+const standInPid = (file: string): number | undefined => {
+  const text = existsSync(file) ? readFileSync(file, 'utf8') : '';
+  return /^[1-9]\d*$/.test(text) ? Number(text) : undefined;
+};
+
+/** Whether the process `pid` still exists. */
+function isRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ESRCH') return false;
+    throw error;
+  }
+}
+
+test('a failed connect ends the sweep only once the server has exited, even one that ignores SIGTERM and closes its stderr', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tibiawiki-data-oldest-consumer-test-'));
+  const entry = join(dir, 'server.mjs');
+  const pidFile = join(dir, 'pid');
+  writeFileSync(entry, STUBBORN_SERVER);
+  const started = Date.now();
+  try {
+    const error: unknown = await sweep(entry, join(dir, 'index.db'), { STAND_IN_PID: pidFile })
+      .then(() => undefined, (thrown: unknown) => thrown);
+    const ms = Date.now() - started;
+    // Checked the moment the sweep ends, with no grace: Node reaps a child before its process closes.
+    const pid = standInPid(pidFile);
+    const running = pid !== undefined && isRunning(pid);
+    // Rules out a stand-in that failed some other way, before the connect this test is about.
+    assert.ok(error instanceof Error && error.message === "Server's protocol version is not supported: 1999-01-01",
+      `the connect did not fail on the stand-in's protocol version: ${String(error)}`);
+    assert.ok(pid !== undefined, 'the stand-in never recorded its pid');
+    assert.equal(running, false, 'the server was still running when the sweep ended');
+    assert.ok(ms < HANG_MS / 2, `the sweep ended after ${ms} ms, when the server gave up by itself, so nothing killed it`);
+  } finally {
+    // A sweep that ended too early leaves the stand-in running.
+    const pid = standInPid(pidFile);
+    if (pid !== undefined && isRunning(pid)) process.kill(pid, 'SIGKILL');
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a server that cannot start ends the sweep at once, with no process to wait for', { timeout: 5_000 }, async () => {
+  // An environment too big to hand to a new process fails the spawn with E2BIG, before any
+  // process exists, so neither path below is ever read.
+  const error: unknown = await sweep(join(tmpdir(), 'no-server.mjs'), join(tmpdir(), 'no-index.db'), { TOO_BIG: 'x'.repeat(4 * 1024 * 1024) })
+    .then(() => undefined, (thrown: unknown) => thrown);
+  assert.equal((error as NodeJS.ErrnoException | undefined)?.code, 'E2BIG', `the spawn did not fail with E2BIG: ${String(error)}`);
 });
