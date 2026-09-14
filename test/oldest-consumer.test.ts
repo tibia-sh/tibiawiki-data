@@ -319,7 +319,10 @@ function isRunning(pid: number): boolean {
   }
 }
 
-test('a failed connect ends the sweep only once the server has exited, even one that ignores SIGTERM and closes its stderr', async () => {
+// The timeout outlasts HANG_MS, so a sweep that waits for the stand-in to give up by itself still
+// fails on the bound below, and a sweep that never ends fails on the timeout instead of holding the
+// run open.
+test('a failed connect ends the sweep only once the server has exited, even one that ignores SIGTERM and closes its stderr', { timeout: HANG_MS + 15_000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), 'tibiawiki-data-oldest-consumer-test-'));
   const entry = join(dir, 'server.mjs');
   const pidFile = join(dir, 'pid');
