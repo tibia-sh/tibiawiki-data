@@ -147,12 +147,13 @@ test("the only cache either job restores or saves is pnpm/setup's lockfile-verif
   const nodes = all.filter((step) => /uses: *actions\/setup-node@/.test(step));
   assert.equal(nodes.length, 2, 'expected one setup-node in each job');
   for (const step of nodes) {
-    assert.match(step, /^ *package-manager-cache: *false$/m, 'setup-node caches the package manager store');
-    assert.doesNotMatch(step, /^ *cache:/m, 'setup-node restores a dependency cache');
+    const inputs = stepInputs(step);
+    assert.equal(scalar(inputs, 'package-manager-cache'), 'false', 'setup-node caches the package manager store');
+    assert.equal(scalar(inputs, 'cache'), undefined, 'setup-node restores a dependency cache');
   }
   const uvs = all.filter((step) => /uses: *astral-sh\/setup-uv@/.test(step));
   assert.equal(uvs.length, 1, 'expected one setup-uv, in the build job');
-  assert.match(uvs[0]!, /^ *enable-cache: *false$/m, 'setup-uv caches');
+  assert.equal(scalar(stepInputs(uvs[0]!), 'enable-cache'), 'false', 'setup-uv caches');
   const pnpms = all.filter((step) => /uses: *pnpm\/setup@/.test(step));
   assert.equal(pnpms.length, 1, 'expected one pnpm/setup, in the build job');
   const inputs = stepInputs(pnpms[0]!);
