@@ -15,14 +15,16 @@ concurrency:
   queue: max  # a waiting run is kept rather than replaced by a newer one, though GitHub does not guarantee their order
 
 jobs:
-  # The oldest published server that depends on this package's major, installed together with
-  # the packed index, pages every item. scripts/oldest-consumer.ts says why. It runs on every
-  # push, not only on one that publishes, so an index that breaks that server shows red even
-  # when nothing is published.
+  # The oldest and the newest published servers that depend on this package's major, each
+  # installed together with the packed index, page every item. scripts/oldest-consumer.ts says
+  # why. It runs on every push, not only on one that publishes, so an index that breaks either
+  # server shows red even when nothing is published.
   oldest-consumer:
     runs-on: ubuntu-latest
-    # Its own bounds add up to under 20 minutes. The rest is room for checkout and setup.
-    timeout-minutes: 30
+    # The script's own bounds add up to 2190 s, summed beside the value: 120 s to pack the
+    # candidate and 30 s for the registry, then 120 s to pack, 300 s to install and 600 s to
+    # sweep each of two consumers. The rest is room for checkout and setup.
+    timeout-minutes: 45  # 120 + 30 + 2 * (120 + 300 + 600) = 2190 s, 36.5 minutes
     permissions:
       contents: read
     steps:

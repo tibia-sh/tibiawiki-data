@@ -1,25 +1,31 @@
 /**
- * The oldest-consumer gate for a data release: the oldest published server that depends on
- * this package's major, installed together with the packed candidate, pages every item.
+ * The oldest-consumer gate for a data release: the oldest and the newest published servers
+ * that depend on this package's major, each installed together with the packed candidate,
+ * page every item. A server that is both is swept once.
  *
  *   pnpm oldest-consumer
  *
- * A server depends on ^N, so a user who installed the oldest ^N server gets every new N.x of
- * this package with their next install. `pnpm test` checks the index against the
- * devDependency server only, and the server's every-item sweep runs in the server repository,
- * against the data version that repository locks. This gate checks what that user runs: the
- * published server package, installed by npm beside the tarball this checkout packs.
+ * A server depends on ^N, so a user of any ^N server gets every new N.x of this package with
+ * their next install. `pnpm test` checks the index against the devDependency server only, and
+ * the server's every-item sweep runs in the server repository, against the data version that
+ * repository locks. Nothing runs there when this package publishes. This gate checks what
+ * those users run: published server packages, installed by npm beside the tarball this
+ * checkout packs. The oldest ^N server has the oldest serving code that still gets a new N.x.
+ * The newest is the one a fresh install gets, and newer serving code can refuse an index the
+ * oldest serves, through a stricter output schema or a new required column.
  *
  * Why each choice:
  *
- *   - The consumer comes from the registry's abbreviated document, which carries every
+ *   - The consumers come from the registry's abbreviated document, which carries every
  *     version's dependencies. A response other than 200, a timeout or a document of another
- *     shape fails the gate, and none of them ever reads as a missing consumer.
+ *     shape fails the gate, and none of them ever reads as a missing consumer. Both are chosen
+ *     before either is installed.
  *   - Each tarball is packed into an empty directory of its own and taken from there, because
  *     `npm pack --json` prints a list in npm 11 and an object keyed by package name in npm 12.
- *   - The consumer is packed from the registry and installed from its tarball. It is
- *     first-party, so the cooldown does not apply to it, and a server published within the
- *     cooldown could not resolve under --before at all.
+ *   - Each consumer is packed from the registry and installed from its tarball, in a directory
+ *     of its own, beside the one candidate tarball. It is first-party, so the cooldown does not
+ *     apply to it, and a server published within the cooldown could not resolve under --before
+ *     at all.
  *   - Everything else the install resolves waits out the cooldown pnpm-workspace.yaml sets for
  *     npm packages, through --before. No install script runs.
  *   - After the install, the consumer has to resolve the index to the candidate at the root of
@@ -35,7 +41,10 @@
  *     to the installed candidate's DB_PATH, so no other index on the machine can answer.
  *   - Every step is bounded. npm pack gets 120 s and npm install 300 s, both killed with
  *     SIGKILL. The registry gets 30 s. The sweep gets 600 s, and inside it the connect and each
- *     call get 60 s. The server is stopped when the sweep ends, pass or fail.
+ *     call get 60 s. The server is stopped when the sweep ends, pass or fail. The candidate is
+ *     packed once, and each of two consumers is packed, installed and swept, so the bounds add
+ *     up to 2190 s. The gate jobs in ci.yml and release.yml leave room for that.
+ *   - A failure names the consumer it happened in, when it happened in one.
  *   - The scratch directory is removed when the run ends, pass or fail. A signal that kills
  *     this process leaves it in the temp directory, which a CI runner discards.
  */
@@ -91,11 +100,12 @@ export function satisfiesCaret(range: string, version: string): boolean {
 }
 
 /**
- * The oldest stable server version whose range for this package the candidate satisfies,
- * compared as numbers, so 0.10.0 is newer than 0.9.0. Versions without that dependency, and
- * prereleases, are skipped. A document of another shape throws, and never reads as no consumer.
+ * The stable server versions that depend on this package, oldest first, with their ranges.
+ * Versions compare as numbers, so 0.10.0 is newer than 0.9.0. Versions without that dependency,
+ * and prereleases, are skipped. A document of another shape throws, and never reads as no
+ * consumer.
  */
-export function selectOldestConsumer(packument: Packument, candidate: string): string {
+function dependents(packument: Packument, candidate: string): Array<{ name: string; version: Version; range: string }> {
   if (!parseVersion(candidate)) throw new Error(`The candidate version ${candidate} is not x.y.z.`);
   // Read as unknown: the document comes from the network, whatever the parameter's type says.
   const document: unknown = packument;
@@ -103,7 +113,7 @@ export function selectOldestConsumer(packument: Packument, candidate: string): s
   if (!isRecord(versions) || Object.keys(versions).length === 0) {
     throw new Error(`The registry document lists no versions of ${SERVER}.`);
   }
-  const consumers: Array<{ name: string; version: Version; range: string }> = [];
+  const found: Array<{ name: string; version: Version; range: string }> = [];
   for (const [name, manifest] of Object.entries(versions)) {
     const malformed = () => new Error(`The registry document's entry for ${SERVER}@${name} is not a package version.`);
     if (!isRecord(manifest)) throw malformed();
@@ -114,16 +124,53 @@ export function selectOldestConsumer(packument: Packument, candidate: string): s
     if (range === undefined) continue;
     if (typeof range !== 'string') throw malformed();
     const version = parseVersion(name);
-    if (version) consumers.push({ name, version, range });
+    if (version) found.push({ name, version, range });
   }
-  consumers.sort((a, b) => compareVersions(a.version, b.version));
-  const oldest = consumers.find(({ range }) => satisfiesCaret(range, candidate));
-  if (oldest) return oldest.name;
-  throw new Error(
+  return found.sort((a, b) => compareVersions(a.version, b.version));
+}
+
+/** Why no server is a consumer of `candidate`. */
+const noConsumer = (candidate: string): Error =>
+  new Error(
     `No published ${SERVER} depends on a range that ${DATA}@${candidate} satisfies. A new data major has ` +
       'no consumer yet, so it is published by hand under the schema-bump procedure, "Bumping the schema ' +
       'version" in README.md.',
   );
+
+/**
+ * The oldest stable server version whose range for this package the candidate satisfies. It
+ * reads the ranges from the oldest version up, and a range the gate cannot read throws when it
+ * comes before the answer.
+ */
+export function selectOldestConsumer(packument: Packument, candidate: string): string {
+  const oldest = dependents(packument, candidate).find(({ range }) => satisfiesCaret(range, candidate));
+  if (oldest) return oldest.name;
+  throw noConsumer(candidate);
+}
+
+/**
+ * The newest stable server version whose range for this package the candidate satisfies. It
+ * reads the ranges from the newest version down, and a range the gate cannot read throws when
+ * it comes before the answer.
+ */
+export function selectNewestConsumer(packument: Packument, candidate: string): string {
+  const newest = dependents(packument, candidate).findLast(({ range }) => satisfiesCaret(range, candidate));
+  if (newest) return newest.name;
+  throw noConsumer(candidate);
+}
+
+/** A server the gate sweeps, and the end of the candidate's consumers it was chosen from. */
+type Consumer = { version: string; end: 'oldest' | 'newest' | 'oldest and newest' };
+
+/**
+ * The servers the gate sweeps for a candidate, in the order it sweeps them: the oldest
+ * consumer, then the newest. When one version is both, it is swept once.
+ */
+export function selectConsumers(packument: Packument, candidate: string): Consumer[] {
+  const oldest = selectOldestConsumer(packument, candidate);
+  const newest = selectNewestConsumer(packument, candidate);
+  if (newest === oldest) return [{ version: oldest, end: 'oldest and newest' }];
+  return [{ version: oldest, end: 'oldest' }, { version: newest, end: 'newest' }];
 }
 
 /**
@@ -299,6 +346,16 @@ async function sweep(entry: string, dbPath: string, env: Record<string, string>)
   }
 }
 
+/** The dist.integrity the registry document gives for `consumer`. */
+function integrityOf(document: unknown, consumer: string): string {
+  const versions = isRecord(document) ? document['versions'] : undefined;
+  const manifest = isRecord(versions) ? versions[consumer] : undefined;
+  const dist = isRecord(manifest) ? manifest['dist'] : undefined;
+  const integrity = isRecord(dist) ? dist['integrity'] : undefined;
+  if (typeof integrity !== 'string') throw new Error(`The registry document gives no dist.integrity for ${SERVER}@${consumer}.`);
+  return integrity;
+}
+
 /** Runs the gate in `scratch` and returns what passed. Any failure throws. */
 async function gate(scratch: string, startedAt: number): Promise<string> {
   // A consumer's shell carries none of this repository's package-manager config, and nothing
@@ -313,20 +370,45 @@ async function gate(scratch: string, startedAt: number): Promise<string> {
   log(`candidate: ${DATA}@${candidate}`);
 
   const document = await readRegistry();
-  const consumer = selectOldestConsumer(document as Packument, candidate);
-  const versions = isRecord(document) ? document['versions'] : undefined;
-  const manifest = isRecord(versions) ? versions[consumer] : undefined;
-  const dist = isRecord(manifest) ? manifest['dist'] : undefined;
-  const integrity = isRecord(dist) ? dist['integrity'] : undefined;
-  if (typeof integrity !== 'string') throw new Error(`The registry document gives no dist.integrity for ${SERVER}@${consumer}.`);
-  log(`consumer: ${SERVER}@${consumer}, the oldest published server whose range ${candidate} satisfies`);
-  log(`consumer integrity: ${integrity}`);
-  const consumerTarball = pack([`${SERVER}@${consumer}`], scratch, join(scratch, 'consumer'), env);
+  const consumers = selectConsumers(document as Packument, candidate);
+  for (const { version, end } of consumers) {
+    const which = end === 'oldest and newest'
+      ? `both the oldest and the newest published server whose range ${candidate} satisfies, so it is swept once`
+      : `the ${end} published server whose range ${candidate} satisfies`;
+    log(`${end} consumer: ${SERVER}@${version}, ${which}`);
+    log(`${end} consumer integrity: ${integrityOf(document, version)}`);
+  }
 
-  const install = join(scratch, 'install');
+  const before = new Date(startedAt - cooldownMs()).toISOString();
+  for (const { version, end } of consumers) {
+    log(`\nsweeping the ${end} consumer, ${SERVER}@${version}`);
+    try {
+      await checkConsumer({ consumer: version, dir: join(scratch, version), candidate, candidateTarball, before, env });
+    } catch (error) {
+      throw new Error(`The ${end} consumer, ${SERVER}@${version}, failed.`, { cause: error });
+    }
+  }
+  return `${consumers.map(({ version }) => `${SERVER}@${version}`).join(' and ')} served every item of ${DATA}@${candidate}`;
+}
+
+/**
+ * Installs `consumer` from the registry together with the candidate tarball, in `dir`, a new
+ * directory, checks what npm installed, and pages every item through it. Any failure throws.
+ */
+async function checkConsumer({ consumer, dir, candidate, candidateTarball, before, env }: {
+  consumer: string;
+  dir: string;
+  candidate: string;
+  candidateTarball: string;
+  before: string;
+  env: Record<string, string>;
+}): Promise<void> {
+  mkdirSync(dir);
+  const consumerTarball = pack([`${SERVER}@${consumer}`], dir, join(dir, 'consumer'), env);
+
+  const install = join(dir, 'install');
   mkdirSync(install);
   writeFileSync(join(install, 'package.json'), JSON.stringify({ name: 'oldest-consumer-gate', private: true }));
-  const before = new Date(startedAt - cooldownMs()).toISOString();
   log(`installing both tarballs with npm, the rest resolved --before=${before}`);
   execFileSync('npm', ['install', '--ignore-scripts', '--no-audit', '--no-fund', `--before=${before}`, consumerTarball, candidateTarball], {
     cwd: install, env, encoding: 'utf8', timeout: INSTALL_TIMEOUT_MS, killSignal: 'SIGKILL', stdio: ['ignore', 'pipe', 'pipe'],
@@ -354,7 +436,6 @@ async function gate(scratch: string, startedAt: number): Promise<string> {
   log(`swept: pages ${pages.length}, items ${items}`);
   const reason = evaluateSweep(pages, expected);
   if (reason !== undefined) throw new Error(reason);
-  return `${SERVER}@${consumer} served every item of ${DATA}@${candidate}`;
 }
 
 if (import.meta.main) {
