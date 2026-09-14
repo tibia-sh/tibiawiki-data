@@ -44,7 +44,8 @@
  *     call get 60 s. The server is stopped when the sweep ends, pass or fail. The candidate is
  *     packed once, and each of two consumers is packed, installed and swept, so the bounds add
  *     up to 2190 s. The gate jobs in ci.yml and release.yml leave room for that.
- *   - A failure names the consumer it happened in, when it happened in one.
+ *   - A failure names the consumer it happened in, when it happened in one. PASS names the
+ *     consumers whose sweep completed, never the list chosen for it.
  *   - The scratch directory is removed when the run ends, pass or fail. A signal that kills
  *     this process leaves it in the temp directory, which a CI runner discards.
  */
@@ -171,6 +172,27 @@ export function selectConsumers(packument: Packument, candidate: string): Consum
   const newest = selectNewestConsumer(packument, candidate);
   if (newest === oldest) return [{ version: oldest, end: 'oldest and newest' }];
   return [{ version: oldest, end: 'oldest' }, { version: newest, end: 'newest' }];
+}
+
+/**
+ * Runs `check` on each consumer in turn, in the order given, and returns the consumers whose
+ * check completed, which are the ones the gate reports as swept. A check that throws ends the
+ * loop there, with an error that names the consumer.
+ */
+export async function checkConsumers(
+  consumers: readonly Consumer[],
+  check: (consumer: Consumer) => Promise<void>,
+): Promise<Consumer[]> {
+  const checked: Consumer[] = [];
+  for (const consumer of consumers) {
+    try {
+      await check(consumer);
+    } catch (error) {
+      throw new Error(`The ${consumer.end} consumer, ${SERVER}@${consumer.version}, failed.`, { cause: error });
+    }
+    checked.push(consumer);
+  }
+  return checked;
 }
 
 /**
@@ -380,15 +402,11 @@ async function gate(scratch: string, startedAt: number): Promise<string> {
   }
 
   const before = new Date(startedAt - cooldownMs()).toISOString();
-  for (const { version, end } of consumers) {
+  const swept = await checkConsumers(consumers, async ({ version, end }) => {
     log(`\nsweeping the ${end} consumer, ${SERVER}@${version}`);
-    try {
-      await checkConsumer({ consumer: version, dir: join(scratch, version), candidate, candidateTarball, before, env });
-    } catch (error) {
-      throw new Error(`The ${end} consumer, ${SERVER}@${version}, failed.`, { cause: error });
-    }
-  }
-  return `${consumers.map(({ version }) => `${SERVER}@${version}`).join(' and ')} served every item of ${DATA}@${candidate}`;
+    await checkConsumer({ consumer: version, dir: join(scratch, version), candidate, candidateTarball, before, env });
+  });
+  return `${swept.map(({ version }) => `${SERVER}@${version}`).join(' and ')} served every item of ${DATA}@${candidate}`;
 }
 
 /**
