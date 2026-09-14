@@ -325,8 +325,9 @@ test('setup-node restores no dependency cache into the job that publishes, or in
     const setups = jobSteps.filter((step) => /^ *(?:- +)?uses: *actions\/setup-node@/m.test(step));
     assert.ok(setups.length > 0, `the ${job} job never sets up node`);
     for (const step of setups) {
-      assert.match(step, /^ *package-manager-cache: *false$/m, `setup-node in the ${job} job caches the package manager store`);
-      assert.doesNotMatch(step, /^ *cache:/m, `setup-node in the ${job} job restores a dependency cache`);
+      const inputs = stepInputs(step);
+      assert.equal(scalar(inputs, 'package-manager-cache'), 'false', `setup-node in the ${job} job caches the package manager store`);
+      assert.equal(scalar(inputs, 'cache'), undefined, `setup-node in the ${job} job restores a dependency cache`);
     }
   }
 });
