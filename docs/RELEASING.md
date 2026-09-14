@@ -26,7 +26,8 @@ The release job waits for `oldest-consumer`, so a red gate blocks the publish. T
 | `The sweep did not finish within` or `Request timed out` | The sweep timed out | Re-run the run once. When the same commit times out a second time, treat it as a failed sweep. |
 | `npm installed`, `resolves @tibia.sh/tibiawiki-data/index.db to`, `holds @tibia.sh/tibiawiki-data@`, `DB_PATH is` or `is not defined by "exports"` | An install check failed | The install did not come out the way a user gets it, for example because of the candidate's `exports` map or its `DB_PATH`. Fix the package shape, not the index. |
 | `No published @tibia.sh/tibiawiki-mcp depends on a range that` | No consumer | The candidate is a new major, and no published server depends on it yet. Follow the schema-bump procedure, [Bumping the schema version](../README.md#bumping-the-schema-version). |
-| `Could not read https://registry.npmjs.org/`, `spawnSync npm ETIMEDOUT`, or `Command failed: npm` with a network error such as `npm error code ECONNREFUSED` | npm was unreachable or too slow | Re-run the run once npm is back. The run publishes only a version npm lacks. |
+| `Could not read https://registry.npmjs.org/`, `spawnSync npm ETIMEDOUT`, or a network error from npm, such as `npm error code ECONNREFUSED` | npm was unreachable or too slow | Re-run the run once npm is back. The run publishes only a version npm lacks. |
+| `npm error code ETARGET`, `npm error code ENOVERSIONS` or `npm error code ERESOLVE` | npm could not resolve the install | npm takes everything but the two tarballs from before the `--before=` date in the log, 7 days back. Look up the package npm names with `npm view <name> time`. If every version that would do was published after that date, wait until one is 7 days old, then re-run the run. Otherwise the consumer and the candidate cannot install together. Fix the package shape, not the index. |
 
 ## Runs close together
 
