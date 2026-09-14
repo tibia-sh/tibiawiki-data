@@ -10,8 +10,8 @@
  * The count comes from each file's own summary. The run's closing summary would miss
  * exactly the case this exists for: it counts a file that ran no tests as one passing
  * test named after the file, so emptying a file that held one test would leave the
- * total unchanged. A file that ran no tests sends no summary of its own. Skipped and
- * todo tests are not passes, so they do not count either.
+ * total unchanged. A file that declares no tests sends no summary of its own. Skipped
+ * and todo tests are not passes, so they do not count either.
  */
 import type { TestEvent } from 'node:test/reporters';
 

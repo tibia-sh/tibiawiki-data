@@ -18,17 +18,19 @@ const REPORTER = fileURLToPath(new URL('./min-tests.ts', import.meta.url));
  * Runs the reporter over two fixtures: one file with `passing` passing tests and `skipped`
  * skipped ones, and one emptied file that keeps its import and declares no tests.
  * `nodeOptions` replaces NODE_OPTIONS in the child, and no value removes it.
+ * The fixtures are .mjs, so they load as ES modules whatever package.json sits above
+ * the temp directory.
  */
 function runWithFloor({ passing, skipped = 0, nodeOptions }: { passing: number; skipped?: number; nodeOptions?: string }) {
   const dir = mkdtempSync(join(tmpdir(), 'tibiawiki-data-min-tests-'));
   try {
     writeFileSync(
-      join(dir, 'tests.test.ts'),
+      join(dir, 'tests.test.mjs'),
       `import { test } from 'node:test';\n` +
         `for (let i = 0; i < ${passing}; i++) test('test ' + i, () => {});\n` +
         `for (let i = 0; i < ${skipped}; i++) test.skip('skipped ' + i, () => {});\n`,
     );
-    writeFileSync(join(dir, 'emptied.test.ts'), `import { test } from 'node:test';\nvoid test;\n`);
+    writeFileSync(join(dir, 'emptied.test.mjs'), `import { test } from 'node:test';\nvoid test;\n`);
     // Node marks every test-file process with NODE_TEST_CONTEXT. Inherited, it makes the
     // child report up to this runner instead of ending with its own exit code.
     const env: NodeJS.ProcessEnv = { ...process.env };
@@ -37,7 +39,7 @@ function runWithFloor({ passing, skipped = 0, nodeOptions }: { passing: number; 
     if (nodeOptions !== undefined) env['NODE_OPTIONS'] = nodeOptions;
     return spawnSync(
       process.execPath,
-      ['--test', `--test-reporter=${REPORTER}`, 'tests.test.ts', 'emptied.test.ts'],
+      ['--test', `--test-reporter=${REPORTER}`, 'tests.test.mjs', 'emptied.test.mjs'],
       { cwd: dir, env, encoding: 'utf8' },
     );
   } finally {
