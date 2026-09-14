@@ -18,12 +18,15 @@ npm never accepts the same version twice, even after an unpublish, per its [unpu
 
 ## When the oldest-consumer job fails
 
-The release job waits for `oldest-consumer`, so a red gate blocks the publish. The gate installs the oldest published server that depends on `^N` together with the packed index, and pages every item through it. Its log says whether the sweep failed or npm could not be reached.
+The release job waits for `oldest-consumer`, so a red gate blocks the publish. The gate installs the oldest and the newest published servers that depend on `^N`, each together with the packed index, and pages every item through each. When one server is both, the gate sweeps it once. Its log ends with a `FAIL` line, and the lines under it name the case. When the case happened in one consumer, the first of them names that consumer, such as `The newest consumer, @tibia.sh/tibiawiki-mcp@0.4.0, failed.` Look up the message after it:
 
-| Cause | What to do |
-|---|---|
-| The sweep failed | A published `^N` server breaks on this index, so do not publish it as `N.x`. Fix the index or the generator, or treat the change as a new major under [Bumping the schema version](../README.md#bumping-the-schema-version). |
-| npm was unreachable | Re-run the run once npm is back. The run publishes only a version npm lacks. |
+| The log under `FAIL` says | Cause | What to do |
+|---|---|---|
+| `is an error, so the server could not serve it`, `came from an index generated at`, `matching items, but the index holds`, `came back on page`, `distinct items, but the index holds`, `the sweep returned no items` or `is not in the shape the gate reads` | The sweep failed | A published `^N` server breaks on this index, so do not publish it as `N.x`. Fix the index or the generator, or treat the change as a new major under [Bumping the schema version](../README.md#bumping-the-schema-version). |
+| `did not finish within`, `Request timed out`, `spawnSync npm ETIMEDOUT` or `The operation was aborted due to timeout` | A step timed out | Re-run the run once. When the same commit times out a second time, treat it as a failed sweep. |
+| `npm installed`, `resolves @tibia.sh/tibiawiki-data/index.db to`, `not the candidate`, `DB_PATH is` or `is not defined by "exports"` | An install check failed | The install did not come out the way a user gets it, for example because of the candidate's `exports` map or its `DB_PATH`. Fix the package shape, not the index. |
+| `No published @tibia.sh/tibiawiki-mcp depends on a range that` | No consumer | The candidate is a new major, and no published server depends on it yet. Follow the schema-bump procedure, [Bumping the schema version](../README.md#bumping-the-schema-version). |
+| `Could not read https://registry.npmjs.org/` followed by `fetch failed` or `The registry answered`, or `Command failed: npm` with a network error such as `ECONNREFUSED` | npm was unreachable | Re-run the run once npm is back. The run publishes only a version npm lacks. |
 
 ## Runs close together
 

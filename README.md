@@ -121,12 +121,15 @@ crawl.
 is anything but `9.0.0`. The major version covers only the server's enrichment tables,
 and no version covers the tables tibiawiki-sql writes.
 
-A generator upgrade does not bump the major. A user who installed the oldest published server
-that depends on `^N` gets every new `N.x` of this package, so before every publish, and in CI,
-the `oldest-consumer` job installs that server package from npm together with the packed
-candidate, and pages every item through its `tibia_find_items`. The gate passes only when no
-page is an error, every page carries the candidate index's `generate_time`, and every item in
-the index comes back exactly once. `pnpm oldest-consumer` runs the same gate, and needs network
+A generator upgrade does not bump the major. If you installed any published server that depends
+on `^N`, your next install gets every new `N.x` of this package. So before every publish, and in
+CI, the `oldest-consumer` job installs the oldest and the newest published `^N` server from npm,
+each together with the packed candidate, and pages every item through each one's
+`tibia_find_items`. The oldest has the oldest serving code that still gets a new `N.x`. The newest
+is the one a fresh install gets, and newer serving code can refuse an index the oldest serves. When
+one server is both, the job sweeps it once. The gate passes only when, for each server, no page
+is an error, every page carries the candidate index's `generate_time`, and every item in the
+index comes back exactly once. `pnpm oldest-consumer` runs the same gate, and needs network
 access to npm.
 
 The sweep covers items only, not creatures, NPCs, quests or spells. So the `9.0.0` pin in
@@ -243,7 +246,7 @@ and passes the gate, ends this way. If it does not, the run installs from the lo
 `pnpm test`, and runs `npm publish`.
 
 - The gate runs on every push, whether the run publishes or not, so an index that breaks the
-  oldest published server turns the run red even when nothing is published.
+  oldest or the newest published server turns the run red even when nothing is published.
 - The check is for existence, never a comparison with `latest`. A revert leaves
   `version` below `latest`, and `npm publish` moves `latest` itself.
 - A registry the check cannot read fails the run. It is never taken for a missing
