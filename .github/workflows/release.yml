@@ -41,7 +41,10 @@ jobs:
       # The npm the release job installs, so the gate packs and installs with that same npm.
       - run: npm install -g npm@12.0.2
       # Installs the pnpm that `packageManager` names, then runs `pnpm install --frozen-lockfile`.
-      # It leaves the pnpm store uncached.
+      # It leaves the pnpm store uncached. It caches its lockfile-verification record whatever the
+      # inputs say, and saves the record right after the install, before the gate runs the servers
+      # it installs from npm. When that save does not go through, its post step tries again at the
+      # end of the job, after them.
       - uses: pnpm/setup@703c52620218391530e48b9e8870d5c0082e1b9b # v2.1.0
         with:
           install: true
