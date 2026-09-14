@@ -1,23 +1,27 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { evaluateSweep, satisfiesCaret, selectOldestConsumer } from '../scripts/oldest-consumer.ts';
+import {
+  evaluateSweep, satisfiesCaret, selectConsumers, selectNewestConsumer, selectOldestConsumer,
+} from '../scripts/oldest-consumer.ts';
 
 /**
- * scripts/oldest-consumer.ts installs from the registry and serves every item through a
- * published server, so the suite cannot run it. These pin its decisions instead: which
- * published server is the oldest consumer of a candidate, and whether the sweep through that
- * server was complete and clean. `pnpm oldest-consumer` runs the whole gate.
+ * scripts/oldest-consumer.ts installs from the registry and serves every item through
+ * published servers, so the suite cannot run it. These pin its decisions instead: which
+ * published servers are the oldest and the newest consumer of a candidate, which of them the
+ * gate lists to sweep, and whether a sweep through a server was complete and clean.
+ * `pnpm oldest-consumer` runs the whole gate.
  */
 
 const DATA = '@tibia.sh/tibiawiki-data';
 
-/** The server versions on npm as of 2026-09-13, with the dependencies the abbreviated document lists. */
+/** The server versions on npm as of 2026-09-14, with the dependencies the abbreviated document lists. */
 const PUBLISHED = {
   versions: {
     '0.1.0': { dependencies: { zod: '4.5.4', '@modelcontextprotocol/server': '2.0.0' } },
     '0.2.0': { dependencies: { zod: '4.5.4', [DATA]: '^3', '@modelcontextprotocol/server': '2.0.0' } },
     '0.3.0': { dependencies: { zod: '4.5.4', [DATA]: '^3', '@modelcontextprotocol/server': '2.0.0' } },
     '0.3.1': { dependencies: { zod: '4.5.4', [DATA]: '^3', '@modelcontextprotocol/server': '2.0.0' } },
+    '0.4.0': { dependencies: { zod: '4.5.4', [DATA]: '^3', '@modelcontextprotocol/server': '2.0.0' } },
   },
 };
 
@@ -93,7 +97,70 @@ test('a registry document of another shape throws, and never reads as no consume
   for (const [what, document] of documents) {
     assert.throws(() => selectOldestConsumer(document as typeof PUBLISHED, '3.0.2'), (error: unknown) =>
       error instanceof Error && !/no consumer/i.test(error.message), `${what} did not throw, or threw as no consumer`);
+    assert.throws(() => selectNewestConsumer(document as typeof PUBLISHED, '3.0.2'), (error: unknown) =>
+      error instanceof Error && !/no consumer/i.test(error.message), `${what} did not throw from the newest end, or threw as no consumer`);
   }
+});
+
+test('the newest consumer is 0.4.0, not an older server that depends on the same range', () => {
+  assert.equal(selectNewestConsumer(PUBLISHED, '3.0.2'), '0.4.0');
+});
+
+test('a newest server version without the dependency is skipped', () => {
+  // 0.5.0 has no dependencies at all, and 0.6.0 has some, but not this package.
+  const document = { versions: { ...PUBLISHED.versions, '0.5.0': {}, '0.6.0': { dependencies: { zod: '4.5.4' } } } };
+  assert.equal(selectNewestConsumer(document, '3.0.2'), '0.4.0');
+});
+
+test('a newest server whose range the candidate does not satisfy is skipped', () => {
+  // A server can ask for a later minor, and a server after a schema bump depends on the next major.
+  assert.equal(selectNewestConsumer(dependingOn({ '0.3.0': '^3', '0.4.0': '^3', '0.5.0': '^3.1.0', '1.0.0': '^4' }), '3.0.2'), '0.4.0');
+});
+
+test('server versions are compared as numbers from the newest end too, so 0.10.0 is newer than 0.9.0', () => {
+  // Neither the listed order nor a string sort puts 0.10.0 last.
+  assert.equal(selectNewestConsumer(dependingOn({ '0.9.0': '^3', '0.10.0': '^3', '0.2.0': '^3' }), '3.0.2'), '0.10.0');
+});
+
+test('a prerelease server version is skipped at the newest end too', () => {
+  assert.equal(selectNewestConsumer(dependingOn({ '0.2.0': '^3', '0.4.0': '^3', '0.5.0-rc.1': '^3', '0.4.1-beta.0': '^3' }), '3.0.2'), '0.4.0');
+});
+
+test('a range the gate cannot read throws when the newest end meets it before the answer', () => {
+  for (const range of ['>=3', '3.x', '~3.0.0', '^0']) {
+    const document = dependingOn({ '0.2.0': '^3', '0.4.0': range });
+    assert.throws(() => selectNewestConsumer(document, '3.0.2'), (error: unknown) => error instanceof Error && error.message.includes(range),
+      `selectNewestConsumer read ${range}`);
+    // Each end reads only the ranges it meets before its answer, and the oldest end stops at 0.2.0.
+    assert.equal(selectOldestConsumer(document, '3.0.2'), '0.2.0', `selectOldestConsumer read ${range} past its answer`);
+  }
+  assert.throws(() => selectNewestConsumer({ versions: { '0.1.0': {} } }, '3.0'), /^Error: The candidate version 3\.0 is not x\.y\.z\.$/);
+});
+
+test('a candidate no published server accepts throws the same schema-bump error from the newest end', () => {
+  /** What `select` throws for a 4.0.0 candidate, or undefined when it throws nothing. */
+  const thrown = (select: typeof selectOldestConsumer): string | undefined => {
+    try {
+      select(PUBLISHED, '4.0.0');
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+    return undefined;
+  };
+  assert.match(thrown(selectNewestConsumer) ?? '', /published by hand under the schema-bump procedure/);
+  assert.equal(thrown(selectNewestConsumer), thrown(selectOldestConsumer));
+});
+
+test('the sweep list holds the oldest consumer, then the newest', () => {
+  assert.deepEqual(selectConsumers(PUBLISHED, '3.0.2'), [{ version: '0.2.0', end: 'oldest' }, { version: '0.4.0', end: 'newest' }]);
+});
+
+test('a server that is both the oldest and the newest consumer is on the sweep list once', () => {
+  // The servers before and after it depend on other majors.
+  const document = dependingOn({ '0.1.0': '^2', '0.2.0': '^3', '0.3.0': '^4' });
+  assert.equal(selectOldestConsumer(document, '3.0.2'), '0.2.0');
+  assert.equal(selectNewestConsumer(document, '3.0.2'), '0.2.0');
+  assert.deepEqual(selectConsumers(document, '3.0.2'), [{ version: '0.2.0', end: 'oldest and newest' }]);
 });
 
 const STAMP = '2026-09-13T07:02:58.860376+00:00';

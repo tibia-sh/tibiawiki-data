@@ -13,7 +13,7 @@ const workflow = (): string => read('release.yml');
 
 const releaseJob = (): string => under(under(code(workflow()), 'jobs'), 'release');
 
-/** The job that pages every item through the oldest published server before anything is published. */
+/** The job that pages every item through the oldest and the newest published servers before anything is published. */
 const gateJob = (): string => under(under(code(workflow()), 'jobs'), 'oldest-consumer');
 
 /** The release job's steps, one string per list item. */
@@ -103,15 +103,15 @@ test('the oldest-consumer job holds exactly contents: read, and no id-token', ()
   assert.doesNotMatch(gateJob(), /\bid-token\b/, 'the oldest-consumer job can mint an OIDC token');
 });
 
-test('the oldest-consumer job runs pnpm oldest-consumer unconditionally, bounded at 30 minutes', () => {
+test('the oldest-consumer job runs pnpm oldest-consumer unconditionally, bounded at 45 minutes', () => {
   // A condition or continue-on-error on the job or on one of its steps can hide a failed or
-  // skipped sweep. The script's own bounds add up to 1170 s, and the rest of the half hour is
-  // checkout and setup.
+  // skipped sweep. The script's own bounds add up to 2190 s with two consumers, and the rest of
+  // the 45 minutes is checkout and setup.
   assert.ok(steps(gateJob()).some((step) => /^ *(?:- +)?run: *pnpm oldest-consumer$/m.test(step)),
     'the oldest-consumer job never runs pnpm oldest-consumer');
   assert.doesNotMatch(gateJob(), /^ *(?:- +)?(?:if|continue-on-error):/m,
     'the oldest-consumer job or one of its steps has a condition or continue-on-error');
-  assert.equal(scalar(gateJob(), 'timeout-minutes'), '30', 'the oldest-consumer job is not bounded at 30 minutes');
+  assert.equal(scalar(gateJob(), 'timeout-minutes'), '45', 'the oldest-consumer job is not bounded at 45 minutes');
 });
 
 test('the release job can mint the OIDC token npm publish authenticates with', () => {

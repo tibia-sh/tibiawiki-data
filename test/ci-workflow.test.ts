@@ -25,13 +25,13 @@ test('the ci.yml oldest-consumer job holds exactly contents: read, and no id-tok
   assert.doesNotMatch(gateJob(), /\bid-token\b/, 'the oldest-consumer job can mint an OIDC token');
 });
 
-test('the ci.yml oldest-consumer job runs pnpm oldest-consumer unconditionally, bounded at 30 minutes', () => {
+test('the ci.yml oldest-consumer job runs pnpm oldest-consumer unconditionally, bounded at 45 minutes', () => {
   // A condition or continue-on-error on the job or on one of its steps can hide a failed or
-  // skipped sweep. The script's own bounds add up to 1170 s, and the rest of the half hour is
-  // checkout and setup.
+  // skipped sweep. The script's own bounds add up to 2190 s with two consumers, and the rest of
+  // the 45 minutes is checkout and setup.
   assert.ok(steps(gateJob()).some((step) => /^ *(?:- +)?run: *pnpm oldest-consumer$/m.test(step)),
     'the oldest-consumer job never runs pnpm oldest-consumer');
   assert.doesNotMatch(gateJob(), /^ *(?:- +)?(?:if|continue-on-error):/m,
     'the oldest-consumer job or one of its steps has a condition or continue-on-error');
-  assert.equal(scalar(gateJob(), 'timeout-minutes'), '30', 'the oldest-consumer job is not bounded at 30 minutes');
+  assert.equal(scalar(gateJob(), 'timeout-minutes'), '45', 'the oldest-consumer job is not bounded at 45 minutes');
 });
