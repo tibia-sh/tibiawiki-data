@@ -192,10 +192,12 @@ test('a failed check stops the gate at that consumer, with an error that names i
   ] as const;
   for (const [failOn, ran, message] of cases) {
     const { checked, check } = recordingCheck(failOn);
-    await assert.rejects(checkConsumers(listed, check), (error: unknown) =>
-      error instanceof Error && error.message === message &&
-      error.cause instanceof Error && error.cause.message === `the check of ${failOn} failed`,
-    `a failed check of ${failOn} did not end the gate`);
+    const error: unknown = await checkConsumers(listed, check).then(() => undefined, (thrown: unknown) => thrown);
+    assert.ok(error instanceof Error, `a failed check of ${failOn} did not end the gate with an error`);
+    assert.equal(error.message, message, `the error for a failed check of ${failOn} does not name that consumer`);
+    // describe() prints the cause under FAIL, and the runbook looks that message up.
+    assert.ok(error.cause instanceof Error && error.cause.message === `the check of ${failOn} failed`,
+      `the error for a failed check of ${failOn} does not carry the check's own error as its cause`);
     assert.deepEqual(checked.map(({ version }) => version), ran, `the gate went on checking after ${failOn} failed`);
   }
 });
