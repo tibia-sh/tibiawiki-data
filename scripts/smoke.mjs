@@ -12,11 +12,11 @@
  * INSTALLED server binary, so every check lands on the artefact, not on this checkout:
  *
  *   - the installed server, with TIBIAWIKI_MCP_DB set to the installed DB_PATH,
- *     completes initialize and tools/list and answers a real query;
- *   - the answer's indexGeneratedAt equals that index's generate_time, so a different
- *     index cannot satisfy the check;
+ *     completes initialize and tools/list and answers a real query.
+ *   - the answer's indexGeneratedAt equals that index's generate_time. An answer whose
+ *     indexGeneratedAt differs from that generate_time fails.
  *   - SCHEMA_VERSION, the installed manifest's major and the index's
- *     mcp_schema_version row agree;
+ *     mcp_schema_version row agree.
  *   - the ./index.db subpath, which the server's locator resolves, names DB_PATH.
  *
  * Why each choice:
@@ -31,9 +31,10 @@
  *   - It strips the lowercase npm_* keys from the child environment. A package manager
  *     or npx running a script can export its own config that way, and npm rejects some
  *     of it outright (EALLOWSCRIPTS) while silently applying the rest to an install meant
- *     to look like a stranger's. Case is load-bearing: npm reads NPM_CONFIG_* too, and those are the
- *     operator's own registry, proxy and CA settings, which a real consumer would have.
- *     NODE_OPTIONS goes with them, because it can filter every test away silently.
+ *     to look like a stranger's. Case is load-bearing: npm reads NPM_CONFIG_* too, and
+ *     those are the operator's own registry, proxy and CA settings, which a real consumer
+ *     would have. NODE_OPTIONS goes with them, because it can filter every test away
+ *     silently.
  *   - Both steps time out and kill with SIGKILL, so a child that ignores SIGTERM cannot
  *     hold the check open past the bound. Only that child is killed. The test file that
  *     `node --test` runs in a process of its own survives it.
