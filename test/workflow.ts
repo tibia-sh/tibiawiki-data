@@ -70,7 +70,7 @@ export const steps = (job: string): string[] => {
  * the calling test fails, and a check that an input is absent cannot pass on a spelling it misses.
  */
 export const stepInputs = (step: string): string => {
-  const inputs = under(step.replace(/^( *)- /, '$1  '), 'with');
+  const inputs = under(stepBody(step), 'with');
   const names = keys(inputs);
   for (const name of names) {
     assert.match(name, /^[a-z][a-z0-9-]*$/, `${stepName(step)} has an input written in a form this test cannot read: ${name}`);
@@ -78,6 +78,9 @@ export const stepInputs = (step: string): string => {
   assert.equal(new Set(names).size, names.length, `${stepName(step)} sets an input more than once`);
   return inputs;
 };
+
+/** A step with its `- ` marker replaced by spaces, so its keys sit at one indentation for `under` and `scalar`. */
+export const stepBody = (step: string): string => step.replace(/^( *)- /, '$1  ');
 
 /** A step's `if:`, whether it is the first key on the `- ` line or a later one. */
 export const stepIf = (step: string): string | undefined => /^ *(?:- +)?if: *(.*)$/m.exec(step)?.[1];
@@ -143,10 +146,11 @@ export const runScripts = (yaml: string): string[] => {
 export type Call = { command: string; args: string[] };
 
 /**
- * Commands a step could reach the network or the repository with. Unless a test stands in
- * for one, a call to it fails, so no test can publish, push or open a pull request for real.
+ * Commands a step could reach the network or the repository with, and timeout, which runs
+ * whatever command follows its bound. Unless a test stands in for one, a call to it fails,
+ * so no test can publish, push or open a pull request for real.
  */
-const GUARDED = ['npm', 'npx', 'pnpm', 'git', 'gh', 'curl', 'wget'];
+const GUARDED = ['npm', 'npx', 'pnpm', 'git', 'gh', 'curl', 'wget', 'timeout'];
 
 /** The regular files under `root`, by path relative to it, as text. Symlinks are left out. */
 const snapshot = (root: string): Record<string, string> =>
