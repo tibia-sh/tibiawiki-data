@@ -257,6 +257,11 @@ and passes the gate, ends this way. If it does not, the run installs from the lo
   attaches a provenance attestation for the merged commit. The trusted publisher is
   registered for the file name `release.yml`, and renaming the file breaks publishing
   with no warning.
+- Once npm has accepted the publish, the run's `hosting` job tells `tibia-sh/mcp.tibia.sh`
+  about the version. Its `bump.yml` pins it, opens a pull request and merges it when the
+  checks pass, so the hosted endpoint `https://mcp.tibia.sh/wiki` serves the new index
+  within minutes. When that job is red, follow
+  [The hosting dispatch](docs/RELEASING.md#the-hosting-dispatch) in `docs/RELEASING.md`.
 - Every pull request runs the same `pnpm test` and the same gate, in `.github/workflows/ci.yml`.
 
 Nothing is tagged, so a failed publish leaves nothing stranded. When a release run fails,
