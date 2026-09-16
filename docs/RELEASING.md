@@ -1,6 +1,6 @@
 # Releasing
 
-A push to `main` publishes the `version` in `package.json`, after the `oldest-consumer` gate and `pnpm test`, when npm does not list that version yet. Nothing is tagged. [Releases](../README.md#releases) in the README has the details.
+A push to `main` publishes the `version` in `package.json`, after the `oldest-consumer` gate and `pnpm test`, when npm does not list that version yet. Nothing is tagged. [Releases](../README.md#releases) in the README has the details. Once npm accepts the publish, the run's `hosting` job tells `tibia-sh/mcp.tibia.sh` about the release, as [The hosting dispatch](#the-hosting-dispatch) describes.
 
 ## When a release run fails
 
@@ -10,7 +10,7 @@ A failed run leaves nothing stranded. `main` holds a version npm does not have, 
 |---|---|
 | Something in the repository, such as a failing test | Fix it in a pull request and merge. The merge's run publishes. |
 | Something outside it: npm was down, or the trusted publisher on npmjs.com does not match and `npm publish` failed with `ENEEDAUTH` | Fix that, then re-run the most recent release run. |
-| npm lists the version although the run failed | Nothing. The publish went through, and the next run publishes nothing. |
+| npm lists the version although the run failed | The publish went through, and the next run publishes nothing. When the `hosting` job is red or was skipped, follow [The hosting dispatch](#the-hosting-dispatch). |
 
 Never re-run a release run expecting a different result when nothing outside the repository changed.
 
@@ -41,6 +41,22 @@ npm dist-tag add @tibia.sh/tibiawiki-data@X.Y.Z latest
 ```
 
 A push right after a publish can also read a version list from before that publish. Its run then tries to publish the same version again, and fails when npm refuses a version it already has. Nothing needs doing. A later run reads the new list and publishes nothing.
+
+## The hosting dispatch
+
+Once npm accepts the publish, the run's `hosting` job tells `tibia-sh/mcp.tibia.sh` about the release. Its one step, `Tell mcp.tibia.sh about the release`, sends a `repository_dispatch` of type `first-party-release` that names the package and the version, using the `HOSTING_DISPATCH_TOKEN` secret of the `release-trigger` environment. It makes up to three attempts, 30 seconds apart, and prints `Told tibia-sh/mcp.tibia.sh about @tibia.sh/tibiawiki-data X.Y.Z in attempt N.` once one got through. A run that publishes nothing skips the job.
+
+The dispatch starts `bump.yml` in the hosting repository. That run pins the version, opens a pull request, turns on auto-merge and waits for the merge, and the merge deploys. [How a release reaches the endpoint](https://github.com/tibia-sh/mcp.tibia.sh#how-a-release-reaches-the-endpoint) in that repository's README describes the chain and what can go wrong there. `gh run list --workflow bump.yml -R tibia-sh/mcp.tibia.sh` lists its runs.
+
+A red `hosting` job leaves npm untouched. The publish happened before the job started. The job is red when the version does not look like `X.Y.Z`, or when all three attempts failed. Its error line names the version, and the log carries what `gh` said about each attempt, so you can tell a rejected token from an outage. Three attempts that all hang take 7.5 minutes, inside the job's 8, so the job ends with that line and is never cut short. `Bad credentials (HTTP 401)` means the token expired or was revoked, and [The release trigger token](https://github.com/tibia-sh/mcp.tibia.sh#the-release-trigger-token) in the hosting repository's README describes how to rotate it.
+
+Re-running the whole release run does not send the dispatch again. Its release job finds the version on npm and publishes nothing, so `released` stays empty and the `hosting` job is skipped. Run `bump.yml` by hand instead, on `main` of the hosting repository, with the version npm has:
+
+```bash
+gh workflow run bump.yml -R tibia-sh/mcp.tibia.sh --ref main -f package=@tibia.sh/tibiawiki-data -f version=X.Y.Z
+```
+
+The run it starts does what the dispatch would have. A version the hosting repository already pins ends it green with nothing to do, so a dispatch that arrived after all costs nothing. A version below the pinned one fails it, because `bump.yml` refuses a downgrade.
 
 ## Schema bumps
 
