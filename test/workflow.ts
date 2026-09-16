@@ -63,6 +63,9 @@ export const steps = (job: string): string[] => {
   return marker ? block.split(new RegExp(`^(?=${marker})`, 'm')) : [];
 };
 
+/** A step with its `- ` marker replaced by spaces, so its keys sit at one indentation for `under` and `scalar`. */
+export const stepBody = (step: string): string => step.replace(/^( *)- /, '$1  ');
+
 /**
  * The inputs under a step's `with:`, whichever of the step's keys sits on the `- ` line. The runner
  * takes an input whose key is quoted, capitalised or followed by a space before its colon, and
@@ -78,9 +81,6 @@ export const stepInputs = (step: string): string => {
   assert.equal(new Set(names).size, names.length, `${stepName(step)} sets an input more than once`);
   return inputs;
 };
-
-/** A step with its `- ` marker replaced by spaces, so its keys sit at one indentation for `under` and `scalar`. */
-export const stepBody = (step: string): string => step.replace(/^( *)- /, '$1  ');
 
 /** A step's `if:`, whether it is the first key on the `- ` line or a later one. */
 export const stepIf = (step: string): string | undefined => /^ *(?:- +)?if: *(.*)$/m.exec(step)?.[1];
