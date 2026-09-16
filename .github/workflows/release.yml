@@ -55,6 +55,9 @@ jobs:
     # Nothing is published unless the gate passed on this same commit.
     needs: oldest-consumer
     runs-on: ubuntu-latest
+    outputs:
+      released: ${{ steps.publish.outputs.released }}  # 'true' once npm accepted the publish, else empty
+      version: ${{ steps.publish.outputs.version }}    # the version it accepted
     permissions:
       contents: read   # check out the merged commit
       id-token: write  # OIDC for npm trusted publishing
@@ -113,6 +116,58 @@ jobs:
       # index's mcp_schema_version row must agree before anything is published.
       - run: pnpm test
         if: ${{ steps.registry.outputs.publish == 'true' }}
-      # Packs the committed index.db. prepublishOnly runs pnpm test once more first.
-      - run: npm publish
+      # Packs the committed index.db. prepublishOnly runs pnpm test once more first. Then it hands
+      # the hosting job what it published. The default bash -e stops the script at a failed publish,
+      # so released is 'true' or empty. The version is read before the publish, so a version this
+      # step cannot read publishes nothing.
+      - id: publish
         if: ${{ steps.registry.outputs.publish == 'true' }}
+        run: |
+          version=$(node -p 'require("./package.json").version')
+          npm publish
+          echo "released=true" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  # Tells tibia-sh/mcp.tibia.sh about the release, so its bump.yml pins the version and deploys it.
+  # A job of its own, because the token is a secret of the release-trigger environment, and naming
+  # that environment in the release job would put an environment claim in its OIDC token, which
+  # npm's trusted publisher rejects. It runs only once the release job published, so a push that
+  # publishes nothing skips it.
+  hosting:
+    needs: release
+    if: ${{ needs.release.outputs.released == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    environment: release-trigger
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.release.outputs.version }}
+    steps:
+      # gh api exits non-zero on an HTTP error and prints it, and timeout stops a request that hangs
+      # after 120 seconds, or kills it 10 seconds later if it ignores that. A dispatch that got through
+      # twice is harmless, because bump.yml finds the version pinned or its pull request open, so a
+      # failed attempt is tried again 30 seconds later, three attempts in all. Three attempts that all
+      # hang take 7.5 minutes, inside the job's 8. gh reads the token from GH_TOKEN by itself, so the
+      # script never names it.
+      - name: Tell mcp.tibia.sh about the release
+        id: dispatch
+        env:
+          GH_TOKEN: ${{ secrets.HOSTING_DISPATCH_TOKEN }}
+        run: |
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::The published version must look like 1.2.3, and this run has \"$VERSION\"."
+            exit 1
+          fi
+          body="$(jq -n --arg version "$VERSION" '{event_type: "first-party-release", client_payload: {package: "@tibia.sh/tibiawiki-data", version: $version}}')"
+          for attempt in 1 2 3; do
+            if [ "$attempt" -gt 1 ]; then
+              sleep 30
+            fi
+            if timeout --kill-after=10 120 gh api repos/tibia-sh/mcp.tibia.sh/dispatches --input - <<< "$body"; then
+              echo "Told tibia-sh/mcp.tibia.sh about @tibia.sh/tibiawiki-data $VERSION in attempt $attempt."
+              exit 0
+            fi
+          done
+          echo "::error::Could not tell tibia-sh/mcp.tibia.sh about @tibia.sh/tibiawiki-data $VERSION in 3 attempts, 30 seconds apart. Run bump.yml there by hand, as \"The hosting dispatch\" in docs/RELEASING.md describes."
+          exit 1

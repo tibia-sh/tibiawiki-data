@@ -1,13 +1,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { code, keys, read, runScripts, runStep, scalar, stepIf, stepIndex, stepInputs, stepName, steps, stepScript, under, workflowFiles } from './workflow.ts';
+import { code, keys, read, runScripts, runStep, scalar, stepBody, stepIf, stepIndex, stepInputs, stepName, steps, stepScript, under, workflowFiles } from './workflow.ts';
+import type { Call } from './workflow.ts';
 
 /**
  * The release workflow cannot run inside the suite, and a mistake in it surfaces only when
  * a merge publishes, or fails to: a version npm never lets be reused, or a release that
  * quietly never happens. Most properties pinned here are checkable from the files alone.
- * The existence check's decision is not, so its script runs here against a fake npm.
+ * The existence check's decision, what the publish step hands on and the hosting dispatch
+ * are not, so their scripts run here against stand-in commands.
  */
 
 const workflow = (): string => read('release.yml');
@@ -25,6 +27,20 @@ const CHECK_ID = 'registry';
 
 /** The condition every step after that check carries. */
 const PUBLISH_GATE = `\${{ steps.${CHECK_ID}.outputs.publish == 'true' }}`;
+
+/** The step that runs npm publish, and hands the hosting job what it published. */
+const PUBLISH_ID = 'publish';
+
+/** The job that tells the hosting repository about the release, once npm accepted the publish. */
+const hostingJob = (): string => under(under(code(workflow()), 'jobs'), 'hosting');
+
+/** The hosting job's one step, which sends the dispatch. docs/RELEASING.md names it. */
+const DISPATCH_ID = 'dispatch';
+
+const dispatchStep = (): string => {
+  const list = steps(hostingJob());
+  return list[stepIndex(list, DISPATCH_ID)]!;
+};
 
 const isPnpmSetup = (step: string): boolean => /^ *(?:- +)?uses: *pnpm\/setup@/m.test(step);
 
@@ -314,6 +330,50 @@ test('every step after the existence check is gated on it, and nothing before it
   assert.ok(after.some(installsFromLockfile), 'no gated step installs from the lockfile');
 });
 
+/**
+ * Runs the publish step the way a runner does, in a checkout holding `files`, with an npm that
+ * exits `npmExit`. The version it hands on is read with the real node.
+ */
+const runPublish = ({ version = '3.0.4', npmExit = 0, files = { 'package.json': JSON.stringify({ name: '@tibia.sh/tibiawiki-data', version }) } }: {
+  version?: string;
+  npmExit?: number;
+  files?: Record<string, string>;
+} = {}) => runStep(stepScript(workflow(), PUBLISH_ID), { files, commands: { npm: `process.exitCode = ${npmExit};\n` } });
+
+test('the release job hands on released=true and the version only once npm accepted the publish', () => {
+  // A job output is a string, so an expression that evaluates to false arrives as 'false', which
+  // a bare if: treats as true. The publish step writes released=true after npm publish, and the
+  // default bash -e stops the script at a failed publish, so the output is 'true' or empty. The
+  // version is the one package.json names, read before the publish, so a version the step cannot
+  // read publishes nothing. The script runs against a stand-in npm, because an edit such as
+  // `|| true` would let the writes follow a failed publish.
+  const outputs = under(releaseJob(), 'outputs');
+  assert.deepEqual(keys(outputs), ['released', 'version'], 'the release job does not hand on exactly released and version');
+  assert.equal(scalar(outputs, 'released'), `\${{ steps.${PUBLISH_ID}.outputs.released }}`, 'released does not read the publish step');
+  assert.equal(scalar(outputs, 'version'), `\${{ steps.${PUBLISH_ID}.outputs.version }}`, 'version does not read the publish step');
+  const steps = releaseSteps();
+  const publishing = steps.filter((step) => /\bnpm publish\b/.test(step));
+  assert.equal(publishing.length, 1, 'expected exactly one step that runs npm publish');
+  assert.equal(stepIndex(steps, PUBLISH_ID), steps.indexOf(publishing[0]!), `the step that runs npm publish is not the one with id: ${PUBLISH_ID}`);
+  assert.equal(stepIf(publishing[0]!), PUBLISH_GATE, 'the publish step is not gated on the existence check');
+
+  for (const version of ['3.0.4', '10.20.300']) {
+    const published = runPublish({ version });
+    assert.equal(published.status, 0, `the step failed although npm publish succeeded\n${published.log}`);
+    assert.deepEqual(published.calls, [{ command: 'npm', args: ['publish'] }], 'the step ran something besides npm publish');
+    assert.equal(published.output, `released=true\nversion=${version}\n`, 'the step did not hand on released=true and the version package.json names');
+  }
+
+  const refused = runPublish({ npmExit: 1 });
+  assert.notEqual(refused.status, 0, `the step passed although npm publish failed\n${refused.log}`);
+  assert.equal(refused.output, '', 'the step handed something on although npm publish failed');
+
+  const unreadable = runPublish({ files: {} });
+  assert.notEqual(unreadable.status, 0, `the step passed without a package.json\n${unreadable.log}`);
+  assert.deepEqual(unreadable.calls, [], 'the step published a version it could not read');
+  assert.equal(unreadable.output, '', 'the step handed something on without a package.json');
+});
+
 test('setup-node restores no dependency cache into the job that publishes, or into its gate', () => {
   // A restored cache is input no one reviewed, in a job holding id-token: write, or in the gate
   // that decides whether that job publishes. The pinned setup-node restores one by itself whenever
@@ -340,4 +400,236 @@ test('release runs take turns, and none is cancelled or dropped', () => {
   assert.match(concurrency, /^ *group: *\S/m, 'the workflow has no concurrency group');
   assert.match(concurrency, /^ *cancel-in-progress: *false$/m, 'cancel-in-progress is not false');
   assert.match(concurrency, /^ *queue: *max$/m, 'queue is not max, so a waiting run can be replaced');
+});
+
+/** The condition the hosting job runs on. `released` is 'true' or empty. */
+const HOSTING_GATE = "${{ needs.release.outputs.released == 'true' }}";
+
+test('the hosting dispatch is a job of its own, run once npm accepted the publish', () => {
+  // The token is a secret of the release-trigger environment. A job gets an environment's secrets
+  // only by naming it, and naming one in the release job would put an environment claim in its
+  // OIDC token, which npm's trusted publisher rejects. The job runs only once the release job
+  // published, so a push that publishes nothing skips it. It runs no action and checks nothing
+  // out beside the token. Its one step runs under the default bash -e, as the checks below run
+  // its script: the existence check's test keeps every shell override out of the file, and the
+  // script never turns -e off.
+  const hosting = hostingJob();
+  assert.notEqual(hosting, '', 'the workflow has no hosting job');
+  assert.equal(scalar(hosting, 'needs'), 'release', 'the hosting job does not need the release job');
+  assert.equal(scalar(hosting, 'if'), HOSTING_GATE, 'the hosting job does not run on released alone');
+  assert.equal(scalar(hosting, 'runs-on'), 'ubuntu-latest');
+  assert.equal(scalar(hosting, 'timeout-minutes'), '8', 'the hosting job is not bounded at 8 minutes');
+  assert.equal(scalar(hosting, 'environment'), 'release-trigger', 'the hosting job does not run in the release-trigger environment');
+  const permissions = under(hosting, 'permissions');
+  assert.deepEqual(keys(permissions), ['contents'], 'the hosting job does not hold exactly one permission, contents');
+  assert.equal(scalar(permissions, 'contents'), 'read', 'the hosting job holds more than contents: read');
+  assert.deepEqual(keys(under(hosting, 'env')), ['VERSION'], 'the hosting job sets something besides VERSION');
+  assert.equal(scalar(under(hosting, 'env'), 'VERSION'), '${{ needs.release.outputs.version }}', 'VERSION is not the version the release job published');
+  assert.doesNotMatch(hosting, /^ *(?:- +)?uses:/m, 'the hosting job runs an action');
+  assert.equal(scalar(releaseJob(), 'environment'), undefined, 'the release job names an environment');
+  assert.equal(steps(hosting).length, 1, 'expected exactly one hosting job step');
+  const step = dispatchStep();
+  assert.equal(scalar(stepBody(step), 'name'), 'Tell mcp.tibia.sh about the release', 'the dispatch step is not named as docs/RELEASING.md names it');
+  assert.equal(stepIf(step), undefined, `${stepName(step)} sets if`);
+  // The step's env holds the token alone, so nothing there can override the job's VERSION, which
+  // the checks below stand in for. continue-on-error would turn a failed dispatch green, and a
+  // step bound shorter than the job's would cut the attempts short.
+  assert.deepEqual(keys(under(stepBody(step), 'env')), ['GH_TOKEN'], `${stepName(step)} sets something besides GH_TOKEN in its env`);
+  assert.doesNotMatch(hosting, /^ *(?:- +)?continue-on-error:/m, 'the hosting job or its step has continue-on-error');
+  assert.equal(scalar(stepBody(step), 'timeout-minutes'), undefined, `${stepName(step)} has a bound of its own`);
+  assert.doesNotMatch(stepScript(workflow(), DISPATCH_ID), /\bset +\+[a-z]*e|\bset +\+o +errexit\b/, `${stepName(step)} turns off -e`);
+});
+
+test('the hosting token is the one secret any workflow references, and it reaches the dispatch step through its env', () => {
+  // Written into a run script, a secret would be pasted into the shell as code. In a step's env
+  // it is a variable only the processes of that step see, and gh reads GH_TOKEN by itself, so the
+  // script never names the token. No other workflow reads a secret: the release job publishes
+  // through OIDC, and the drift job writes with github.token.
+  const references = workflowFiles().flatMap((file) =>
+    code(read(file)).split('\n').filter((line) => /\bsecrets\b/.test(line)).map((line) => `${file}: ${line.trim()}`));
+  assert.deepEqual(references, ['release.yml: GH_TOKEN: ${{ secrets.HOSTING_DISPATCH_TOKEN }}']);
+  assert.equal(scalar(under(stepBody(dispatchStep()), 'env'), 'GH_TOKEN'), '${{ secrets.HOSTING_DISPATCH_TOKEN }}',
+    'the token does not reach the dispatch step through its env as GH_TOKEN');
+  assert.doesNotMatch(stepScript(workflow(), DISPATCH_ID), /GH_TOKEN|HOSTING_DISPATCH_TOKEN/, 'the dispatch script names its token');
+});
+
+/** The token the dispatch runs with in these checks. The stand-in gh reads no token. */
+const HOSTING_TOKEN = 'stand-in-hosting-token';
+
+/** What the stand-in gh answers a dispatch with: its exit code, and the error it prints when that is not 0. */
+type GhReply = { code: number; text: string };
+
+/** A dispatch GitHub accepted: gh exits 0 and prints nothing for the 204. */
+const DISPATCHED: GhReply = { code: 0, text: '' };
+
+/** gh's errors, as it prints them: a request that never connected, and HTTP errors with their status. */
+const HOSTING_UNREACHABLE: GhReply = {
+  code: 1,
+  text: 'Post "https://api.github.com/repos/tibia-sh/mcp.tibia.sh/dispatches": dial tcp 140.82.121.6:443: i/o timeout',
+};
+const GITHUB_FAILED: GhReply = { code: 1, text: 'gh: Server Error (HTTP 502)' };
+const TOKEN_REJECTED: GhReply = { code: 1, text: 'gh: Bad credentials (HTTP 401)' };
+
+/** A request that hung: timeout stopped it and exits 124, and nothing was printed. */
+const TIMED_OUT: GhReply = { code: 124, text: '' };
+
+/**
+ * A stand-in gh. It reads all of its stdin, the body gh would send, and keeps it in RUNNER_TEMP as
+ * dispatch-N.json for call N. It answers call N with `replies[N - 1]`, printing the error on stderr
+ * as gh does, and fails a call with no reply, so a fourth attempt cannot pass on a guess.
+ */
+const fakeGh = (replies: GhReply[]): string => String.raw`
+const fs = require('node:fs');
+const temp = process.env.RUNNER_TEMP;
+const call = fs.readdirSync(temp).filter((name) => /^dispatch-\d+\.json$/.test(name)).length + 1;
+fs.writeFileSync(temp + '/dispatch-' + call + '.json', fs.readFileSync(0, 'utf8'));
+const reply = ${JSON.stringify(replies)}[call - 1];
+if (reply === undefined) {
+  process.stderr.write('fake gh: no reply for call ' + call + '\n');
+  process.exitCode = 2;
+  return;
+}
+if (reply.code !== 0) process.stderr.write(reply.text + '\n');
+process.exitCode = reply.code;
+`;
+
+/**
+ * A stand-in for GNU timeout. It takes only `--kill-after=10 120` and a command, which it runs on
+ * its own stdin and whose status it exits with. Anything else exits 125, timeout's own failure, so
+ * a changed bound cannot pass on a guess. It stops nothing, because no stand-in hangs.
+ */
+const FAKE_TIMEOUT = String.raw`
+const args = process.argv.slice(2);
+if (args.length < 3 || args[0] !== '--kill-after=10' || args[1] !== '120') {
+  process.stderr.write('fake timeout: unsupported arguments: ' + args.join(' ') + '\n');
+  process.exitCode = 125;
+  return;
+}
+const run = require('node:child_process').spawnSync(args[2], args.slice(3), { stdio: 'inherit' });
+if (run.error) {
+  process.stderr.write('fake timeout: ' + run.error.message + '\n');
+  process.exitCode = 127;
+  return;
+}
+process.exitCode = run.status ?? 1;
+`;
+
+/** The body the dispatch sends for `version`, as bump.yml in the hosting repository reads it. */
+const dispatchBody = (version: string): unknown => ({
+  event_type: 'first-party-release',
+  client_payload: { package: '@tibia.sh/tibiawiki-data', version },
+});
+
+/** `body` as GitHub would read it: one JSON document, or the test fails. */
+const json = (body: string): unknown => {
+  try {
+    return JSON.parse(body);
+  } catch {
+    return assert.fail(`a body is not one JSON document: ${body}`);
+  }
+};
+
+/**
+ * Runs the dispatch step for `version` with stand-ins for gh, sleep and timeout, and jq for real.
+ * gh answers its calls with `replies` in order, sleep returns at once. The step holds the token in
+ * its env, so any command that prints it, such as an environment dump or a trace, fails every run.
+ */
+function runDispatch(version: string, replies: GhReply[]) {
+  const run = runStep(stepScript(workflow(), DISPATCH_ID), {
+    commands: { gh: fakeGh(replies), sleep: '', timeout: FAKE_TIMEOUT },
+    env: { VERSION: version, GH_TOKEN: HOSTING_TOKEN },
+  });
+  assert.ok(!run.log.includes(HOSTING_TOKEN), 'the dispatch step printed the token');
+  for (const call of run.calls) {
+    assert.ok(!call.args.join(' ').includes(HOSTING_TOKEN), `the token appears on the command line of ${call.command}`);
+  }
+  return {
+    ...run,
+    errors: run.log.split('\n').filter((line) => line.startsWith('::error::')),
+    /** What each gh call read on stdin, in the order of the calls. */
+    bodies: Object.entries(run.runnerTemp)
+      .filter(([name]) => /^dispatch-\d+\.json$/.test(name))
+      .sort(([a], [b]) => a.localeCompare(b, 'en', { numeric: true }))
+      .map(([, body]) => json(body)),
+  };
+}
+
+const DISPATCH_ARGS = ['api', 'repos/tibia-sh/mcp.tibia.sh/dispatches', '--input', '-'];
+
+/** The calls one attempt records: gh under timeout's bound, then gh itself. */
+const ATTEMPT: Call[] = [
+  { command: 'timeout', args: ['--kill-after=10', '120', 'gh', ...DISPATCH_ARGS] },
+  { command: 'gh', args: DISPATCH_ARGS },
+];
+
+/** The pause between two attempts. */
+const PAUSE: Call = { command: 'sleep', args: ['30'] };
+
+/** The line the step prints once a dispatch of `version` got through, in attempt `attempt`. */
+const told = (version: string, attempt: number): string =>
+  `Told tibia-sh/mcp.tibia.sh about @tibia.sh/tibiawiki-data ${version} in attempt ${attempt}.`;
+
+test('the hosting dispatch rejects a version that is not a release version, before it calls gh', () => {
+  // The version decides what bump.yml pins, and the error line names what this run had instead.
+  for (const version of ['', 'v3.0.4', '3.0', '3.0.4-rc.1', '3.0.4; true']) {
+    const run = runDispatch(version, [DISPATCHED]);
+    assert.equal(run.status, 1, `${JSON.stringify(version)} is accepted\n${run.log}`);
+    assert.deepEqual(run.errors, [`::error::The published version must look like 1.2.3, and this run has "${version}".`]);
+    assert.deepEqual(run.calls, [], `${JSON.stringify(version)} reaches gh or sleep`);
+  }
+});
+
+test('the hosting dispatch tells the hosting repository about the version once when its first attempt succeeds', () => {
+  // The body is the event bump.yml is triggered by, with the version npm accepted.
+  for (const version of ['3.0.4', '10.20.300']) {
+    const run = runDispatch(version, [DISPATCHED]);
+    assert.equal(run.status, 0, run.log);
+    assert.deepEqual(run.calls, ATTEMPT, 'the dispatch is not one gh call under timeout');
+    assert.deepEqual(run.bodies, [dispatchBody(version)]);
+    assert.ok(run.log.split('\n').includes(told(version, 1)), `the log does not say the dispatch got through\n${run.log}`);
+    assert.deepEqual(run.errors, [], `a dispatch that got through ends with an error\n${run.log}`);
+  }
+});
+
+test('the hosting dispatch tries again 30 seconds after a failure, and stops at the attempt that got through', () => {
+  // A dispatch that got through twice is harmless, because bump.yml finds the version pinned or
+  // its pull request open, so a failed attempt is only tried again, with the same body. A hung
+  // attempt, which timeout stopped, is a failed attempt like any other.
+  const second = runDispatch('3.0.4', [GITHUB_FAILED, DISPATCHED]);
+  assert.equal(second.status, 0, second.log);
+  assert.deepEqual(second.calls, [...ATTEMPT, PAUSE, ...ATTEMPT]);
+  assert.deepEqual(second.bodies, [dispatchBody('3.0.4'), dispatchBody('3.0.4')]);
+  assert.ok(second.log.split('\n').includes(told('3.0.4', 2)), `the log does not say which attempt got through\n${second.log}`);
+  assert.deepEqual(second.errors, [], `a dispatch that got through ends with an error\n${second.log}`);
+  const third = runDispatch('3.0.4', [TIMED_OUT, HOSTING_UNREACHABLE, DISPATCHED]);
+  assert.equal(third.status, 0, third.log);
+  assert.deepEqual(third.calls, [...ATTEMPT, PAUSE, ...ATTEMPT, PAUSE, ...ATTEMPT]);
+  assert.deepEqual(third.bodies, [dispatchBody('3.0.4'), dispatchBody('3.0.4'), dispatchBody('3.0.4')]);
+  assert.ok(third.log.split('\n').includes(told('3.0.4', 3)), `the log does not say which attempt got through\n${third.log}`);
+  assert.deepEqual(third.errors, [], `a dispatch that got through ends with an error\n${third.log}`);
+});
+
+test('the hosting dispatch fails after 3 attempts, 30 seconds apart, and names the runbook section with the manual command', () => {
+  // The publish already happened, so the job ends red with the version and the recovery, and gh's
+  // own errors say why each attempt failed.
+  const failures = [HOSTING_UNREACHABLE, TOKEN_REJECTED, GITHUB_FAILED];
+  const run = runDispatch('3.0.4', failures);
+  assert.equal(run.status, 1, run.log);
+  assert.deepEqual(run.calls, [...ATTEMPT, PAUSE, ...ATTEMPT, PAUSE, ...ATTEMPT]);
+  assert.deepEqual(run.errors, [
+    '::error::Could not tell tibia-sh/mcp.tibia.sh about @tibia.sh/tibiawiki-data 3.0.4 in 3 attempts, 30 seconds apart. Run bump.yml there by hand, as "The hosting dispatch" in docs/RELEASING.md describes.',
+  ]);
+  assert.doesNotMatch(run.log, /^Told /m, `the log says the dispatch got through\n${run.log}`);
+  for (const { text } of failures) {
+    assert.ok(run.log.includes(text), `the log does not carry gh's error: ${text}`);
+  }
+  const section = /"([^"]+)" in docs\/RELEASING\.md/.exec(run.errors[0]!)![1]!;
+  const lines = readFileSync(new URL('../docs/RELEASING.md', import.meta.url), 'utf8').split('\n');
+  const start = lines.indexOf(`## ${section}`);
+  assert.notEqual(start, -1, `docs/RELEASING.md has no section "${section}"`);
+  const end = lines.findIndex((line, index) => index > start && line.startsWith('## '));
+  assert.ok(
+    lines.slice(start, end === -1 ? undefined : end).includes('gh workflow run bump.yml -R tibia-sh/mcp.tibia.sh --ref main -f package=@tibia.sh/tibiawiki-data -f version=X.Y.Z'),
+    `"${section}" in docs/RELEASING.md does not give the manual command`,
+  );
 });
