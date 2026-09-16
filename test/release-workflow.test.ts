@@ -571,7 +571,8 @@ const told = (version: string, attempt: number): string =>
 
 test('the hosting dispatch rejects a version that is not a release version, before it calls gh', () => {
   // The version decides what bump.yml pins, and the error line names what this run had instead.
-  for (const version of ['', 'v3.0.4', '3.0', '3.0.4-rc.1', '3.0.4; true']) {
+  // 3-0-4 passes a regex whose dots lost their backslashes, so it stays in the list.
+  for (const version of ['', 'v3.0.4', '3.0', '3.0.4-rc.1', '3.0.4; true', '3-0-4']) {
     const run = runDispatch(version, [DISPATCHED]);
     assert.equal(run.status, 1, `${JSON.stringify(version)} is accepted\n${run.log}`);
     assert.deepEqual(run.errors, [`::error::The published version must look like 1.2.3, and this run has "${version}".`]);
