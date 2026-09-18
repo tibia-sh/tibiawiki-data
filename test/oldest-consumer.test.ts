@@ -82,6 +82,19 @@ test('a candidate no published server accepts throws, sending a new data major t
     /published by hand under the schema-bump procedure/.test(error.message));
 });
 
+test('the no-consumer error names a section that docs/RELEASING.md has', () => {
+  let message = '';
+  try {
+    selectOldestConsumer(PUBLISHED, '4.0.0');
+  } catch (error) {
+    message = (error as Error).message;
+  }
+  const section = /"([^"]+)" in docs\/RELEASING\.md/.exec(message)?.[1];
+  assert.ok(section, `the error names no section of docs/RELEASING.md: ${message}`);
+  const lines = readFileSync(new URL('../docs/RELEASING.md', import.meta.url), 'utf8').split('\n');
+  assert.ok(lines.includes(`## ${section}`), `docs/RELEASING.md has no section "${section}"`);
+});
+
 test('server versions are compared as numbers, so 0.9.0 is older than 0.10.0', () => {
   // Listed newest first, and in an order a string sort would also get wrong.
   assert.equal(selectOldestConsumer(dependingOn({ '0.10.0': '^3', '0.9.0': '^3', '1.0.0': '^3' }), '3.0.2'), '0.9.0');
