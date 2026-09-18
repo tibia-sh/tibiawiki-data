@@ -693,6 +693,15 @@ test('the GitHub release is a job of its own, run once npm accepted the publish'
   assert.equal(scalar(under(job, 'env'), 'VERSION'), '${{ needs.release.outputs.version }}',
     'VERSION is not the version the release job published');
   assert.doesNotMatch(job, /^ *(?:- +)?continue-on-error:/m, 'the github-release job or one of its steps has continue-on-error');
+  // This is the one job that can write to the repository, so what runs in it is pinned: a step
+  // added here would run with contents: write, and a third action would be code no one reviewed.
+  const list = steps(job);
+  assert.equal(list.length, 4, 'the github-release job does not run exactly four steps');
+  assert.match(list[0]!, /^ *- +uses: *actions\/checkout@/, 'the first step of the github-release job is not the checkout');
+  assert.match(list[1]!, /^ *- +uses: *actions\/setup-node@/, 'the second step of the github-release job is not setup-node');
+  assert.equal(stepIndex(list, NOTES_ID), 2, `the step with id: ${NOTES_ID} is not the third`);
+  assert.equal(stepIndex(list, CREATE_ID), 3, `the step with id: ${CREATE_ID} is not the fourth`);
+  assert.equal(job.split('uses:').length - 1, 2, 'the github-release job uses something besides those two actions');
 });
 
 test('the github-release job checks out the full history and the tags, and installs nothing', () => {
