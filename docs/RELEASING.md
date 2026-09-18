@@ -122,6 +122,15 @@ commit=<the merged commit>
 )
 ```
 
+`gh` can refuse the create with `"workflow" scope may be required`. GitHub does that when your token lacks the `workflow` scope and the workflow files at the target commit differ from those at every branch tip, which is the usual case for a commit that is no longer the tip of `main`. It happened for `v3.0.1` and `v3.0.2` when the first four releases were backfilled on 2026-09-18, and not for the two commits whose workflow files matched a branch. Push the tag over SSH, which no token scope limits, and create the release on it. In the block above, replace `--target "$commit"` with `--verify-tag` after:
+
+```bash
+git update-ref "refs/tags/v$version" "$commit"
+git push origin "refs/tags/v$version"
+```
+
+The job itself tags the commit the run published, which is the tip of `main` unless a later merge changed a workflow in the minute between.
+
 That is the job's own logic, so it covers a first release too: with no tag below the version, `previous` comes back empty and the notes are written from this index alone, with no start tag for the generated part.
 
 Do not re-run the release run once npm accepted the publish. Its release job finds the version on npm and publishes nothing, so `released` stays empty and both this job and `hosting` are skipped.
