@@ -142,7 +142,7 @@ const noConsumer = (candidate: string): Error =>
   new Error(
     `No published ${SERVER} depends on a range that ${DATA}@${candidate} satisfies. A new data major has ` +
       'no consumer yet, so it is published by hand under the schema-bump procedure, "Bumping the schema ' +
-      'version" in README.md.',
+      'version" in docs/RELEASING.md.',
   );
 
 /**
