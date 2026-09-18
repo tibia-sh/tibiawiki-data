@@ -64,7 +64,8 @@ const compareVersions = (a: Version, b: Version): number => a[0] - b[0] || a[1] 
  */
 export function previousTag(tags: string[], version: string): string | undefined {
   const current = parseVersion(version);
-  if (!current) throw new Error(`${version} is not an x.y.z version.`);
+  // Quoted, so an empty version or one that is all spaces still reads as a value in the message.
+  if (!current) throw new Error(`${JSON.stringify(version)} is not an x.y.z version.`);
   let highest: { tag: string; version: Version } | undefined;
   for (const tag of tags) {
     const parsed = tag.startsWith('v') ? parseVersion(tag.slice(1)) : undefined;
@@ -97,9 +98,9 @@ export function readSnapshot(dbPath: string): Snapshot {
     const generator = info('version');
     const names = db.prepare("select name from sqlite_master where type = 'table'").all()
       .map((row) => row['name'])
-      .filter((name): name is string => typeof name === 'string' && !name.startsWith('sqlite_'))
-      .sort();
-    const rows: Record<string, number> = {};
+      .filter((name): name is string => typeof name === 'string' && !name.startsWith('sqlite_'));
+    // Without a prototype, so a table named constructor or __proto__ is a count like any other.
+    const rows: Record<string, number> = Object.create(null);
     for (const name of names) {
       const counted = db.prepare(`select count(*) as count from "${name.replaceAll('"', '""')}"`).get()?.['count'];
       if (typeof counted !== 'number') throw new Error(`${dbPath} gave no row count for ${name}.`);
@@ -115,11 +116,17 @@ const count = (rows: number): string => rows.toLocaleString('en-US');
 
 const change = (delta: number): string => (delta > 0 ? `+${count(delta)}` : delta < 0 ? `-${count(-delta)}` : '0');
 
+/**
+ * The rows of `name` in `snapshot`, or 0 when it holds no such table. Own keys only, so a table
+ * named constructor or toString counts as itself whatever object the caller passed.
+ */
+const rowsOf = (snapshot: Snapshot, name: string): number => (Object.hasOwn(snapshot.rows, name) ? snapshot.rows[name]! : 0);
+
 /** The fixed tables, then every other table whose count moved, by name. A missing table is 0. */
 function tableNames(current: Snapshot, previous: Snapshot): string[] {
-  const others = new Set([...Object.keys(current.rows), ...Object.keys(previous.rows)]);
-  const moved = [...others].sort()
-    .filter((name) => !FIXED_TABLES.includes(name) && (current.rows[name] ?? 0) !== (previous.rows[name] ?? 0));
+  const everyTable = new Set([...Object.keys(current.rows), ...Object.keys(previous.rows)]);
+  const moved = [...everyTable].sort()
+    .filter((name) => !FIXED_TABLES.includes(name) && rowsOf(current, name) !== rowsOf(previous, name));
   return [...FIXED_TABLES, ...moved];
 }
 
@@ -135,12 +142,12 @@ export function renderNotes(version: string, current: Snapshot, previous?: { ver
   ];
   if (previous === undefined) {
     lines.push('', '| Table | Rows |', '|---|---|');
-    for (const name of FIXED_TABLES) lines.push(`| \`${name}\` | ${count(current.rows[name] ?? 0)} |`);
+    for (const name of FIXED_TABLES) lines.push(`| \`${name}\` | ${count(rowsOf(current, name))} |`);
   } else if (!sameSnapshot) {
     lines.push('', `| Table | Rows | Change since \`${previous.version}\` |`, '|---|---|---|');
     for (const name of tableNames(current, previous.snapshot)) {
-      const rows = current.rows[name] ?? 0;
-      lines.push(`| \`${name}\` | ${count(rows)} | ${change(rows - (previous.snapshot.rows[name] ?? 0))} |`);
+      const rows = rowsOf(current, name);
+      lines.push(`| \`${name}\` | ${count(rows)} | ${change(rows - rowsOf(previous.snapshot, name))} |`);
     }
   }
   return `${lines.join('\n')}\n`;
@@ -148,17 +155,30 @@ export function renderNotes(version: string, current: Snapshot, previous?: { ver
 
 const USAGE =
   'Usage: node scripts/release-notes.ts <version> <index.db> [<previous-version> <previous-index.db>]\n' +
-  '       node scripts/release-notes.ts --previous-tag <version>, with the tag names on stdin\n';
+  '       node scripts/release-notes.ts --previous-tag <version>, with the tag names on stdin\n' +
+  '       Each <version> is x.y.z, without a leading v.\n';
+
+/**
+ * Whether the command reads `args`. The notes mode's versions are checked here, before a file is
+ * opened, so a flag or a tag name where a version belongs is a usage error rather than a release
+ * page titled after it. The tag mode's version is checked by previousTag, which has to throw on
+ * it anyway.
+ */
+function isShaped(args: string[]): boolean {
+  if (args[0] === '--previous-tag') return args.length === 2;
+  if (args.length === 2) return parseVersion(args[0]!) !== undefined;
+  if (args.length === 4) return parseVersion(args[0]!) !== undefined && parseVersion(args[2]!) !== undefined;
+  return false;
+}
 
 if (import.meta.main) {
   const args = process.argv.slice(2);
-  const tagMode = args[0] === '--previous-tag';
-  if (tagMode ? args.length !== 2 : args.length !== 2 && args.length !== 4) {
+  if (!isShaped(args)) {
     process.exitCode = 2;
     process.stderr.write(USAGE);
   } else {
     try {
-      if (tagMode) {
+      if (args[0] === '--previous-tag') {
         const tags = readFileSync(0, 'utf8').split('\n').map((line) => line.trim()).filter((line) => line !== '');
         const tag = previousTag(tags, args[1]!);
         if (tag !== undefined) process.stdout.write(`${tag}\n`);
