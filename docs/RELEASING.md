@@ -101,16 +101,28 @@ Look before you create anything by hand. A `gh release create` GitHub accepted c
 gh release view vX.Y.Z
 ```
 
-When it is there, nothing needs doing. When it is not, create it from a checkout of `main` with the tags fetched, with `X.Y.Z` as the published version and the merged commit as the target:
+When it is there, nothing needs doing. When it is not, create it from any up-to-date checkout, with `X.Y.Z` as the published version and the commit that merged it as the target. The index comes out of that commit and not out of the working tree, so a release created days later still describes the snapshot its tag points at. The commands run in one subshell that stops at the first failure, so nothing is created unless the notes were written:
 
 ```bash
-previous=$(git tag --list 'v*' | node scripts/release-notes.ts --previous-tag X.Y.Z)
-git show "$previous:index.db" > /tmp/previous-index.db
-node scripts/release-notes.ts X.Y.Z index.db "${previous#v}" /tmp/previous-index.db > /tmp/release-notes.md
-gh release create vX.Y.Z --target <the merged commit> --title vX.Y.Z --notes-file /tmp/release-notes.md --generate-notes --notes-start-tag "$previous"
+git fetch --tags
+version=X.Y.Z
+commit=<the merged commit>
+(
+  set -euo pipefail
+  previous=$(git tag --list 'v*' | node scripts/release-notes.ts --previous-tag "$version")
+  git show "$commit:index.db" > /tmp/index.db
+  if [ -n "$previous" ]; then
+    git show "$previous:index.db" > /tmp/previous-index.db
+    node scripts/release-notes.ts "$version" /tmp/index.db "${previous#v}" /tmp/previous-index.db > /tmp/release-notes.md
+    gh release create "v$version" --target "$commit" --title "v$version" --notes-file /tmp/release-notes.md --generate-notes --notes-start-tag "$previous"
+  else
+    node scripts/release-notes.ts "$version" /tmp/index.db > /tmp/release-notes.md
+    gh release create "v$version" --target "$commit" --title "v$version" --notes-file /tmp/release-notes.md --generate-notes
+  fi
+)
 ```
 
-With no release before this one, `previous` comes back empty. Drop the `git show` line, write the notes with `node scripts/release-notes.ts X.Y.Z index.db > /tmp/release-notes.md`, and leave `--notes-start-tag` off the last line.
+That is the job's own logic, so it covers a first release too: with no tag below the version, `previous` comes back empty and the notes are written from this index alone, with no start tag for the generated part.
 
 Do not re-run the release run once npm accepted the publish. Its release job finds the version on npm and publishes nothing, so `released` stays empty and both this job and `hosting` are skipped.
 
@@ -152,10 +164,11 @@ pipeline. It is this package, because no published server installs `N.0.0`. Serv
    depends on `^N`, so the install here resolves the hand-published `N.0.0` too, and the
    pull request adds the same exclude to this repository's `pnpm-workspace.yaml`. Its CI
    passes, and merging it publishes nothing, because npm already has `N.0.0`.
-5. Create the GitHub release for `N.0.0` by hand, with the command in
-   [The GitHub release](#the-github-release), targeting the commit step 4 merged. That merge
-   publishes nothing, so the `github-release` job never runs for it, and without this step
-   every new major would miss its release.
+5. Create the GitHub release for `N.0.0` by hand, with the sequence in
+   [The GitHub release](#the-github-release) and `commit` set to the commit step 4 merged, which
+   is where that `index.db` landed on `main`. That merge publishes nothing, so the
+   `github-release` job never runs for it, and without this step every new major would miss its
+   release.
 
 Do not merge a data refresh here between steps 2 and 4. `main` is still on N-1 then, and
 npm refuses to publish a version below `N.0.0` without a dist-tag, so its release run

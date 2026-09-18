@@ -964,9 +964,12 @@ test('a create gh refused ends the step red, and names the runbook section with 
     '::error::Could not create the GitHub release v3.0.4. Create it by hand, as "The GitHub release" in docs/RELEASING.md describes.',
   ]);
   assert.ok(run.log.includes(GH_REFUSED), `the log does not carry gh's error: ${GH_REFUSED}`);
+  // The manual sequence runs the same create in both of the job's forms, and its commands sit
+  // inside a subshell, so the lines are compared without their indentation.
   const section = runbookSection(run.errors[0]!);
-  assert.ok(
-    section.lines.includes('gh release create vX.Y.Z --target <the merged commit> --title vX.Y.Z --notes-file /tmp/release-notes.md --generate-notes --notes-start-tag "$previous"'),
-    `"${section.name}" in docs/RELEASING.md does not give the manual command`,
-  );
+  const lines = section.lines.map((line) => line.trim());
+  const create = 'gh release create "v$version" --target "$commit" --title "v$version" --notes-file /tmp/release-notes.md --generate-notes';
+  for (const line of [`${create} --notes-start-tag "$previous"`, create]) {
+    assert.ok(lines.includes(line), `"${section.name}" in docs/RELEASING.md does not give the manual command: ${line}`);
+  }
 });
