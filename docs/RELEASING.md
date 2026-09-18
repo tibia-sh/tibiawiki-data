@@ -25,9 +25,13 @@ and passes the gate, ends this way. If it does not, the run installs from the lo
   checks pass, so the hosted endpoint `https://mcp.tibia.sh/wiki` serves the new index
   within minutes. When that job is red, follow
   [The hosting dispatch](#the-hosting-dispatch).
+- The run's `github-release` job tags the published commit `vX.Y.Z` and creates the GitHub
+  release for it, with notes generated from the index. When that job is red, follow
+  [The GitHub release](#the-github-release).
 - Every pull request runs the same `pnpm test` and the same gate, in `.github/workflows/ci.yml`.
 
-Nothing is tagged, so a failed publish leaves nothing stranded.
+The tag and the release are created only after npm accepted the publish, so a failed publish
+still strands nothing.
 
 ## When a release run fails
 
@@ -37,7 +41,7 @@ A failed run leaves nothing stranded. `main` holds a version npm does not have, 
 |---|---|
 | Something in the repository, such as a failing test | Fix it in a pull request and merge. The merge's run publishes. |
 | Something outside it: npm was down, or the trusted publisher on npmjs.com does not match and `npm publish` failed with `ENEEDAUTH` | Fix that, then re-run the most recent release run. |
-| npm lists the version although the run failed | The publish went through, and the next run publishes nothing. When the `hosting` job is red or was skipped, follow [The hosting dispatch](#the-hosting-dispatch). |
+| npm lists the version although the run failed | The publish went through, and the next run publishes nothing. When the `hosting` job is red or was skipped, follow [The hosting dispatch](#the-hosting-dispatch). Check the GitHub release the same way, with [The GitHub release](#the-github-release). |
 
 Never re-run a release run expecting a different result when nothing outside the repository changed.
 
@@ -85,6 +89,31 @@ gh workflow run bump.yml -R tibia-sh/mcp.tibia.sh --ref main -f package=@tibia.s
 
 The run it starts does what the dispatch would have. A version the hosting repository already pins ends it green with nothing to do, so a dispatch that arrived after all costs nothing. A version below the pinned one fails it, because `bump.yml` refuses a downgrade.
 
+## The GitHub release
+
+Once npm accepts the publish, the run's `github-release` job tags the published commit `vX.Y.Z` and creates its GitHub release. Its first step, `Write the release notes`, finds the highest `vX.Y.Z` tag below this version, reads that release's `index.db` out of the tag, and runs `scripts/release-notes.ts` over both indexes. Its second step, `Create the GitHub release`, hands those notes to `gh release create`, which creates the tag on the commit the run published and adds GitHub's own generated notes since the previous tag. Every release is listed at [github.com/tibia-sh/tibiawiki-data/releases](https://github.com/tibia-sh/tibiawiki-data/releases).
+
+A red `github-release` job leaves npm and the hosting dispatch untouched. The publish happened before the job started, and the `hosting` job does not wait for this one, so the endpoint still gets the new index. The job is red when the version does not look like `X.Y.Z`, when the tag `vX.Y.Z` exists already, or when the create failed. An existing tag is worth looking at rather than working around: the job runs only for a version npm did not have, so a tag for it should not exist. `git fetch --tags` and then `git log -1 vX.Y.Z` says which commit it points at, and the `gh release view` below says whether a release already sits on it.
+
+Look before you create anything by hand. A `gh release create` GitHub accepted can still report a failure, for example when its answer never arrived, and then the release and its tag are already there:
+
+```bash
+gh release view vX.Y.Z
+```
+
+When it is there, nothing needs doing. When it is not, create it from a checkout of `main` with the tags fetched, with `X.Y.Z` as the published version and the merged commit as the target:
+
+```bash
+previous=$(git tag --list 'v*' | node scripts/release-notes.ts --previous-tag X.Y.Z)
+git show "$previous:index.db" > /tmp/previous-index.db
+node scripts/release-notes.ts X.Y.Z index.db "${previous#v}" /tmp/previous-index.db > /tmp/release-notes.md
+gh release create vX.Y.Z --target <the merged commit> --title vX.Y.Z --notes-file /tmp/release-notes.md --generate-notes --notes-start-tag "$previous"
+```
+
+With no release before this one, `previous` comes back empty. Drop the `git show` line, write the notes with `node scripts/release-notes.ts X.Y.Z index.db > /tmp/release-notes.md`, and leave `--notes-start-tag` off the last line.
+
+Do not re-run the release run once npm accepted the publish. Its release job finds the version on npm and publishes nothing, so `released` stays empty and both this job and `hosting` are skipped.
+
 ## Bumping the schema version
 
 **Not yet exercised.** No schema bump has gone through this procedure.
@@ -123,6 +152,10 @@ pipeline. It is this package, because no published server installs `N.0.0`. Serv
    depends on `^N`, so the install here resolves the hand-published `N.0.0` too, and the
    pull request adds the same exclude to this repository's `pnpm-workspace.yaml`. Its CI
    passes, and merging it publishes nothing, because npm already has `N.0.0`.
+5. Create the GitHub release for `N.0.0` by hand, with the command in
+   [The GitHub release](#the-github-release), targeting the commit step 4 merged. That merge
+   publishes nothing, so the `github-release` job never runs for it, and without this step
+   every new major would miss its release.
 
 Do not merge a data refresh here between steps 2 and 4. `main` is still on N-1 then, and
 npm refuses to publish a version below `N.0.0` without a dist-tag, so its release run
