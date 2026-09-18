@@ -61,6 +61,9 @@ the wiki was read, and `version` there is the tibiawiki-sql version that read it
 db.prepare("select key, value from database_info where key in ('version', 'generate_time')").all();
 ```
 
+The [releases page](https://github.com/tibia-sh/tibiawiki-data/releases) says what each snapshot
+holds: those two values, and how the row counts moved since the release before it.
+
 ## How it stays current
 
 A workflow rebuilds the index every Monday. When the wiki's content changed, it opens a pull
