@@ -63,14 +63,9 @@ reproduced byte for byte. Three values identify it:
 - `generate_time` in the same table, which records when the index was generated.
   It is a timestamp, not a wiki revision. The generator records no revision.
 
-What each release was built from:
-
-| Release | Generator `version` | `generate_time` |
-|---|---|---|
-| `3.0.0` | `9.0.0` | `2026-09-12T19:53:53.020856+00:00` |
-| `3.0.1` | `9.0.0` | `2026-09-13T07:02:58.860376+00:00` |
-| `3.0.2` | `9.0.0` | `2026-09-13T23:07:10.219337+00:00` |
-| `3.0.3` | `9.0.0` | `2026-09-14T12:56:04.784727+00:00` |
+What each release was built from is on its own release page, at
+[github.com/tibia-sh/tibiawiki-data/releases](https://github.com/tibia-sh/tibiawiki-data/releases).
+A release is named after the package version, and its notes carry the other two values.
 
 To read them from any index:
 
