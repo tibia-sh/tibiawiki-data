@@ -1,6 +1,33 @@
 # Releasing
 
-A push to `main` publishes the `version` in `package.json`, after the `oldest-consumer` gate and `pnpm test`, when npm does not list that version yet. Nothing is tagged. [Releases](../README.md#releases) in the README has the details. Once npm accepts the publish, the run's `hosting` job tells `tibia-sh/mcp.tibia.sh` about the release, as [The hosting dispatch](#the-hosting-dispatch) describes.
+Merging a commit to `main` publishes its `package.json` `version` if npm does not have
+that version yet. On every push to `main`, `.github/workflows/release.yml` runs the
+`oldest-consumer` gate from [How the index is built](MAINTAINING.md#how-the-index-is-built), and its release
+job waits for that gate. The release job then asks npm whether it lists that exact version. If
+it does, the run publishes nothing and ends green. Every merge that leaves `version` alone,
+and passes the gate, ends this way. If it does not, the run installs from the lockfile, runs
+`pnpm test`, and runs `npm publish`.
+
+- The gate runs on every push, whether the run publishes or not, so an index that breaks the
+  oldest or the newest published server turns the run red even when nothing is published.
+- The check is for existence, never a comparison with `latest`. A revert leaves
+  `version` below `latest`, and `npm publish` moves `latest` itself.
+- A registry the check cannot read fails the run. It is never taken for a missing
+  version.
+- The run packs the committed `index.db` and never rebuilds it, so the file published is
+  the file reviewed in the pull request.
+- It publishes through npm trusted publishing, so no npm token exists to leak, and npm
+  attaches a provenance attestation for the merged commit. The trusted publisher is
+  registered for the file name `release.yml`, and renaming the file breaks publishing
+  with no warning.
+- Once npm has accepted the publish, the run's `hosting` job tells `tibia-sh/mcp.tibia.sh`
+  about the version. Its `bump.yml` pins it, opens a pull request and merges it when the
+  checks pass, so the hosted endpoint `https://mcp.tibia.sh/wiki` serves the new index
+  within minutes. When that job is red, follow
+  [The hosting dispatch](#the-hosting-dispatch).
+- Every pull request runs the same `pnpm test` and the same gate, in `.github/workflows/ci.yml`.
+
+Nothing is tagged, so a failed publish leaves nothing stranded.
 
 ## When a release run fails
 
@@ -22,10 +49,10 @@ The release job waits for `oldest-consumer`, so a red gate blocks the publish. T
 
 | The log under `FAIL` says | Cause | What to do |
 |---|---|---|
-| `is an error, so the server could not serve it`, `came from an index generated at`, `matching items, but the index holds`, `came back on page`, `distinct items, but the index holds`, `the sweep returned no items` or `is not in the shape the gate reads` | The sweep failed | A published `^N` server breaks on this index, so do not publish it as `N.x`. Fix the index or the generator, or treat the change as a new major under [Bumping the schema version](../README.md#bumping-the-schema-version). |
+| `is an error, so the server could not serve it`, `came from an index generated at`, `matching items, but the index holds`, `came back on page`, `distinct items, but the index holds`, `the sweep returned no items` or `is not in the shape the gate reads` | The sweep failed | A published `^N` server breaks on this index, so do not publish it as `N.x`. Fix the index or the generator, or treat the change as a new major under [Bumping the schema version](#bumping-the-schema-version). |
 | `The sweep did not finish within` or `Request timed out` | The sweep timed out | Re-run the run once. When the same commit times out a second time, treat it as a failed sweep. |
 | `npm installed`, `resolves @tibia.sh/tibiawiki-data/index.db to`, `holds @tibia.sh/tibiawiki-data@`, `DB_PATH is` or `is not defined by "exports"` | An install check failed | The install did not come out the way a user gets it, for example because of the candidate's `exports` map or its `DB_PATH`. Fix the package shape, not the index. |
-| `No published @tibia.sh/tibiawiki-mcp depends on a range that` | No consumer | The candidate is a new major, and no published server depends on it yet. Follow the schema-bump procedure, [Bumping the schema version](../README.md#bumping-the-schema-version). |
+| `No published @tibia.sh/tibiawiki-mcp depends on a range that` | No consumer | The candidate is a new major, and no published server depends on it yet. Follow the schema-bump procedure, [Bumping the schema version](#bumping-the-schema-version). |
 | `Could not read https://registry.npmjs.org/`, `spawnSync npm ETIMEDOUT`, or a network error from npm, such as `npm error code ECONNREFUSED` | npm was unreachable or too slow | Re-run the run once npm is back. The run publishes only a version npm lacks. |
 | `npm error code ETARGET`, `npm error code ENOVERSIONS` or `npm error code ERESOLVE` | npm could not resolve the install | npm takes everything but the two tarballs from before the `--before=` date in the log, 7 days back. Look up the package npm names with `npm view <name> time`. If every version that would do was published after that date, wait until one is 7 days old, then re-run the run. Otherwise the consumer and the candidate cannot install together. Fix the package shape, not the index. |
 
@@ -58,6 +85,86 @@ gh workflow run bump.yml -R tibia-sh/mcp.tibia.sh --ref main -f package=@tibia.s
 
 The run it starts does what the dispatch would have. A version the hosting repository already pins ends it green with nothing to do, so a dispatch that arrived after all costs nothing. A version below the pinned one fails it, because `bump.yml` refuses a downgrade.
 
-## Schema bumps
+## Bumping the schema version
 
-A schema bump publishes one release by hand, outside this workflow. That release has no trusted publisher, so pnpm refuses it in both repositories until each excludes it from its trust policy. Follow [Bumping the schema version](../README.md#bumping-the-schema-version).
+**Not yet exercised.** No schema bump has gone through this procedure.
+
+A bump from N-1 to N cannot pass the automated gates. This package's `N.0.0` runs
+`pnpm test` against its devDependency server, which has to read schema N, so it needs a
+schema-N server on the registry. That server's CI needs this package's `N.0.0` on the
+registry: its `^N` dependency has to install, and its `test/data-package.test.ts` and
+regression sweep read the installed index. So one side is published outside its
+pipeline. It is this package, because no published server installs `N.0.0`. Server
+`0.1.0` does not use this package, and every later server depends on a major below N.
+
+1. On the server's schema-N branch, run `pnpm build`, then `npm pack`. Build this
+   repository's index with that tarball's `build-index`. The published server stamps the
+   index N-1, which this repository's tests reject. Then cross-validate: install each
+   repository's counterpart from the other's local tarball, and run both full test
+   suites. Neither repository builds `dist/` when it packs, so build before every
+   `npm pack`, or the tarball carries a stale `dist/` or none.
+2. The maintainer publishes this package's `N.0.0` by hand, from the validated tarball.
+   `npm publish` runs no lifecycle scripts for a tarball, so step 1 is the only gate it
+   gets. The release carries no provenance and no trusted publisher.
+3. The server's pull request sets `MCP_SCHEMA_VERSION` to N and its dependency range to
+   `^N`. It also adds `trustPolicyExclude` for exactly `@tibia.sh/tibiawiki-data@N.0.0`
+   to the server's `pnpm-workspace.yaml`, with the reason in a comment:
+
+   ```yaml
+   # @tibia.sh/tibiawiki-data N.0.0 was published by hand, so it has no trusted publisher.
+   trustPolicyExclude:
+     - '@tibia.sh/tibiawiki-data@N.0.0'
+   ```
+
+   Its CI passes against the registry, and its release PR publishes it through the
+   server's pipeline.
+4. This repository's pull request commits that exact `index.db`, with `SCHEMA_VERSION` N,
+   `version` `N.0.0`, and the devDependency moved to the new server. The new server
+   depends on `^N`, so the install here resolves the hand-published `N.0.0` too, and the
+   pull request adds the same exclude to this repository's `pnpm-workspace.yaml`. Its CI
+   passes, and merging it publishes nothing, because npm already has `N.0.0`.
+
+Do not merge a data refresh here between steps 2 and 4. `main` is still on N-1 then, and
+npm refuses to publish a version below `N.0.0` without a dist-tag, so its release run
+fails.
+
+Both repositories set `trustPolicy: no-downgrade`, which makes pnpm refuse a version with
+weaker trust evidence than any version published before it. The release workflow publishes
+with a trusted publisher, and a publish by hand has none. So once npm has a release of this
+package from the release workflow, an install that resolves `N.0.0` without the exclude
+fails with `ERR_PNPM_TRUST_DOWNGRADE`. pnpm reads only the first `trustPolicyExclude` entry
+that names a package, so keep one entry for it.
+
+Once npm has `N.0.1` or later from the release workflow, remove both excludes. In each
+repository, remove it in the pull request that moves the lockfile off `N.0.0` with
+`pnpm update @tibia.sh/tibiawiki-data --no-save`. Without `--no-save`, pnpm also raises the
+server's `^N` to the new version, such as `^N.0.1`, and the server's
+`test/data-package.test.ts` rejects that. Without the exclude, a lockfile still on `N.0.0`
+fails the next `pnpm dedupe`. pnpm 12.4.1 fails `update --no-save` with
+`ERR_PNPM_STRICT_MIN_RELEASE_AGE_REQUIRES_SAVE` whenever `minimumReleaseAge` is set
+([pnpm#14835](https://github.com/pnpm/pnpm/issues/14835)). Until `packageManager` names a
+pnpm with the fix, run `pnpm update @tibia.sh/tibiawiki-data` without `--no-save`, restore
+`^N` in the server's `package.json`, then run `pnpm install`. The lockfile moves and the range
+stays.
+
+**Verify the deadlock before relying on this.** On a scratch branch, set the server's
+`MCP_SCHEMA_VERSION` to N: its `test/data-package.test.ts` and regression sweep must
+fail. Here, set `SCHEMA_VERSION` and `version` to N against the schema-(N-1)
+devDependency: the suite must fail before anything is published. If either suite passes,
+it is not checking what this procedure assumes, so stop and find out why. Once npm has a
+release of this package from the release workflow, the server's install of the
+hand-published `N.0.0` fails with `ERR_PNPM_TRUST_DOWNGRADE` without the exclude from
+step 3. Do not try to reproduce that against the real registry, because it takes a real
+publish by hand.
+
+This repository's half was checked on 2026-09-13 for N = 4, on a clone. `pnpm test`
+fails at `the shipped index carries SCHEMA_VERSION`. With the index's
+`mcp_schema_version` row set to 4 as well, it fails at the server test instead, because
+the schema-3 server refuses a schema-4 index. Either way `npm publish` stops in
+`prepublishOnly` and packs nothing.
+
+The trust failure was checked on 2026-09-13 with pnpm 10.33.0, against a local stand-in
+for the registry and never the real one. With `3.0.1` from a trusted publisher and `4.0.0`
+published by hand after it, the server's install of `^4` and this repository's install of
+a server that depends on `^4` both fail with `ERR_PNPM_TRUST_DOWNGRADE`. An exclude for
+exactly `@tibia.sh/tibiawiki-data@4.0.0` lets both through.
