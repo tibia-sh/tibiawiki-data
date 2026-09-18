@@ -24,14 +24,16 @@ index with it. To ask questions over the data without installing anything, add t
 | `spell` | 211 |
 
 The counts are from the `3.0.3` snapshot. The tables come from
-[tibiawiki-sql](https://github.com/Galarzaa90/tibiawiki-sql), which generates the file, plus a few
-the server adds for its own queries. Images are not included, only links to them.
+[tibiawiki-sql](https://github.com/Galarzaa90/tibiawiki-sql), which generates the file. The server
+adds a few more for its own queries. Images are not included, only links to them.
 
 ## Use
 
 ```bash
 npm install @tibia.sh/tibiawiki-data
 ```
+
+The example needs Node 22.13 or later, for `node:sqlite`.
 
 ```js
 import { DatabaseSync } from 'node:sqlite';
@@ -42,15 +44,15 @@ console.log(db.prepare('select title, hitpoints from creature where name = ?').g
 ```
 
 1. `DB_PATH` => the absolute path to `index.db` inside the installed package
-2. `SCHEMA_VERSION` => the version of the tables the server adds, always equal to this package's major version
-
-The file is also exported as `@tibia.sh/tibiawiki-data/index.db`.
+2. `SCHEMA_VERSION` => the version of the tables the server adds. It always equals this package's major version
 
 ## Versions
 
 The major version is the server's schema version, which is why the first release was `3.0.0`.
 A server that reads schema 3 depends on `^3`, so npm never installs an index it cannot read.
-Every release within a major is a newer snapshot with the same tables.
+Every release within a major is a newer snapshot. The tables the server adds keep their shape
+within a major. The rest come from tibiawiki-sql, and `version` in `database_info` says which
+release of it wrote them.
 
 A snapshot says when it was taken. `generate_time` in the `database_info` table is the moment
 the wiki was read, and `version` there is the tibiawiki-sql version that read it:
@@ -62,8 +64,8 @@ db.prepare("select key, value from database_info where key in ('version', 'gener
 ## How it stays current
 
 A workflow rebuilds the index every Monday. When the wiki's content changed, it opens a pull
-request with the new `index.db`. A maintainer reviews and merges it, and the merge publishes the
-next patch version to npm with a provenance attestation. The hosted server picks the new version
+request with the new `index.db`. A maintainer reviews and merges it. The merge publishes the next
+patch version to npm with a provenance attestation. The hosted server picks the new version
 up by itself within minutes.
 
 The file you install is the file that was reviewed. It is committed to this repository, and a
@@ -79,8 +81,8 @@ pnpm install --frozen-lockfile
 pnpm test
 ```
 
-[docs/MAINTAINING.md](docs/MAINTAINING.md) covers how the index is built and tested, and
-[docs/RELEASING.md](docs/RELEASING.md) covers publishing.
+[docs/MAINTAINING.md](https://github.com/tibia-sh/tibiawiki-data/blob/main/docs/MAINTAINING.md) covers how the index is built and tested, and
+[docs/RELEASING.md](https://github.com/tibia-sh/tibiawiki-data/blob/main/docs/RELEASING.md) covers publishing.
 
 ## Licence
 
