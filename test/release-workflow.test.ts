@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { basename, dirname } from 'node:path';
 import { code, keys, read, runScripts, runStep, scalar, stepBody, stepIf, stepIndex, stepInputs, stepName, steps, stepScript, under, workflowFiles } from './workflow.ts';
 import type { Call } from './workflow.ts';
 
@@ -41,6 +42,32 @@ const dispatchStep = (): string => {
   const list = steps(hostingJob());
   return list[stepIndex(list, DISPATCH_ID)]!;
 };
+
+/** The `::error::` lines a step's log carries, which are the lines GitHub shows as the job's errors. */
+const errorLines = (log: string): string[] => log.split('\n').filter((line) => line.startsWith('::error::'));
+
+/** A step's `$GITHUB_OUTPUT` as a map. Every line is `name=value`, or the calling test fails. */
+const outputs = (text: string): Record<string, string> =>
+  Object.fromEntries(text.split('\n').filter((line) => line !== '').map((line) => {
+    const at = line.indexOf('=');
+    assert.notEqual(at, -1, `an output line is not name=value: ${line}`);
+    return [line.slice(0, at), line.slice(at + 1)];
+  }));
+
+/**
+ * The section of docs/RELEASING.md an `::error::` line names, as `"<section>" in
+ * docs/RELEASING.md`, with its heading and its lines up to the next one. A line naming no
+ * section, or a section the file does not have, fails the calling test.
+ */
+function runbookSection(error: string): { name: string; lines: string[] } {
+  const name = /"([^"]+)" in docs\/RELEASING\.md/.exec(error)?.[1];
+  assert.ok(name, `this error line names no section of docs/RELEASING.md: ${error}`);
+  const lines = readFileSync(new URL('../docs/RELEASING.md', import.meta.url), 'utf8').split('\n');
+  const start = lines.indexOf(`## ${name}`);
+  assert.notEqual(start, -1, `docs/RELEASING.md has no section "${name}"`);
+  const end = lines.findIndex((line, index) => index > start && line.startsWith('## '));
+  return { name, lines: lines.slice(start, end === -1 ? undefined : end) };
+}
 
 const isPnpmSetup = (step: string): boolean => /^ *(?:- +)?uses: *pnpm\/setup@/m.test(step);
 
@@ -402,8 +429,8 @@ test('release runs take turns, and none is cancelled or dropped', () => {
   assert.match(concurrency, /^ *queue: *max$/m, 'queue is not max, so a waiting run can be replaced');
 });
 
-/** The condition the hosting job runs on. `released` is 'true' or empty. */
-const HOSTING_GATE = "${{ needs.release.outputs.released == 'true' }}";
+/** The condition each job after the release job runs on. `released` is 'true' or empty. */
+const RELEASED_GATE = "${{ needs.release.outputs.released == 'true' }}";
 
 test('the hosting dispatch is a job of its own, run once npm accepted the publish', () => {
   // The token is a secret of the release-trigger environment. A job gets an environment's secrets
@@ -416,7 +443,7 @@ test('the hosting dispatch is a job of its own, run once npm accepted the publis
   const hosting = hostingJob();
   assert.notEqual(hosting, '', 'the workflow has no hosting job');
   assert.equal(scalar(hosting, 'needs'), 'release', 'the hosting job does not need the release job');
-  assert.equal(scalar(hosting, 'if'), HOSTING_GATE, 'the hosting job does not run on released alone');
+  assert.equal(scalar(hosting, 'if'), RELEASED_GATE, 'the hosting job does not run on released alone');
   assert.equal(scalar(hosting, 'runs-on'), 'ubuntu-latest');
   assert.equal(scalar(hosting, 'timeout-minutes'), '8', 'the hosting job is not bounded at 8 minutes');
   assert.equal(scalar(hosting, 'environment'), 'release-trigger', 'the hosting job does not run in the release-trigger environment');
@@ -545,7 +572,7 @@ function runDispatch(version: string, replies: GhReply[]) {
   }
   return {
     ...run,
-    errors: run.log.split('\n').filter((line) => line.startsWith('::error::')),
+    errors: errorLines(run.log),
     /** What each gh call read on stdin, in the order of the calls. */
     bodies: Object.entries(run.runnerTemp)
       .filter(([name]) => /^dispatch-\d+\.json$/.test(name))
@@ -624,13 +651,322 @@ test('the hosting dispatch fails after 3 attempts, 30 seconds apart, and names t
   for (const { text } of failures) {
     assert.ok(run.log.includes(text), `the log does not carry gh's error: ${text}`);
   }
-  const section = /"([^"]+)" in docs\/RELEASING\.md/.exec(run.errors[0]!)![1]!;
-  const lines = readFileSync(new URL('../docs/RELEASING.md', import.meta.url), 'utf8').split('\n');
-  const start = lines.indexOf(`## ${section}`);
-  assert.notEqual(start, -1, `docs/RELEASING.md has no section "${section}"`);
-  const end = lines.findIndex((line, index) => index > start && line.startsWith('## '));
+  const section = runbookSection(run.errors[0]!);
   assert.ok(
-    lines.slice(start, end === -1 ? undefined : end).includes('gh workflow run bump.yml -R tibia-sh/mcp.tibia.sh --ref main -f package=@tibia.sh/tibiawiki-data -f version=X.Y.Z'),
-    `"${section}" in docs/RELEASING.md does not give the manual command`,
+    section.lines.includes('gh workflow run bump.yml -R tibia-sh/mcp.tibia.sh --ref main -f package=@tibia.sh/tibiawiki-data -f version=X.Y.Z'),
+    `"${section.name}" in docs/RELEASING.md does not give the manual command`,
+  );
+});
+
+/** The job that tags the commit this run published and creates its GitHub release. */
+const githubReleaseJob = (): string => under(under(code(workflow()), 'jobs'), 'github-release');
+
+/** Its first step, which runs the notes script without the token. docs/RELEASING.md names it. */
+const NOTES_ID = 'notes';
+
+/** Its second step, which holds the token and runs git and gh alone. docs/RELEASING.md names it. */
+const CREATE_ID = 'create';
+
+const githubReleaseStep = (id: string): string => {
+  const list = steps(githubReleaseJob());
+  return list[stepIndex(list, id)]!;
+};
+
+test('the GitHub release is a job of its own, run once npm accepted the publish', () => {
+  // It is the one job that can write to the repository, and it holds no OIDC token: the job that
+  // publishes to npm cannot tag, and the job that tags cannot publish. It runs beside the hosting
+  // job, and neither waits for the other. It runs only once the release job published, so a push
+  // that publishes nothing skips it and a failed publish leaves no tag behind.
+  const job = githubReleaseJob();
+  assert.notEqual(job, '', 'the workflow has no github-release job');
+  assert.equal(scalar(job, 'needs'), 'release', 'the github-release job does not need the release job');
+  assert.equal(scalar(job, 'if'), RELEASED_GATE, 'the github-release job does not run on released alone');
+  assert.equal(scalar(job, 'runs-on'), 'ubuntu-latest');
+  assert.equal(scalar(job, 'timeout-minutes'), '5', 'the github-release job is not bounded at 5 minutes');
+  assert.equal(scalar(job, 'environment'), undefined, 'the github-release job names an environment');
+  const permissions = under(job, 'permissions');
+  assert.deepEqual(keys(permissions), ['contents'], 'the github-release job does not hold exactly one permission, contents');
+  assert.equal(scalar(permissions, 'contents'), 'write', 'the github-release job holds more than contents: write');
+  assert.doesNotMatch(job, /\bid-token\b/, 'the github-release job can mint an OIDC token');
+  assert.doesNotMatch(job, /\bsecrets\./, 'the github-release job reads a secret');
+  assert.deepEqual(keys(under(job, 'env')), ['VERSION'], 'the github-release job sets something besides VERSION');
+  assert.equal(scalar(under(job, 'env'), 'VERSION'), '${{ needs.release.outputs.version }}',
+    'VERSION is not the version the release job published');
+  assert.doesNotMatch(job, /^ *(?:- +)?continue-on-error:/m, 'the github-release job or one of its steps has continue-on-error');
+});
+
+test('the github-release job checks out the full history and the tags, and installs nothing', () => {
+  // The notes read the previous release's index out of its tag, so a shallow checkout without
+  // tags would silently make every release look like a first one. The job installs no package:
+  // the script it runs imports node builtins only, and this job can write to the repository.
+  const job = githubReleaseJob();
+  const list = steps(job);
+  const checkouts = list.filter((step) => /^ *(?:- +)?uses: *actions\/checkout@/m.test(step));
+  assert.equal(checkouts.length, 1, 'expected exactly one checkout in the github-release job');
+  const checkout = stepInputs(checkouts[0]!);
+  assert.equal(scalar(checkout, 'fetch-depth'), '0', 'the checkout does not fetch the whole history');
+  assert.equal(scalar(checkout, 'fetch-tags'), 'true', 'the checkout does not fetch the tags the previous release is found among');
+  assert.equal(scalar(checkout, 'persist-credentials'), 'false', 'the checkout leaves the token in .git/config');
+  assert.doesNotMatch(checkouts[0]!, /^ *ref:/m, 'the checkout takes a ref instead of the triggering commit');
+  const setups = list.filter((step) => /^ *(?:- +)?uses: *actions\/setup-node@/m.test(step));
+  assert.equal(setups.length, 1, 'expected exactly one setup-node in the github-release job');
+  const node = stepInputs(setups[0]!);
+  assert.equal(scalar(node, 'node-version'), "'26'", 'setup-node does not install the Node the script runs under');
+  assert.equal(scalar(node, 'package-manager-cache'), 'false', 'setup-node in the github-release job caches the package manager store');
+  assert.equal(scalar(node, 'cache'), undefined, 'setup-node in the github-release job restores a dependency cache');
+  assert.doesNotMatch(job, /\bpnpm\b|\bnpm +(?:install|i|ci)\b/, 'the github-release job installs packages');
+});
+
+test('the token reaches the create step alone, and the step that runs the script never sees it', () => {
+  // The script runs on a tag's content and on the version, neither of which a reviewer saw as
+  // code, so the step running it holds no env at all. gh reads GH_TOKEN by itself, so neither
+  // script names the token.
+  const job = githubReleaseJob();
+  assert.equal(job.split('GH_TOKEN').length - 1, 1, 'GH_TOKEN appears more than once in the github-release job');
+  const notes = githubReleaseStep(NOTES_ID);
+  assert.equal(scalar(stepBody(notes), 'name'), 'Write the release notes', 'the notes step is not named as docs/RELEASING.md names it');
+  assert.equal(under(stepBody(notes), 'env'), '', `${stepName(notes)} has an env of its own`);
+  const create = githubReleaseStep(CREATE_ID);
+  assert.equal(scalar(stepBody(create), 'name'), 'Create the GitHub release', 'the create step is not named as docs/RELEASING.md names it');
+  assert.deepEqual(keys(under(stepBody(create), 'env')), ['GH_TOKEN', 'PREVIOUS', 'NOTES'],
+    `${stepName(create)} does not take exactly the token, the previous tag and the notes`);
+  assert.equal(scalar(under(stepBody(create), 'env'), 'GH_TOKEN'), '${{ github.token }}',
+    'the create step runs with something other than the run token');
+  assert.equal(scalar(under(stepBody(create), 'env'), 'PREVIOUS'), `\${{ steps.${NOTES_ID}.outputs.previous }}`,
+    'PREVIOUS is not the tag the notes step found');
+  assert.equal(scalar(under(stepBody(create), 'env'), 'NOTES'), `\${{ steps.${NOTES_ID}.outputs.notes }}`,
+    'NOTES is not the file the notes step wrote');
+  assert.doesNotMatch(stepScript(workflow(), NOTES_ID), /GH_TOKEN|GITHUB_TOKEN/, 'the notes script names a token');
+  assert.doesNotMatch(stepScript(workflow(), CREATE_ID), /GH_TOKEN|GITHUB_TOKEN/, 'the create script names its token');
+  for (const step of [notes, create]) {
+    assert.equal(stepIf(step), undefined, `${stepName(step)} sets if`);
+    assert.equal(scalar(stepBody(step), 'timeout-minutes'), undefined, `${stepName(step)} has a bound of its own`);
+  }
+});
+
+/** What the stand-in script prints as the notes, which the step must leave in the file it hands on. */
+const NOTES_TEXT = '# the notes this stand-in wrote\n';
+
+/** What the stand-in git prints for the previous release's index. */
+const PREVIOUS_INDEX = 'the previous index';
+
+/**
+ * A stand-in git for the notes step: `tag --list` prints `tags`, one per line, and `show` prints
+ * PREVIOUS_INDEX. Each exits the code given for it, and prints nothing when that is not 0. Any
+ * other subcommand exits 2, so a command this test does not stand in for cannot pass unnoticed.
+ */
+const fakeNotesGit = (tags: string[], tagsExit: number, showExit: number): string =>
+  `const args = process.argv.slice(2);\n` +
+  `if (args[0] === 'tag') {\n` +
+  `  if (${tagsExit} === 0) process.stdout.write(${JSON.stringify(tags.map((tag) => `${tag}\n`).join(''))});\n` +
+  `  process.exitCode = ${tagsExit};\n` +
+  `} else if (args[0] === 'show') {\n` +
+  `  if (${showExit} === 0) process.stdout.write(${JSON.stringify(PREVIOUS_INDEX)});\n` +
+  `  process.exitCode = ${showExit};\n` +
+  `} else {\n` +
+  `  process.stderr.write('fake git: ' + args.join(' ') + '\\n');\n` +
+  `  process.exitCode = 2;\n` +
+  `}\n`;
+
+/**
+ * A stand-in for the node that runs scripts/release-notes.ts. Its --previous-tag mode keeps what
+ * it read on stdin in RUNNER_TEMP as tags.txt and prints `previous`, or nothing when that is
+ * empty, as the script prints a tag or nothing. Its notes mode prints NOTES_TEXT.
+ */
+const fakeNotesScript = (previous: string, previousExit: number, notesExit: number): string =>
+  `const fs = require('node:fs');\n` +
+  `if (process.argv[3] === '--previous-tag') {\n` +
+  `  fs.writeFileSync(process.env.RUNNER_TEMP + '/tags.txt', fs.readFileSync(0, 'utf8'));\n` +
+  `  if (${previousExit} === 0 && ${JSON.stringify(previous)} !== '') process.stdout.write(${JSON.stringify(previous)} + '\\n');\n` +
+  `  process.exitCode = ${previousExit};\n` +
+  `} else {\n` +
+  `  if (${notesExit} === 0) process.stdout.write(${JSON.stringify(NOTES_TEXT)});\n` +
+  `  process.exitCode = ${notesExit};\n` +
+  `}\n`;
+
+/**
+ * Runs the notes step the way a runner does, in a checkout holding index.db, with stand-ins for
+ * git and for the node that runs the script. `tags` is what `git tag --list` prints and
+ * `previous` what the script answers the tag mode with. Each exit lets one command fail in turn.
+ */
+function runNotes({ version = '3.0.4', tags = ['v3.0.0', 'v3.0.3'], previous = 'v3.0.3', tagsExit = 0, showExit = 0, previousExit = 0, notesExit = 0 }: {
+  version?: string;
+  tags?: string[];
+  previous?: string;
+  tagsExit?: number;
+  showExit?: number;
+  previousExit?: number;
+  notesExit?: number;
+} = {}) {
+  const run = runStep(stepScript(workflow(), NOTES_ID), {
+    files: { 'index.db': 'the committed index' },
+    commands: { git: fakeNotesGit(tags, tagsExit, showExit), node: fakeNotesScript(previous, previousExit, notesExit) },
+    env: { VERSION: version },
+  });
+  return {
+    ...run,
+    errors: errorLines(run.log),
+    // The two commands of a pipeline run at once, so they record their calls in either order.
+    // Sorted by command name, git comes before node whichever of them started first.
+    pipeline: run.calls.slice(0, 2).sort((a, b) => a.command.localeCompare(b.command)),
+    /** Every call the step made after that pipeline, in order. */
+    rest: run.calls.slice(2),
+  };
+}
+
+/** The script call that finds the previous tag, as the notes step makes it. */
+const PREVIOUS_TAG_CALL: Call = { command: 'node', args: ['scripts/release-notes.ts', '--previous-tag', '3.0.4'] };
+
+/** The tag list the notes step asks git for. */
+const TAG_LIST_CALL: Call = { command: 'git', args: ['tag', '--list', 'v*'] };
+
+test('the notes step writes the notes against the previous release, and hands on the tag and the file', () => {
+  // The script takes the previous version without the v its tag carries, and reads that
+  // release's index out of the tag rather than from the network.
+  const run = runNotes();
+  assert.equal(run.status, 0, run.log);
+  const out = outputs(run.output);
+  assert.deepEqual(Object.keys(out), ['previous', 'notes'], 'the step does not hand on exactly previous and notes');
+  assert.equal(out['previous'], 'v3.0.3', 'the step did not hand on the tag the script found');
+  const temp = dirname(out['notes']!);
+  assert.deepEqual(run.pipeline, [TAG_LIST_CALL, PREVIOUS_TAG_CALL]);
+  assert.deepEqual(run.rest, [
+    { command: 'git', args: ['show', 'v3.0.3:index.db'] },
+    { command: 'node', args: ['scripts/release-notes.ts', '3.0.4', 'index.db', '3.0.3', `${temp}/previous-index.db`] },
+  ]);
+  assert.equal(run.runnerTemp['tags.txt'], 'v3.0.0\nv3.0.3\n', 'the tag list git printed did not reach the script');
+  assert.equal(run.runnerTemp[basename(out['notes']!)], NOTES_TEXT, 'the file the step hands on does not hold the notes');
+  assert.equal(run.runnerTemp['previous-index.db'], PREVIOUS_INDEX, "the previous release's index was not extracted to RUNNER_TEMP");
+  assert.equal(run.checkout['index.db'], 'the committed index', 'the step wrote into the checkout');
+  assert.deepEqual(run.errors, [], `a step that wrote its notes ends with an error\n${run.log}`);
+});
+
+test('the notes step writes the notes without a previous release when no tag is below the version', () => {
+  // The first release of a major has no tag below it, and that is not a failure.
+  const run = runNotes({ tags: [], previous: '' });
+  assert.equal(run.status, 0, run.log);
+  const out = outputs(run.output);
+  assert.equal(out['previous'], '', 'the step handed on a previous tag although there is none');
+  assert.deepEqual(run.pipeline, [TAG_LIST_CALL, PREVIOUS_TAG_CALL]);
+  assert.deepEqual(run.rest, [{ command: 'node', args: ['scripts/release-notes.ts', '3.0.4', 'index.db'] }]);
+  assert.equal(run.runnerTemp[basename(out['notes']!)], NOTES_TEXT, 'the file the step hands on does not hold the notes');
+  assert.equal(run.runnerTemp['previous-index.db'], undefined, 'the step extracted an index although there is no previous release');
+});
+
+test('the notes step rejects a version that is not a release version, before it runs anything', () => {
+  // The version becomes the tag, the title and the install line, and the error names what this
+  // run had instead. 3-0-4 passes a regex whose dots lost their backslashes, so it stays in the list.
+  for (const version of ['', 'v3.0.4', '3.0', '3.0.4-rc.1', '3.0.4; true', '3-0-4']) {
+    const run = runNotes({ version });
+    assert.equal(run.status, 1, `${JSON.stringify(version)} is accepted\n${run.log}`);
+    assert.deepEqual(run.errors, [`::error::The published version must look like 1.2.3, and this run has "${version}".`]);
+    assert.deepEqual(run.calls, [], `${JSON.stringify(version)} reaches git or the script`);
+    assert.equal(run.output, '', `the step handed something on for ${JSON.stringify(version)}`);
+  }
+});
+
+test('the notes step fails, and hands nothing on, when a command it needs fails', () => {
+  // A failed command must end the job red rather than leave a release to be created from half
+  // the notes. git listing no tags is the quiet one: taken for a first release, it would cost
+  // the notes their change column, so the script sets pipefail as well as -e.
+  const cases: Array<[string, Parameters<typeof runNotes>[0]]> = [
+    ['git cannot list the tags', { tagsExit: 1 }],
+    ['the script refuses the version it is asked for a previous tag for', { previousExit: 2 }],
+    ["git cannot read the previous release's index", { showExit: 1 }],
+    ['the script cannot write the notes', { notesExit: 1 }],
+  ];
+  for (const [what, options] of cases) {
+    const run = runNotes(options);
+    assert.notEqual(run.status, 0, `the step passed when ${what}\n${run.log}`);
+    assert.equal(run.output, '', `the step handed something on when ${what}`);
+  }
+});
+
+/** The commit the run published, which the release targets. */
+const RUN_SHA = 'd34db33fd34db33fd34db33fd34db33fd34db33f';
+
+/** The file the notes step handed on, as the create step receives it. */
+const NOTES_FILE = '/home/runner/work/_temp/release-notes.md';
+
+/** The token the create step runs with in these checks. The stand-in gh reads no token. */
+const RELEASE_TOKEN = 'stand-in-release-token';
+
+/** What the stand-in gh prints when it refuses a release, as gh prints its errors. */
+const GH_REFUSED = 'gh: Resource not accessible by integration (HTTP 403)';
+
+/**
+ * Runs the create step the way a runner does, with stand-ins for git and gh. git answers
+ * `rev-parse` the way it does for a tag that exists or is missing, and gh exits `ghExit`. The
+ * token is in the step's env, so any command that prints it fails every run.
+ */
+function runCreate({ version = '3.0.4', previous = 'v3.0.3', tagExists = false, ghExit = 0 }: {
+  version?: string;
+  previous?: string;
+  tagExists?: boolean;
+  ghExit?: number;
+} = {}) {
+  const run = runStep(stepScript(workflow(), CREATE_ID), {
+    commands: {
+      git: tagExists ? `process.stdout.write(${JSON.stringify(`${RUN_SHA}\n`)});\n` : 'process.exitCode = 1;\n',
+      gh: `if (${ghExit} !== 0) process.stderr.write(${JSON.stringify(`${GH_REFUSED}\n`)});\nprocess.exitCode = ${ghExit};\n`,
+    },
+    env: { VERSION: version, PREVIOUS: previous, NOTES: NOTES_FILE, GH_TOKEN: RELEASE_TOKEN, GITHUB_SHA: RUN_SHA },
+  });
+  assert.ok(!run.log.includes(RELEASE_TOKEN), 'the create step printed the token');
+  for (const call of run.calls) {
+    assert.ok(!call.args.join(' ').includes(RELEASE_TOKEN), `the token appears on the command line of ${call.command}`);
+  }
+  return { ...run, errors: errorLines(run.log) };
+}
+
+/** The lookup that stops the step when the tag exists already. */
+const TAG_LOOKUP_CALL: Call = { command: 'git', args: ['rev-parse', '-q', '--verify', 'refs/tags/v3.0.4'] };
+
+/** The release gh is asked to create, up to the start tag. */
+const CREATE_ARGS = ['release', 'create', 'v3.0.4', '--target', RUN_SHA, '--title', 'v3.0.4', '--notes-file', NOTES_FILE, '--generate-notes'];
+
+test('the create step creates the release on the commit this run published, with the notes and the start tag', () => {
+  // gh creates the tag itself, on --target, which is the commit npm provenance names. The
+  // generated notes list the pull requests merged since the previous tag.
+  const run = runCreate();
+  assert.equal(run.status, 0, run.log);
+  assert.deepEqual(run.calls, [TAG_LOOKUP_CALL, { command: 'gh', args: [...CREATE_ARGS, '--notes-start-tag', 'v3.0.3'] }]);
+  assert.deepEqual(run.errors, [], `a release that was created ends with an error\n${run.log}`);
+});
+
+test('the create step leaves the start tag out when there is no previous release', () => {
+  // gh rejects an empty --notes-start-tag, and with no tag below the version there is nothing
+  // to count the merged pull requests from.
+  const run = runCreate({ previous: '' });
+  assert.equal(run.status, 0, run.log);
+  assert.deepEqual(run.calls, [TAG_LOOKUP_CALL, { command: 'gh', args: CREATE_ARGS }]);
+});
+
+test('the create step fails before it calls gh when the tag exists already', () => {
+  // --target applies only to a tag gh creates, so a release on a tag pointing elsewhere would
+  // name the wrong commit. released is 'true' only for a version npm did not have, so an
+  // existing tag is an anomaly a person should look at.
+  const run = runCreate({ tagExists: true });
+  assert.equal(run.status, 1, run.log);
+  assert.deepEqual(run.calls, [TAG_LOOKUP_CALL], 'the step called gh although the tag exists already');
+  assert.deepEqual(run.errors, [
+    '::error::The tag v3.0.4 exists already, so this run created no release. Look at what it points at, as "The GitHub release" in docs/RELEASING.md describes.',
+  ]);
+});
+
+test('a create gh refused ends the step red, and names the runbook section with the manual command', () => {
+  // npm has the version by now, so the job ends red with the version and the recovery, and gh's
+  // own error says why.
+  const run = runCreate({ ghExit: 1 });
+  assert.equal(run.status, 1, run.log);
+  assert.deepEqual(run.calls, [TAG_LOOKUP_CALL, { command: 'gh', args: [...CREATE_ARGS, '--notes-start-tag', 'v3.0.3'] }]);
+  assert.deepEqual(run.errors, [
+    '::error::Could not create the GitHub release v3.0.4. Create it by hand, as "The GitHub release" in docs/RELEASING.md describes.',
+  ]);
+  assert.ok(run.log.includes(GH_REFUSED), `the log does not carry gh's error: ${GH_REFUSED}`);
+  const section = runbookSection(run.errors[0]!);
+  assert.ok(
+    section.lines.includes('gh release create vX.Y.Z --target <the merged commit> --title vX.Y.Z --notes-file /tmp/release-notes.md --generate-notes --notes-start-tag "$previous"'),
+    `"${section.name}" in docs/RELEASING.md does not give the manual command`,
   );
 });

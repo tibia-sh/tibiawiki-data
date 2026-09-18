@@ -128,6 +128,90 @@ jobs:
           echo "released=true" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
+  # Tags the commit this run published and creates its GitHub release. A job of its own, because it
+  # is the only job here that can write to the repository, and it holds no OIDC token: the job that
+  # publishes to npm cannot tag, and the job that tags cannot publish. It runs beside the hosting
+  # job and neither waits for the other. It runs only once the release job published, so a push that
+  # publishes nothing skips it, and a failed publish leaves no tag behind.
+  github-release:
+    needs: release
+    if: ${{ needs.release.outputs.released == 'true' }}
+    runs-on: ubuntu-latest
+    # Two steps that run a script, a checkout and a setup-node. 5 minutes is room for the checkout
+    # of the whole history, which is what takes the time here.
+    timeout-minutes: 5
+    permissions:
+      contents: write  # create the tag and the release
+    env:
+      VERSION: ${{ needs.release.outputs.version }}
+    steps:
+      # No ref: the commit that triggered the run, which is the commit npm provenance names and the
+      # one this release targets. The whole history and every tag, because the notes read the
+      # previous release's index out of its tag.
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: '26'
+          # No dependency cache in this job either. This setup-node restores one by itself whenever
+          # package.json names a packageManager, so it is switched off by name.
+          package-manager-cache: false
+      # The notes come from the repository's own script, which imports node builtins only, so this
+      # job installs nothing. The step holds no env of its own, so the script never sees a token.
+      # pipefail beside the runner's -e: git printing no tags would otherwise read as a first
+      # release, and the notes would quietly lose their change column.
+      - name: Write the release notes
+        id: notes
+        run: |
+          set -o pipefail
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::The published version must look like 1.2.3, and this run has \"$VERSION\"."
+            exit 1
+          fi
+          notes="$RUNNER_TEMP/release-notes.md"
+          previous=$(git tag --list 'v*' | node scripts/release-notes.ts --previous-tag "$VERSION")
+          if [ -n "$previous" ]; then
+            index="$RUNNER_TEMP/previous-index.db"
+            git show "$previous:index.db" > "$index"
+            # The script takes versions without the v the tag carries.
+            node scripts/release-notes.ts "$VERSION" index.db "${previous#v}" "$index" > "$notes"
+          else
+            node scripts/release-notes.ts "$VERSION" index.db > "$notes"
+          fi
+          {
+            echo "previous=$previous"
+            echo "notes=$notes"
+          } >> "$GITHUB_OUTPUT"
+      # gh reads the token from GH_TOKEN by itself, so the script never names it. gh release create
+      # creates the tag too, on --target. An existing tag stops the step before that call, because
+      # --target applies only to a tag gh creates, so a release on a tag pointing elsewhere would
+      # name the wrong commit. One attempt: a create is one API call, and docs/RELEASING.md gives
+      # the manual command.
+      - name: Create the GitHub release
+        id: create
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREVIOUS: ${{ steps.notes.outputs.previous }}
+          NOTES: ${{ steps.notes.outputs.notes }}
+        run: |
+          if git rev-parse -q --verify "refs/tags/v$VERSION" > /dev/null; then
+            echo "::error::The tag v$VERSION exists already, so this run created no release. Look at what it points at, as \"The GitHub release\" in docs/RELEASING.md describes."
+            exit 1
+          fi
+          create=(release create "v$VERSION" --target "$GITHUB_SHA" --title "v$VERSION" --notes-file "$NOTES" --generate-notes)
+          # The generated notes list the pull requests merged since the previous release. With no
+          # tag below this version there is nothing to count them from.
+          if [ -n "$PREVIOUS" ]; then
+            create+=(--notes-start-tag "$PREVIOUS")
+          fi
+          if ! gh "${create[@]}"; then
+            echo "::error::Could not create the GitHub release v$VERSION. Create it by hand, as \"The GitHub release\" in docs/RELEASING.md describes."
+            exit 1
+          fi
+
   # Tells tibia-sh/mcp.tibia.sh about the release, so its bump.yml pins the version and deploys it.
   # A job of its own, because the token is a secret of the release-trigger environment, and naming
   # that environment in the release job would put an environment claim in its OIDC token, which
