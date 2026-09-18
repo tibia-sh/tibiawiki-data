@@ -37,6 +37,7 @@ function makeIndex(path: string, { info, rows, indexes = [] }: {
   rows: Record<string, number>;
   indexes?: string[];
 }): void {
+  const quoted = (name: string): string => `"${name.replaceAll('"', '""')}"`;
   const db = new DatabaseSync(path);
   try {
     db.exec('create table database_info (key text primary key, value text)');
@@ -44,13 +45,13 @@ function makeIndex(path: string, { info, rows, indexes = [] }: {
       db.prepare('insert into database_info (key, value) values (?, ?)').run(key, value);
     }
     for (const [name, count] of Object.entries(rows)) {
-      db.exec(`create table "${name}" (id integer primary key)`);
+      db.exec(`create table ${quoted(name)} (id integer primary key)`);
       if (count > 0) {
         db.exec(`with recursive c(x) as (select 1 union all select x + 1 from c where x < ${count}) ` +
-          `insert into "${name}" (id) select x from c`);
+          `insert into ${quoted(name)} (id) select x from c`);
       }
     }
-    for (const name of indexes) db.exec(`create index "${name}_id" on "${name}" (id)`);
+    for (const name of indexes) db.exec(`create index ${quoted(`${name}_id`)} on ${quoted(name)} (id)`);
   } finally {
     db.close();
   }
@@ -206,10 +207,11 @@ test('no tag below the version gives nothing, and the version tag itself is not 
   assert.equal(previousTag([], '3.0.4'), undefined);
 });
 
-test('a version that is not X.Y.Z throws rather than compare', () => {
-  for (const version of ['3.0', 'v3.0.0', '3.0.0-rc.1', '3.0.01', '']) {
-    assert.throws(() => previousTag(['v3.0.1'], version), (error: unknown) =>
-      error instanceof Error && error.message.includes(version || 'x.y.z'), `previousTag read ${JSON.stringify(version)}`);
+test('a version that is not X.Y.Z throws rather than compare, quoting what it was given', () => {
+  // Quoted, so an empty version or one that is all spaces still reads as a value in the message.
+  for (const version of ['3.0', 'v3.0.0', '3.0.0-rc.1', '3.0.01', '', ' ']) {
+    assert.throws(() => previousTag(['v3.0.1'], version),
+      { message: `${JSON.stringify(version)} is not an x.y.z version.` }, `previousTag read ${JSON.stringify(version)}`);
   }
 });
 
@@ -243,11 +245,47 @@ test('a snapshot counts the tables only, not the indexes or sqlite_ tables', () 
       db.close();
     }
     const read = readSnapshot(path);
-    assert.deepEqual(read, {
-      generateTime: STAMP,
-      generator: '9.0.0',
-      rows: { counted: 1, creature: 0, database_info: 2, item: 3 },
-    });
+    assert.equal(read.generateTime, STAMP);
+    assert.equal(read.generator, '9.0.0');
+    // Spread, because the counts come back on an object with no prototype.
+    assert.deepEqual({ ...read.rows }, { counted: 1, creature: 0, database_info: 2, item: 3 });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a table named constructor or __proto__ is counted and compared like any other', () => {
+  // On a plain object the count of `constructor` would come back as a function and the count of
+  // `__proto__` would never be stored at all, so both tables would report a nonsense change.
+  const dir = mkdtempSync(join(tmpdir(), 'tibiawiki-data-release-notes-'));
+  try {
+    const previousPath = join(dir, 'previous.db');
+    const currentPath = join(dir, 'index.db');
+    makeIndex(previousPath, { info: { generate_time: '2026-09-14T12:56:04.784727+00:00', version: '9.0.0' }, rows: { item: 1 } });
+    // A computed key, because `__proto__:` in an object literal sets the prototype instead.
+    makeIndex(currentPath, { info: { generate_time: STAMP, version: '9.0.0' }, rows: { item: 1, constructor: 2, ['__proto__']: 5 } });
+
+    const current = readSnapshot(currentPath);
+    assert.equal(current.rows['constructor'], 2);
+    assert.equal(current.rows['__proto__'], 5);
+    const notes = renderNotes('3.0.4', current, { version: '3.0.3', snapshot: readSnapshot(previousPath) });
+    assert.match(notes, /^\| `__proto__` \| 5 \| \+5 \|$/m);
+    assert.match(notes, /^\| `constructor` \| 2 \| \+2 \|$/m);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a table whose name is a SQL keyword or holds a double quote is counted under that name', () => {
+  // The name reaches `select count(*)` as an interpolated identifier, so it is quoted there.
+  const dir = mkdtempSync(join(tmpdir(), 'tibiawiki-data-release-notes-'));
+  try {
+    const path = join(dir, 'index.db');
+    makeIndex(path, { info: { generate_time: STAMP, version: '9.0.0' }, rows: { order: 3, 'we"ird': 2, 'from': 0 } });
+    const { rows } = readSnapshot(path);
+    assert.equal(rows['order'], 3);
+    assert.equal(rows['we"ird'], 2);
+    assert.equal(rows['from'], 0);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -255,7 +293,11 @@ test('a snapshot counts the tables only, not the indexes or sqlite_ tables', () 
 
 test('an argument shape the command does not read prints a usage naming both modes and exits 2', () => {
   const shapes = [[], ['3.0.4'], ['3.0.4', 'index.db', '3.0.3'], ['3.0.4', 'index.db', '3.0.3', 'previous.db', 'extra'],
-    ['--previous-tag'], ['--previous-tag', '3.0.4', 'index.db']];
+    ['--previous-tag'], ['--previous-tag', '3.0.4', 'index.db'],
+    // A version that is not x.y.z is a usage error too, checked before any file is opened, so a
+    // flag or a tag name in the version's place never reads as the name of a release.
+    ['--help', 'index.db'], ['3.0', 'index.db'], ['v3.0.4', 'index.db'],
+    ['3.0.4', 'index.db', 'v3.0.3', 'previous.db'], ['3.0.4', 'index.db', '3.0.3-rc.1', 'previous.db']];
   for (const args of shapes) {
     const result = run(args);
     assert.equal(result.status, 2, `${JSON.stringify(args)} did not exit 2\n${result.stdout}${result.stderr}`);
