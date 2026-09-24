@@ -326,19 +326,35 @@ jobs:
             -c 'credential.helper=!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f' \
             push --force origin HEAD:refs/heads/drift/index
 
-          # The pull request the lookup found can have merged or closed between the lookup and the
-          # push. So it is read again by number after the update, and when it is no longer open a
-          # new one is opened for drift/index. Auto-merge is turned on or off from this state.
-          if [ -n "$number" ]; then
-            gh api --method PATCH "repos/$GITHUB_REPOSITORY/pulls/$number" -f title="$title" -f body="$body" --jq .html_url
-            now=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$number" --jq '"\(.state) \(.auto_merge != null)"')
-            if [[ ! $now =~ ^(open|closed)\ (true|false)$ ]]; then
-              echo "Reading pull request #$number again printed '$now'." >&2
+          # Reads pull request $number into state, merged, auto and sha. It returns non-zero when gh
+          # fails, and ends the step when gh answers with another shape.
+          read_pull_request() {
+            local view
+            view=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$number" --jq '"\(.state) \(.merged) \(.auto_merge != null) \(.head.sha)"') || return 1
+            if [[ ! $view =~ ^(open|closed)\ (true|false)\ (true|false)\ ([0-9a-f]{40})$ ]]; then
+              echo "::error::Reading pull request #$number printed '$view'."
               exit 1
             fi
-            armed=${BASH_REMATCH[2]}
-            if [ "${BASH_REMATCH[1]}" != open ]; then
-              echo "Pull request #$number closed before this push, so a new one is opened."
+            state=${BASH_REMATCH[1]}
+            merged=${BASH_REMATCH[2]}
+            auto=${BASH_REMATCH[3]}
+            sha=${BASH_REMATCH[4]}
+          }
+
+          # The pull request the lookup found can have merged or closed between the lookup and the
+          # push. So it is read again by number after the update. A merge of the commit this run
+          # pushed is this run's, and ends the step. Closed any other way, a new pull request is
+          # opened for drift/index. Auto-merge is turned on or off from this state.
+          if [ -n "$number" ]; then
+            gh api --method PATCH "repos/$GITHUB_REPOSITORY/pulls/$number" -f title="$title" -f body="$body" --jq .html_url
+            read_pull_request
+            if [ "$merged" = true ] && [ "$sha" = "$head" ]; then
+              echo "Pull request #$number merged $head already, so release.yml publishes $VERSION."
+              exit 0
+            fi
+            armed=$auto
+            if [ "$state" != open ]; then
+              echo "Pull request #$number closed before this push without merging it, so a new one is opened."
               number=
             fi
           fi
@@ -374,7 +390,7 @@ jobs:
           while :; do
             # gh can fail for a moment in an hour of reads. Three failed reads in a row end the
             # wait, and a good read starts the count again.
-            if ! view=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$number" --jq '"\(.state) \(.merged) \(.auto_merge != null) \(.head.sha)"'); then
+            if ! read_pull_request; then
               failed=$((failed + 1))
               if ((failed >= 3)); then
                 echo "::error::Reading pull request #$number failed 3 times in a row."
@@ -385,14 +401,6 @@ jobs:
               continue
             fi
             failed=0
-            if [[ ! $view =~ ^(open|closed)\ (true|false)\ (true|false)\ ([0-9a-f]{40})$ ]]; then
-              echo "::error::Reading pull request #$number printed '$view'."
-              exit 1
-            fi
-            state=${BASH_REMATCH[1]}
-            merged=${BASH_REMATCH[2]}
-            auto=${BASH_REMATCH[3]}
-            sha=${BASH_REMATCH[4]}
             if [ "$merged" = true ]; then
               if [ "$sha" != "$head" ]; then
                 echo "::error::Pull request #$number merged $sha, not $head, the commit this run pushed."

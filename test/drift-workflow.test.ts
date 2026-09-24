@@ -483,7 +483,10 @@ test('the version step fails, and sets nothing, when it cannot find a version np
 const HEAD_SHA = 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678';
 const OTHER_SHA = 'ffeeddccbbaa99887766554433221100ffeeddcc';
 
-/** What a poll prints for the pull request: its state, whether it merged, whether auto-merge is on, and its head. */
+/**
+ * What a read of the pull request prints, after the push or in the wait: its state, whether it
+ * merged, whether auto-merge is on, and its head.
+ */
 const poll = (state: 'open' | 'closed', merged: boolean, armed: boolean, sha = HEAD_SHA): string =>
   `${state} ${merged} ${armed} ${sha}\n`;
 
@@ -498,7 +501,7 @@ const FAIL = 'FAIL';
 type GhScenario = {
   /** What the lookup of the open pull request prints: `<number> <auto-merge on>`, or nothing. */
   open?: string;
-  /** What the read of that pull request after the push prints: `<state> <auto-merge on>`. */
+  /** What the read of that pull request after the push prints, as `poll` builds it. */
   reread?: string;
   /** The exit code of `gh pr merge --disable-auto`, and of `gh pr merge --auto`. */
   disable?: number;
@@ -511,18 +514,20 @@ type GhScenario = {
 
 /**
  * A stand-in gh for the propose step. It answers the lookup, a write, a merge, the read after the
- * push and a poll as gh would with the step's --jq filters, and fails any other call. A poll is
- * the read whose filter takes head.sha. It counts polls in RUNNER_TEMP, since each call is a
- * process of its own.
+ * push and a poll as gh would with the step's --jq filters, and fails any other call. The read
+ * after the push is the first read of a pull request after the update, and every other read is a
+ * poll. Each call is a process of its own, so it keeps both facts in RUNNER_TEMP.
  */
-const fakeGh = ({ open = '', reread = 'open false\n', disable = 0, enable = 0, polls = [MERGED] }: GhScenario = {}): string =>
+const fakeGh = ({ open = '', reread = DISARMED, disable = 0, enable = 0, polls = [MERGED] }: GhScenario = {}): string =>
   `const fs = require('node:fs');\n` +
   `const args = process.argv.slice(2);\n` +
-  `const jq = args[args.indexOf('--jq') + 1] ?? '';\n` +
+  `const patched = process.env.RUNNER_TEMP + '/patched';\n` +
   `if (args[0] === 'pr' && args[1] === 'merge') process.exitCode = args.includes('--disable-auto') ? ${disable} : ${enable};\n` +
-  `else if (args.includes('--method')) process.stdout.write(args.includes('POST') ? '12\\n' : 'https://github.com/tibia-sh/tibiawiki-data/pull/7\\n');\n` +
+  `else if (args.includes('--method') && args.includes('PATCH')) { fs.writeFileSync(patched, ''); process.stdout.write('https://github.com/tibia-sh/tibiawiki-data/pull/7\\n'); }\n` +
+  `else if (args.includes('--method')) process.stdout.write('12\\n');\n` +
   `else if (args[0] === 'api' && /\\/pulls\\?head=/.test(args[1])) process.stdout.write(${JSON.stringify(open)});\n` +
-  `else if (args[0] === 'api' && /\\/pulls\\/\\d+$/.test(args[1]) && jq.includes('head.sha')) {\n` +
+  `else if (args[0] === 'api' && /\\/pulls\\/\\d+$/.test(args[1]) && fs.existsSync(patched)) { fs.rmSync(patched); process.stdout.write(${JSON.stringify(reread)}); }\n` +
+  `else if (args[0] === 'api' && /\\/pulls\\/\\d+$/.test(args[1])) {\n` +
   `  const counter = process.env.RUNNER_TEMP + '/polls';\n` +
   `  const count = fs.existsSync(counter) ? Number(fs.readFileSync(counter, 'utf8')) : 0;\n` +
   `  fs.writeFileSync(counter, String(count + 1));\n` +
@@ -530,8 +535,7 @@ const fakeGh = ({ open = '', reread = 'open false\n', disable = 0, enable = 0, p
   `  const answer = polls[Math.min(count, polls.length - 1)];\n` +
   `  if (answer === ${JSON.stringify(FAIL)}) { process.stderr.write('gh: Server Error (HTTP 502)\\n'); process.exitCode = 1; }\n` +
   `  else process.stdout.write(answer);\n` +
-  `} else if (args[0] === 'api' && /\\/pulls\\/\\d+$/.test(args[1])) process.stdout.write(${JSON.stringify(reread)});\n` +
-  `else { process.stderr.write('the stand-in gh does not answer this call\\n'); process.exitCode = 98; }\n`;
+  `} else { process.stderr.write('the stand-in gh does not answer this call\\n'); process.exitCode = 98; }\n`;
 
 /** A stand-in git that names `head` as HEAD and does nothing else. */
 const fakeGit = (head = HEAD_SHA): string =>
@@ -562,17 +566,34 @@ const runPropose = (gh: GhScenario, env: Record<string, string> = PROPOSE_ENV) =
 const flagValues = (args: string[], flag: string): string[] =>
   args.flatMap((arg, index) => (arg === flag ? [args[index + 1]!] : []));
 
-const isPoll = (args: string[]): boolean => (args[args.indexOf('--jq') + 1] ?? '').includes('head.sha');
-
-/** What the step did, in order, one word each: lookup, disable, push, create, update, reread, enable, poll. */
-const actions = (calls: Call[]): string[] =>
-  calls.flatMap(({ command, args }) => {
-    if (command === 'git') return args.includes('push') ? ['push'] : [];
-    if (args[0] === 'pr' && args[1] === 'merge') return [args.includes('--disable-auto') ? 'disable' : 'enable'];
-    if (args.includes('--method')) return [args.includes('POST') ? 'create' : 'update'];
-    if (/\/pulls\?head=/.test(args[1] ?? '')) return ['lookup'];
-    return [isPoll(args) ? 'poll' : 'reread'];
+/**
+ * What the step did, in order, each call named in one word with its arguments: lookup, disable,
+ * push, create, update, reread, enable, poll. A read is the reread when it is the first one after
+ * the update, as the stand-in gh counts it.
+ */
+const label = (calls: Call[]): Array<{ action: string; args: string[] }> => {
+  let updated = false;
+  return calls.flatMap(({ command, args }) => {
+    const as = (action: string) => [{ action, args }];
+    if (command === 'git') return args.includes('push') ? as('push') : [];
+    if (args[0] === 'pr' && args[1] === 'merge') return as(args.includes('--disable-auto') ? 'disable' : 'enable');
+    if (args.includes('--method')) {
+      updated = args.includes('PATCH');
+      return as(updated ? 'update' : 'create');
+    }
+    if (/\/pulls\?head=/.test(args[1] ?? '')) return as('lookup');
+    if (updated) {
+      updated = false;
+      return as('reread');
+    }
+    return as('poll');
   });
+};
+
+const actions = (calls: Call[]): string[] => label(calls).map(({ action }) => action);
+
+/** The arguments of each call the step made as `action`. */
+const argsOf = (calls: Call[], action: string): string[][] => label(calls).filter((call) => call.action === action).map(({ args }) => args);
 
 const ghCalls = (calls: Call[]): string[][] => calls.filter((call) => call.command === 'gh').map((call) => call.args);
 
@@ -617,7 +638,7 @@ test('the pr job turns on auto-merge with a rebase on the pull request it opened
   assert.deepEqual(actions(run.calls), ['lookup', 'push', 'create', 'enable', 'poll', 'poll', 'poll']);
   const gh = ghCalls(run.calls);
   assert.deepEqual(gh.find((args) => args[0] === 'pr'), ['pr', 'merge', '12', '--auto', '--rebase']);
-  for (const args of gh.filter(isPoll)) {
+  for (const args of argsOf(run.calls, 'poll')) {
     assert.deepEqual(args.slice(0, 2), ['api', 'repos/tibia-sh/tibiawiki-data/pulls/12']);
   }
   assert.match(run.log, new RegExp(`#12 merged ${HEAD_SHA}`), 'the step does not say the pull request merged its commit');
@@ -639,28 +660,42 @@ test('the pr job updates the open drift pull request instead of opening another,
   assert.ok(fields.includes('title=chore: release a refreshed index as 3.0.1'), `unexpected title in ${fields.join(' | ')}`);
   const body = fields.find((field) => field.startsWith('body='));
   assert.ok(body?.includes(DIGEST_A) && body.includes(DIGEST_B), 'the updated body does not carry both digests');
-  const reread = gh.find((args) => !isPoll(args) && /\/pulls\/\d+$/.test(args[1] ?? '') && !args.includes('--method'));
+  const reread = argsOf(run.calls, 'reread')[0];
   assert.equal(reread?.[1], 'repos/tibia-sh/tibiawiki-data/pulls/7', 'the pull request is not read again by its number');
   assert.deepEqual(gh.find((args) => args[0] === 'pr'), ['pr', 'merge', '7', '--auto', '--rebase']);
 });
 
 test('the pr job decides auto-merge from the pull request as it is after the push', () => {
-  const armed = runPropose({ open: '7 true\n', reread: 'open true\n', polls: [OPEN, MERGED] });
+  const armed = runPropose({ open: '7 true\n', reread: OPEN, polls: [OPEN, MERGED] });
   assert.equal(armed.status, 0, armed.log);
   assert.deepEqual(actions(armed.calls), ['lookup', 'push', 'update', 'reread', 'poll', 'poll'], 'auto-merge was turned on again');
-  const cleared = runPropose({ open: '7 true\n', reread: 'open false\n' });
+  const cleared = runPropose({ open: '7 true\n', reread: DISARMED });
   assert.equal(cleared.status, 0, cleared.log);
   assert.deepEqual(actions(cleared.calls), ['lookup', 'push', 'update', 'reread', 'enable', 'poll'], 'auto-merge found off after the push stayed off');
 });
 
 test('a pull request that merged between the lookup and the push is replaced by a new one, which the job waits on', () => {
   // Waiting on the old number would take its earlier merge for this run's.
-  const run = runPropose({ open: '7 true\n', reread: 'closed true\n', polls: [OPEN, MERGED] });
+  const run = runPropose({ open: '7 true\n', reread: poll('closed', true, false, OTHER_SHA), polls: [OPEN, MERGED] });
   assert.equal(run.status, 0, run.log);
   assert.deepEqual(actions(run.calls), ['lookup', 'push', 'update', 'reread', 'create', 'enable', 'poll', 'poll']);
   const gh = ghCalls(run.calls);
   assert.deepEqual(gh.find((args) => args[0] === 'pr'), ['pr', 'merge', '12', '--auto', '--rebase']);
-  for (const args of gh.filter(isPoll)) assert.equal(args[1], 'repos/tibia-sh/tibiawiki-data/pulls/12', 'the wait reads the old pull request');
+  for (const args of argsOf(run.calls, 'poll')) assert.equal(args[1], 'repos/tibia-sh/tibiawiki-data/pulls/12', 'the wait reads the old pull request');
+});
+
+test('a pull request that merged the pushed commit before the read after the push ends the step green', () => {
+  // That merge is this run's, so no pull request is opened in its place.
+  for (const env of [PROPOSE_ENV, HELD_ENV]) {
+    const run = runPropose({ open: '7 true\n', reread: MERGED }, env);
+    assert.equal(run.status, 0, run.log);
+    assert.deepEqual(actions(run.calls), ['lookup', ...(env === HELD_ENV ? ['disable'] : []), 'push', 'update', 'reread']);
+    assert.match(run.log, new RegExp(`#7 merged ${HEAD_SHA}`), 'the step does not say the pull request merged its commit');
+  }
+  // Closed without merging is not this run's, and a new one is opened.
+  const closed = runPropose({ open: '7 false\n', reread: CLOSED });
+  assert.equal(closed.status, 0, closed.log);
+  assert.deepEqual(actions(closed.calls), ['lookup', 'push', 'update', 'reread', 'create', 'enable', 'poll']);
 });
 
 test('the pr job fails when the pull request is closed unmerged, or still open at the deadline', () => {
@@ -724,7 +759,7 @@ test('a held refresh turns off auto-merge before it pushes, and opens or updates
 });
 
 test('a held refresh turns off auto-merge that is on again after the push', () => {
-  const run = runPropose({ open: '7 false\n', reread: 'open true\n' }, HELD_ENV);
+  const run = runPropose({ open: '7 false\n', reread: OPEN }, HELD_ENV);
   assert.equal(run.status, 0, run.log);
   assert.deepEqual(actions(run.calls), ['lookup', 'push', 'update', 'reread', 'disable']);
 });
@@ -738,7 +773,7 @@ test('a held refresh without auto-merge on turns it neither off nor on', () => {
   assert.deepEqual(actions(created.calls), ['lookup', 'push', 'create']);
   const body = flagValues(ghCalls(created.calls).find((args) => args.includes('--method'))!, '-f').find((field) => field.startsWith('body='));
   assert.ok(body?.startsWith('body=**Held for review.**'), 'the new held pull request does not say it is held');
-  const replaced = runPropose({ open: '7 false\n', reread: 'closed true\n' }, HELD_ENV);
+  const replaced = runPropose({ open: '7 false\n', reread: poll('closed', true, false, OTHER_SHA) }, HELD_ENV);
   assert.equal(replaced.status, 0, replaced.log);
   assert.deepEqual(actions(replaced.calls), ['lookup', 'push', 'update', 'reread', 'create']);
 });
@@ -756,7 +791,7 @@ test('the pr job goes no further when the lookup or the read after the push answ
     assert.notEqual(run.status, 0, `the step passed when the lookup printed ${JSON.stringify(open)}\n${run.log}`);
     assert.deepEqual(actions(run.calls), ['lookup'], `the step went on after the lookup printed ${JSON.stringify(open)}`);
   }
-  for (const reread of ['', 'open\n', 'merged true\n', 'open yes\n']) {
+  for (const reread of ['', 'open false\n', `merged true false ${HEAD_SHA}\n`, `open yes false ${HEAD_SHA}\n`]) {
     const run = runPropose({ open: '7 false\n', reread });
     assert.notEqual(run.status, 0, `the step passed when the read after the push printed ${JSON.stringify(reread)}\n${run.log}`);
     assert.deepEqual(actions(run.calls), ['lookup', 'push', 'update', 'reread'], `the step went on after the read printed ${JSON.stringify(reread)}`);
