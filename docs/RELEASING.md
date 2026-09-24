@@ -177,14 +177,12 @@ it cannot change a workflow file. The maintainer accepted that trade-off, as for
 repository's release trigger token.
 
 If this token leaks, revoke it first, on github.com under Settings, Developer settings, Personal
-access tokens, Fine-grained tokens. Right after that, turn off auto-merge on the open drift pull
-request, or close it, and run `gh workflow disable drift.yml --repo tibia-sh/tibiawiki-data`. A
-pull request with auto-merge on can still merge after the token is revoked, and its merge
-publishes. Leave `drift.yml` disabled until a new token is stored. Then check what `main` and npm
-hold:
+access tokens, Fine-grained tokens. Then:
 
-1. Turn off auto-merge on every open pull request, or close it, your own included. One with
-   auto-merge on merges without the token once its checks pass, and its merge publishes.
+1. Close every open drift pull request, and turn off auto-merge on every other open pull request,
+   your own included. Run `gh workflow disable drift.yml --repo tibia-sh/tibiawiki-data`, and leave
+   it disabled until a new token is stored. A pull request with auto-merge on still merges after the
+   token is revoked, once its checks pass, and its merge publishes.
 2. Read `git log` on `main` for commits you did not land yourself.
 3. Run `npm view @tibia.sh/tibiawiki-data time` for versions published since the leak.
 4. In a pull request, revert anything you did not land, and set `version` to the next patch npm
@@ -215,13 +213,13 @@ refresh when the wiki changed.
 A run of `drift.yml` on `main` whose `build` or `pr` job fails, times out or is cancelled, or that
 holds a refresh, comments on one issue, titled
 `The drift job needs a look`, opened by `github-actions[bot]` and assigned to `drptbl`. An assignee
-is notified of every comment whatever their watch settings. When no such issue is open, the run
-opens it. Each comment links the run and says what happened:
+is subscribed to the issue. When no such issue is open, the run opens it. A run assigns `drptbl`
+only when it opens the issue, so a comment on an issue someone unassigned stays unassigned. Each comment links the run and says what happened:
 
 | The comment says | What to do |
 |---|---|
 | `The build job did not succeed.` and its result | `cancelled` means the job hit its 60 minute bound, most often a slow wiki, or someone cancelled the run. Run drift again. For `failure`, open the run and read the red step. A tripped gate in `pnpm build-index`, a failing `pnpm test`, a wiki the build could not read, or `The guard could not compare the indexes.` each end it there, before anything is pushed. Fix the cause, or run drift again once the wiki is back. |
-| `The pr job did not succeed.` and its result | `cancelled` means the job hit its 75 minute bound or someone cancelled the run. Auto-merge stays on, so check the drift pull request. For `failure`, open the run and read the red step. `npm does not list X.Y.Z from package.json yet` means the release of the version on `main` is still running or failed, so follow [When a release run fails](#when-a-release-run-fails) and run drift again once npm has it. `was closed without merging` means someone closed the pull request. `merged <commit>, not <commit>` means the pull request merged a commit other than the one this run pushed, so read `git log` on `main` for what landed. `found off a second time` means something keeps turning auto-merge off. `failed 3 times in a row` means `gh` could not read the pull request, so check it by hand. `has not merged 3600 seconds after auto-merge was on` means its checks failed or are still running: auto-merge stays on, so it merges by itself once they pass, for example after you re-run a check that failed for a reason outside the repository. `Bad credentials` from `gh` means the token expired or was revoked, so rotate it as [The drift token](#the-drift-token) describes. |
+| `The pr job did not succeed.` and its result | `cancelled` means the job hit its 75 minute bound or someone cancelled the run. Auto-merge stays on, so check the drift pull request. For `failure`, open the run and read the red step. `npm does not list X.Y.Z from package.json yet` means the release of the version on `main` is still running or failed, so follow [When a release run fails](#when-a-release-run-fails) and run drift again once npm has it. `was closed without merging` means someone closed the pull request. `merged <commit>, not <commit>` means the pull request merged a commit other than the one this run pushed, so read `git log` on `main` for what landed. `found off a second time` means something keeps turning auto-merge off. `failed 3 times in a row` means `gh` could not read the pull request, so check it by hand. `has not merged 3600 seconds after auto-merge was on` means its checks failed or are still running: auto-merge stays on, so it merges by itself once they pass, for example after you re-run a check that failed for a reason outside the repository. `Bad credentials` from `gh` means the token was revoked, so rotate it as [The drift token](#the-drift-token) describes. |
 | `The refresh was held for review:` and its reasons | Follow the steps below. |
 
 A held refresh has its reasons twice: in the comment, and at the top of the pull request's body,
@@ -294,10 +292,15 @@ pipeline. It is this package, because no published server installs `N.0.0`. Serv
 
 Do not merge a data refresh here between steps 2 and 4. `main` is still on N-1 then, and
 npm refuses to publish a version below `N.0.0` without a dist-tag, so its release run
-fails. The drift job merges a refresh by itself, so before step 2 run
-`gh workflow disable drift.yml --repo tibia-sh/tibiawiki-data` and turn off auto-merge on an
-open drift pull request, or close it. Once step 4 has merged, run
-`gh workflow enable drift.yml --repo tibia-sh/tibiawiki-data`.
+fails. The drift job merges a refresh by itself, and a drift run waiting for its merge turns
+auto-merge back on within 30 seconds, so turning auto-merge off is not enough. Before step 2:
+
+- Run `gh workflow disable drift.yml --repo tibia-sh/tibiawiki-data`.
+- Cancel any drift run in progress. `gh run list --workflow drift.yml --repo tibia-sh/tibiawiki-data`
+  lists them, and `gh run cancel <id> --repo tibia-sh/tibiawiki-data` cancels one.
+- Close the open drift pull request. A run that is still waiting then ends red.
+
+Once step 4 has merged, run `gh workflow enable drift.yml --repo tibia-sh/tibiawiki-data`.
 
 Both repositories set `trustPolicy: no-downgrade`, which makes pnpm refuse a version with
 weaker trust evidence than any version published before it. The release workflow publishes

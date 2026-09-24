@@ -57,9 +57,9 @@ complaint.
 A release is a snapshot of a wiki that keeps changing. It can be identified, but not
 reproduced byte for byte. Three values identify it:
 
-- the package version;
+- The package version.
 - `version` in the index's `database_info` table, which is the tibiawiki-sql
-  generator version;
+  generator version.
 - `generate_time` in the same table, which records when the index was generated.
   It is a timestamp, not a wiki revision. The generator records no revision.
 
