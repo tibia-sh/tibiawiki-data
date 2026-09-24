@@ -150,23 +150,32 @@ The `pr` job then sets `version` to the next patch npm does not have, pushes the
 already open. It pushes and opens with `DRIFT_TOKEN`, so the pull request's CI starts by
 itself. [The drift token](RELEASING.md#the-drift-token) says what that token can do.
 
+After the push and the update, the job reads the pull request again. When it merged or closed
+between the lookup and the push, the job opens a new one for `drift/index` and goes on with
+that. Auto-merge is turned on or off from what this read shows.
+
 - **Not held.** The job turns on auto-merge with rebase and waits up to 60 minutes for the
   merge, checking every 30 seconds. Auto-merge merges the pull request once `test` and
   `oldest-consumer`, which the ruleset requires, pass, and the merge publishes the new patch
-  through `release.yml`. The job
-  ends red when the pull request is closed without merging, or is still open at the deadline.
+  through `release.yml`. Only a merge of the commit this run pushed counts. When the job finds
+  auto-merge off during the wait, it turns it on again once. A read of the pull request that
+  fails is tried again 10 seconds later. The job ends red when the pull request is closed
+  without merging, merges another commit, is still open at the deadline, has auto-merge off a
+  second time, or cannot be read 3 times in a row.
 - **Held.** The job turns auto-merge off first when the open pull request has it, then pushes
-  and opens or updates the pull request. Its body starts with **Held for review.** and lists
-  the reasons. The run ends green and the pull request waits for you.
+  and opens or updates the pull request, and turns auto-merge off again when the read after the
+  push finds it on. Its body starts with **Held for review.** and lists the reasons. The run
+  ends green and the pull request waits for you.
 
-A run on `main` that fails, or holds a refresh, comments on the issue
+A run on `main` whose `build` or `pr` job fails, times out or is cancelled, or that holds a
+refresh, comments on the issue
 `The drift job needs a look`, or opens it assigned to `drptbl`.
 [When the drift job needs a look](RELEASING.md#when-the-drift-job-needs-a-look) says what to do.
 
 - A tripped gate, a failing test, a guard that cannot read an index, an unreadable registry, or
   a `version` on `main` that npm does not list yet each end the run red before anything is
-  pushed. A pull request closed without merging, or not merged within 60 minutes, ends it red
-  after the push.
+  pushed. A pull request closed without merging, merged at another commit, or not merged within
+  60 minutes ends it red after the push.
 - Each run that finds a change replaces `drift/index`, so an open pull request always carries
   the newest rebuild. A held pull request you leave open is not frozen: when a later run's
   guard finds no reason to hold, that run turns auto-merge on and it merges by itself.
