@@ -40,8 +40,11 @@ import { DatabaseSync } from 'node:sqlite';
 const PACKAGE = '@tibia.sh/tibiawiki-data';
 const WIKI = 'https://tibia.fandom.com';
 
-/** The tables every release page lists, in this order, whether or not their count moved. */
-const FIXED_TABLES: readonly string[] = ['item', 'creature', 'npc', 'book', 'house', 'achievement', 'quest', 'spell'];
+/**
+ * The tables every release page lists, in this order, whether or not their count moved. They are
+ * the main tables scripts/drift-guard.ts holds a refresh on, in the same order.
+ */
+export const FIXED_TABLES: readonly string[] = ['item', 'creature', 'npc', 'book', 'house', 'achievement', 'quest', 'spell'];
 
 /** A number in a version: 0, or digits without a leading zero. */
 const NUMBER = '(0|[1-9]\\d*)';
