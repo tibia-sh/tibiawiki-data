@@ -170,8 +170,8 @@ importers:
         specifier: 2.0.0
         version: 2.0.0
       '@tibia.sh/tibiawiki-mcp':
-        specifier: ^0.3.0
-        version: 0.3.1
+        specifier: 0.10.0
+        version: 0.10.0(hono@4.13.8)
       '@types/node':
         specifier: 24.13.3
         version: 24.13.3
@@ -181,6 +181,12 @@ importers:
 
 packages:
 
+  '@hono/node-server@1.19.17':
+    resolution: {integrity: sha512-dSneS5qhiauZWGDCeK4o695Xd9nUNjviSZCMQrj10eetr8Uln1ucn6bbphOM6UynAMMtNIzZNSpL9vnASJwrPQ==}
+    engines: {node: '>=18.14.1'}
+    peerDependencies:
+      hono: ^4
+
   '@modelcontextprotocol/client@2.0.0':
     resolution: {integrity: sha512-8f1OghQ2rjzIOfqgUCP+8GiUWqRs89njoWLNqAe8kWmDePv3s1fZXseej+QXemssEuuOvLLmLO/kqM3IQHtISw==}
     engines: {node: '>=20'}
@@ -189,6 +195,16 @@ packages:
     resolution: {integrity: sha512-pJCEwGG7Lfr/+PQp9ZTwKXNeO5wzbfKL7H3MYpCorM4oFBoQrdjnBgEoqG+RjhsvS1FKrDbKux+M1HhlnGWqcA==}
     engines: {node: '>=20'}
 
+  '@modelcontextprotocol/node@2.0.0':
+    resolution: {integrity: sha512-Y4hAC2XdGDUdDOCbLDOCA4+aL3NUldjsOWlDL/YwpAxrPhRm1xHd7lZ+mLacvZ9t3PaH28wgNoaLQGrIk1P2pg==}
+    engines: {node: '>=20'}
+    peerDependencies:
+      '@modelcontextprotocol/server': ^2.0.0
+      hono: ^4.11.4
+    peerDependenciesMeta:
+      hono:
+        optional: true
+
   '@modelcontextprotocol/server@2.0.0':
     resolution: {integrity: sha512-YhHWdHfpFMQfd0prsEnxKeS3Qz3ytIGmsS0sth4KDjnacIT7hxk6hXHkJ9KysxlkvTM+WZAtQbbcUhdoP4Hvtw==}
     engines: {node: '>=20'}
@@ -196,8 +212,8 @@ packages:
   '@tibia.sh/tibiawiki-data@3.0.1':
     resolution: {integrity: sha512-qXRnX9tr7iHeHiP19/6cDQ060yJmaT0uXoSIaSzUIPFNj/6YUbw5UMxdBuChkhuUaoePT1B09RjfXpHIlhjxBw==}
 
-  '@tibia.sh/tibiawiki-mcp@0.3.1':
-    resolution: {integrity: sha512-AZwFqwGGyFQdbO4p0tnTjruLLJTypHPsBA+MwM1aXTHeMxP1gK1sDvr07+iEMrHL+7VwO73hHmkotJEYCasOXA==}
+  '@tibia.sh/tibiawiki-mcp@0.10.0':
+    resolution: {integrity: sha512-VHXbLHTLzihx6B8amXAoXCLWcSwi/h4jeRCJVg0RJ6fV4tQ8rVDjgGq7lDddDzBDzCog6vYaxNobc+1Hm6vN5w==}
     engines: {node: '>=22.13.0'}
     hasBin: true
 
@@ -336,6 +352,10 @@ packages:
     resolution: {integrity: sha512-CRT1WTyuQoD771GW56XEZFQ/ZoSfWid1alKGDYMmkt2yl8UXrVR4pspqWNEcqKvVIzg6PAltWjxcSSPrboA4iA==}
     engines: {node: '>=18.0.0'}
 
+  hono@4.13.8:
+    resolution: {integrity: sha512-/Gng7NfoykZl2pjukW5Z6+8Yxm3BPRf86GTbQnt0SbySkvax4fyL4H3HhY1cCpBGmiW9XDRFzRV+CXK2W8QudQ==}
+    engines: {node: '>=16.9.0'}
+
   isexe@2.0.0:
     resolution: {integrity: sha512-RHxMLp9lnKHGHRng9QFhRCMbYAcVpn69smSGcq3f36xjgVVWThj4qqLbTLlq7Ssj8B+fIQ1EuCEGI2lKsyQeIw==}
 
@@ -376,6 +396,10 @@ packages:
 
 snapshots:
 
+  '@hono/node-server@1.19.17(hono@4.13.8)':
+    dependencies:
+      hono: 4.13.8
+
   '@modelcontextprotocol/client@2.0.0':
     dependencies:
       '@modelcontextprotocol/core': 2.0.0
@@ -390,6 +414,13 @@ snapshots:
     dependencies:
       zod: 4.5.4
 
+  '@modelcontextprotocol/node@2.0.0(@modelcontextprotocol/server@2.0.0)(hono@4.13.8)':
+    dependencies:
+      '@hono/node-server': 1.19.17(hono@4.13.8)
+      '@modelcontextprotocol/server': 2.0.0
+    optionalDependencies:
+      hono: 4.13.8
+
   '@modelcontextprotocol/server@2.0.0':
     dependencies:
       '@modelcontextprotocol/core': 2.0.0
@@ -397,11 +428,14 @@ snapshots:
 
   '@tibia.sh/tibiawiki-data@3.0.1': {}
 
-  '@tibia.sh/tibiawiki-mcp@0.3.1':
+  '@tibia.sh/tibiawiki-mcp@0.10.0(hono@4.13.8)':
     dependencies:
+      '@modelcontextprotocol/node': 2.0.0(@modelcontextprotocol/server@2.0.0)(hono@4.13.8)
       '@modelcontextprotocol/server': 2.0.0
       '@tibia.sh/tibiawiki-data': 3.0.1
       zod: 4.5.4
+    transitivePeerDependencies:
+      - hono
 
   '@types/node@24.13.3':
     dependencies:
@@ -478,6 +512,8 @@ snapshots:
   eventsource@3.0.7:
     dependencies:
       eventsource-parser: 3.1.1
+
+  hono@4.13.8: {}
 
   isexe@2.0.0: {}
 

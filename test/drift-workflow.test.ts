@@ -237,6 +237,17 @@ test('the build job digests the committed index before build-index overwrites it
   assert.match(list[committed]!, /tibiawiki-mcp index-digest index\.db/, 'the committed step does not digest index.db');
 });
 
+test('the digest comes from an exactly pinned server, so a newer one is a reviewed change', () => {
+  // index-digest covers the columns the pinned server's tools read. `^0.3.0` could never reach
+  // 0.4, and nothing moved it, so the drift job stayed on 0.3.1 while the server went to
+  // 0.10.0 and read ten more columns. An exact pin says which server the digest is, and moves
+  // only by a commit that docs/MAINTAINING.md asks for whenever REQUIRED_COLUMNS grows.
+  const manifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as
+    { devDependencies?: Record<string, string> };
+  const pin = manifest.devDependencies?.['@tibia.sh/tibiawiki-mcp'];
+  assert.match(pin ?? '', /^\d+\.\d+\.\d+$/, `@tibia.sh/tibiawiki-mcp is pinned as ${JSON.stringify(pin)}, not an exact version`);
+});
+
 test('the build job tests the rebuilt index, and uploads it only after that and only when it changed', () => {
   const list = steps(buildJob());
   const build = list.findIndex((step) => /\bpnpm build-index\b/.test(step));
