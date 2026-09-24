@@ -1,13 +1,17 @@
 name: drift
 
 # Rebuilds index.db from the live wiki and compares its content with the committed index.
-# When the content changed, it opens one pull request with the rebuilt index and the next
-# patch version. Merging that pull request is what publishes, through release.yml, so
-# nothing here merges or publishes.
+# When the content changed, it pushes drift/index with the rebuilt index and the next patch
+# version, opens or updates its pull request, turns on auto-merge and waits for the merge.
+# The ruleset merges it once test and oldest-consumer pass, and that merge publishes through
+# release.yml. Nothing here publishes by itself. A refresh that loses rows, as
+# scripts/drift-guard.ts decides, is held instead: its pull request stays open with auto-merge
+# off until a person merges or closes it. A run on main that fails or holds a refresh comments
+# on one issue, assigned to the maintainer.
 
 on:
   schedule:
-    - cron: '17 6 * * 1' # Mondays at 06:17 UTC
+    - cron: '17 6 * * 2,5' # Tuesdays and Fridays at 06:17 UTC
   workflow_dispatch:
 
 # Each job asks for what it needs, and a job that asks for nothing gets nothing.
@@ -33,6 +37,10 @@ jobs:
       rebuilt: ${{ steps.digests.outputs.rebuilt }}
       sha256: ${{ steps.digests.outputs.sha256 }}
       changed: ${{ steps.digests.outputs.changed }}
+      # The guard runs only when the content changed. A skipped step's output is empty, so hold
+      # falls back to false and the alert job never reads an empty value.
+      hold: ${{ steps.guard.outputs.hold || 'false' }}
+      reasons: ${{ steps.guard.outputs.reasons }}
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
@@ -69,6 +77,10 @@ jobs:
             exit 1
           fi
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      # The guard compares the rebuilt index's row counts with these.
+      - name: Keep the committed index for the guard
+        run: |
+          cp index.db "$RUNNER_TEMP/committed.db"
       # A tripped gate fails the run here, and leaves index.db as it was. scripts/build.ts
       # gives the generator its PyPI cooldown, so this step sets none.
       - run: pnpm build-index
@@ -105,6 +117,35 @@ jobs:
           } >> "$GITHUB_OUTPUT"
       # The suite, against the rebuilt index, before anything leaves this job.
       - run: pnpm test
+      # Whether the refresh may merge by itself. Each line the guard prints is a reason to hold it
+      # for a person, and none means go.
+      - name: Guard the refresh
+        id: guard
+        if: ${{ steps.digests.outputs.changed == 'true' }}
+        run: |
+          # The guard prints nothing and exits 1 when it cannot read an index, so its exit status
+          # is checked here, by name. An empty stdout from a failed run must never read as go.
+          if ! reasons=$(node scripts/drift-guard.ts "$RUNNER_TEMP/committed.db" index.db); then
+            echo "The guard could not compare the indexes." >&2
+            exit 1
+          fi
+          if [ -n "$reasons" ]; then
+            hold=true
+            echo "The guard holds the refresh for review:"
+            printf '%s\n' "$reasons"
+          else
+            hold=false
+            echo "The guard found no rows lost, so the refresh can merge by itself."
+          fi
+          # The reasons span lines, so they go out as a heredoc. Its delimiter is random, so no
+          # line of the value can end it early.
+          delimiter="REASONS_$(node -e 'process.stdout.write(require("node:crypto").randomBytes(16).toString("hex"))')"
+          {
+            echo "hold=$hold"
+            echo "reasons<<$delimiter"
+            if [ -n "$reasons" ]; then printf '%s\n' "$reasons"; fi
+            echo "$delimiter"
+          } >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ steps.digests.outputs.changed == 'true' }}
         with:
@@ -116,15 +157,19 @@ jobs:
 
   pr:
     needs: build
-    # A dispatch from another branch builds and tests, and opens nothing.
+    # A dispatch from another branch builds, tests and guards, and opens, merges and alerts nothing.
     if: ${{ github.ref == 'refs/heads/main' && needs.build.outputs.changed == 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    # The only job that can write. It runs no pnpm script and nothing from the artifact, only
-    # git, gh, npm view and node one-liners.
+    # 60 minutes of it are the wait for the merge, since oldest-consumer takes up to 45.
+    timeout-minutes: 75
+    # The one job that writes the repository, and only through DRIFT_TOKEN, a fine-grained token
+    # with Contents and Pull requests on this repository alone. The drift environment gives it to
+    # runs on main only. A push, a pull request or a merge made with github.token starts no
+    # workflow, so the pull request's CI and release.yml would never run. The job runs no pnpm
+    # script and nothing from the artifact, only git, gh, npm view and node one-liners.
+    environment: drift
     permissions:
-      contents: write        # push drift/index
-      pull-requests: write   # open or update its pull request
+      contents: read         # the checkout. The token does every write.
     steps:
       # No ref: the commit that triggered the run, which is the one the build job rebuilt.
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
@@ -188,13 +233,16 @@ jobs:
             console.log(manifest.version);
           ' "$versions")
           echo "version=$version" >> "$GITHUB_OUTPUT"
-      - name: Push drift/index and open or update its pull request
+      # The only step that gets the token.
+      - name: Push drift/index, open or update its pull request, and get it merged
         id: propose
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.DRIFT_TOKEN }}
           VERSION: ${{ steps.version.outputs.version }}
           COMMITTED: ${{ needs.build.outputs.committed }}
           REBUILT: ${{ needs.build.outputs.rebuilt }}
+          HOLD: ${{ needs.build.outputs.hold }}
+          REASONS: ${{ needs.build.outputs.reasons }}
           GIT_AUTHOR_NAME: github-actions[bot]
           GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
           GIT_COMMITTER_NAME: github-actions[bot]
@@ -210,11 +258,56 @@ jobs:
             echo "Not a version: '$VERSION'" >&2
             exit 1
           fi
+          # A misspelt output would arrive empty. Only an exact false lets the refresh merge.
+          if [ "$HOLD" != true ] && [ "$HOLD" != false ]; then
+            echo "Hold is neither true nor false: '$HOLD'" >&2
+            exit 1
+          fi
+          if [ "$HOLD" = true ] && [ -z "$REASONS" ]; then
+            echo "The refresh is held, but no reason came with it." >&2
+            exit 1
+          fi
+          # How often and how long the wait for the merge polls, from the environment so the
+          # tests can shorten them.
+          poll=${POLL_SECONDS:-30}
+          limit=${MERGE_DEADLINE_SECONDS:-3600}
+          for value in "$poll" "$limit"; do
+            if [[ ! $value =~ ^[0-9]+$ ]]; then
+              echo "Not a whole number of seconds: '$value'" >&2
+              exit 1
+            fi
+          done
+
+          # The open pull request from drift/index, if there is one, and whether it has auto-merge
+          # on, before anything is pushed.
+          found=$(gh api "repos/$GITHUB_REPOSITORY/pulls?head=$GITHUB_REPOSITORY_OWNER:drift/index&base=main&state=open" \
+            --jq '.[0] // empty | "\(.number) \(.auto_merge != null)"')
+          number=
+          armed=false
+          if [ -n "$found" ]; then
+            if [[ ! $found =~ ^([0-9]+)\ (true|false)$ ]]; then
+              echo "The lookup of the open pull request printed '$found'." >&2
+              exit 1
+            fi
+            number=${BASH_REMATCH[1]}
+            armed=${BASH_REMATCH[2]}
+          fi
+          # A held refresh turns auto-merge off first, so a failure after this can never leave it
+          # armed to merge. gh exits non-zero when it cannot, which ends the step before the push.
+          if [ "$HOLD" = true ] && [ "$armed" = true ]; then
+            gh pr merge "$number" --disable-auto
+          fi
+
           title="chore: release a refreshed index as $VERSION"
           digests=$(printf 'Committed index digest: %s\nRebuilt index digest: %s' "$COMMITTED" "$REBUILT")
           # shellcheck disable=SC2016 # the backticks are Markdown, not command substitution
           body=$(printf 'The drift job rebuilt `index.db`, and its content changed. Merging this pull request publishes `%s`.\n\n- committed index digest: `%s`\n- rebuilt index digest: `%s`\n\nRun: %s/%s/actions/runs/%s\n' \
             "$VERSION" "$COMMITTED" "$REBUILT" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")
+          if [ "$HOLD" = true ]; then
+            held=$(printf '**Held for review.** The refresh was not merged, because:\n\n'
+              while IFS= read -r reason; do printf -- '- %s\n' "$reason"; done <<< "$REASONS")
+            body=$(printf '%s\n\n%s' "$held" "$body")
+          fi
 
           git add index.db package.json
           git commit --quiet -m "$title" -m "$digests"
@@ -226,9 +319,111 @@ jobs:
             -c 'credential.helper=!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f' \
             push --force origin HEAD:refs/heads/drift/index
 
-          number=$(gh api "repos/$GITHUB_REPOSITORY/pulls?head=$GITHUB_REPOSITORY_OWNER:drift/index&base=main&state=open" --jq '.[0].number // empty')
           if [ -n "$number" ]; then
             gh api --method PATCH "repos/$GITHUB_REPOSITORY/pulls/$number" -f title="$title" -f body="$body" --jq .html_url
           else
-            gh api --method POST "repos/$GITHUB_REPOSITORY/pulls" -f head=drift/index -f base=main -f title="$title" -f body="$body" --jq .html_url
+            number=$(gh api --method POST "repos/$GITHUB_REPOSITORY/pulls" -f head=drift/index -f base=main -f title="$title" -f body="$body" --jq .number)
+            if [[ ! $number =~ ^[0-9]+$ ]]; then
+              echo "Opening the pull request printed '$number', not its number." >&2
+              exit 1
+            fi
+            echo "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/pull/$number"
+          fi
+
+          if [ "$HOLD" = true ]; then
+            echo "The refresh is held for review, so pull request #$number is left for a person to merge or close."
+            exit 0
+          fi
+          # A rebase merge, which the ruleset gates on test and oldest-consumer. It merges at once
+          # when those have already passed.
+          if [ "$armed" != true ]; then
+            gh pr merge "$number" --auto --rebase
+          fi
+          # A red check leaves the pull request open, and the run red, rather than a green run
+          # beside a pull request nobody sees.
+          echo "Waiting up to $limit seconds for pull request #$number to merge."
+          deadline=$((SECONDS + limit))
+          while :; do
+            state=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$number" --jq '.state, .merged')
+            case $state in
+              $'closed\ntrue')
+                echo "Pull request #$number merged, so release.yml publishes $VERSION."
+                exit 0
+                ;;
+              $'closed\nfalse')
+                echo "::error::Pull request #$number was closed without merging."
+                exit 1
+                ;;
+              $'open\nfalse') ;;
+              *)
+                echo "::error::Reading pull request #$number printed '$state'."
+                exit 1
+                ;;
+            esac
+            if ((SECONDS + poll >= deadline)); then
+              echo "::error::Pull request #$number has not merged $limit seconds after auto-merge was on. Its checks may have failed."
+              exit 1
+            fi
+            sleep "$poll"
+          done
+
+  alert:
+    needs: [build, pr]
+    # On main only, so a dispatch from another branch alerts nothing. always() lets it run after a
+    # job that failed.
+    if: ${{ always() && github.ref == 'refs/heads/main' && (needs.build.result == 'failure' || needs.pr.result == 'failure' || needs.build.outputs.hold == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Comments on one issue with github.token. It checks nothing out and runs no action.
+    permissions:
+      issues: write
+    steps:
+      - name: Comment on the alert issue, or open it
+        id: alert
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          PR_RESULT: ${{ needs.pr.result }}
+          HOLD: ${{ needs.build.outputs.hold }}
+          REASONS: ${{ needs.build.outputs.reasons }}
+        run: |
+          title='The drift job needs a look'
+          text="Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          said=false
+          if [ "$BUILD_RESULT" = failure ]; then
+            text=$(printf '%s\n\nThe build job failed.' "$text")
+            said=true
+          fi
+          if [ "$PR_RESULT" = failure ]; then
+            text=$(printf '%s\n\nThe pr job failed.' "$text")
+            said=true
+          fi
+          if [ "$HOLD" = true ]; then
+            list=$(while IFS= read -r reason; do printf -- '- %s\n' "$reason"; done <<< "$REASONS")
+            text=$(printf '%s\n\nThe refresh was held for review:\n\n%s' "$text" "$list")
+            said=true
+          fi
+          if [ "$said" != true ]; then
+            echo "::error::The alert job ran, but no job failed and nothing was held."
+            exit 1
+          fi
+
+          # The list, not the search API, which lags. A pull request is an issue to this endpoint,
+          # and anyone can open an issue with this title, so only one github-actions[bot] opened
+          # counts. A failed list ends the step here, so it never opens a second issue. The pages go
+          # to a file, since a page of issue bodies can be longer than one argument may be.
+          issues="$RUNNER_TEMP/issues.json"
+          gh api "repos/$GITHUB_REPOSITORY/issues?state=open&per_page=100" --paginate --slurp > "$issues"
+          number=$(node -e '
+            const [file, title] = process.argv.slice(1);
+            const found = JSON.parse(require("node:fs").readFileSync(file, "utf8")).flat().find((issue) =>
+              issue.title === title && issue.user?.login === "github-actions[bot]" && issue.pull_request === undefined);
+            if (found) process.stdout.write(String(found.number));
+          ' "$issues" "$title")
+          if [ -n "$number" ]; then
+            gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$number/comments" -f body="$text" --jq .html_url
+          else
+            intro='The drift workflow comments here when a run on main fails or holds a refresh for review. Close this issue once each comment is dealt with, and the next alert opens a new one.'
+            gh api --method POST "repos/$GITHUB_REPOSITORY/issues" -f title="$title" -f 'assignees[]=drptbl' \
+              -f body="$(printf '%s\n\n%s' "$intro" "$text")" --jq .html_url
           fi

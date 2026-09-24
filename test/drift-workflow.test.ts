@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { code, keys, read, runScripts, runStep, scalar, stepIf, stepIndex, stepInputs, stepName, steps, stepScript, under } from './workflow.ts';
+import { type Call, code, keys, read, runScripts, runStep, scalar, stepBody, stepIf, stepIndex, stepInputs, stepName, steps, stepScript, under } from './workflow.ts';
 
 /**
  * The drift workflow cannot run inside the suite, and its mistakes are quiet. A detector
@@ -14,6 +14,8 @@ const workflow = (): string => read('drift.yml');
 const jobs = (): string => under(code(workflow()), 'jobs');
 const buildJob = (): string => under(jobs(), 'build');
 const prJob = (): string => under(jobs(), 'pr');
+const alertJob = (): string => under(jobs(), 'alert');
+const proposeStep = (): string => steps(prJob())[stepIndex(steps(prJob()), 'propose')]!;
 
 /** A permissions block as sorted `scope: level` lines. */
 const grants = (block: string): string[] =>
@@ -42,58 +44,105 @@ const fakeServer = (stdout: string, exit = 0): string =>
 
 const SERVER = 'node_modules/.bin/tibiawiki-mcp';
 
-test('the workflow runs on a weekly schedule and by hand, and on nothing else', () => {
+test('the workflow runs on Tuesdays and Fridays at 06:17 UTC and by hand, and on nothing else', () => {
+  // Twice a week. Daily would release almost every day, since the wiki is edited daily.
   assert.deepEqual(keys(under(code(workflow()), 'on')), ['schedule', 'workflow_dispatch'],
     'the drift workflow has a trigger other than its schedule and workflow_dispatch');
   const crons = [...workflow().matchAll(/^ *- *cron: *'([^']*)'(.*)$/gm)];
   assert.equal(crons.length, 1, 'expected exactly one cron schedule');
-  const expression = crons[0]![1]!;
-  const rest = crons[0]![2]!;
-  const [minute, hour, dayOfMonth, month, dayOfWeek, ...extra] = expression.trim().split(/\s+/);
-  assert.equal(extra.length, 0, `${expression} is not a five-field cron`);
-  assert.ok(/^\d+$/.test(minute ?? '') && Number(minute) <= 59, `${expression} does not run at one fixed minute`);
-  assert.ok(/^\d+$/.test(hour ?? '') && Number(hour) <= 23, `${expression} does not run at one fixed hour`);
-  assert.equal(dayOfMonth, '*', `${expression} is not weekly`);
-  assert.equal(month, '*', `${expression} is not weekly`);
-  assert.match(dayOfWeek ?? '', /^[0-6]$/, `${expression} does not run on exactly one day of the week`);
-  const day = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'][Number(dayOfWeek)]!;
-  assert.match(rest, new RegExp(`#.*\\b${day}`), `the schedule runs on ${day}, and its comment does not say so`);
+  assert.equal(crons[0]![1], '17 6 * * 2,5', 'the schedule is not Tuesdays and Fridays at 06:17 UTC');
+  assert.match(crons[0]![2]!, /#.*\bTuesdays?\b.*\bFridays?\b/, 'the schedule comment does not name Tuesday and Friday');
 });
 
 test('no job in the drift workflow can mint an OIDC token', () => {
-  // This workflow never publishes. Without id-token, a mistake in it cannot either.
+  // This workflow never publishes itself. A merge publishes through release.yml, and without
+  // id-token a mistake here cannot publish either.
   assert.doesNotMatch(workflow(), /id-token/);
 });
 
-test('the drift workflow never publishes, merges or turns on auto-merge', () => {
-  // The pull request is the only gate before a publish, so nothing here may get past it.
+test('the drift workflow never publishes, and merges only through auto-merge in the propose step', () => {
+  // A merge publishes through release.yml, so it has to wait for the checks the ruleset requires.
+  // Auto-merge waits for them, and a held refresh turns it off. Nothing else here may merge.
   const body = code(workflow());
   for (const [what, pattern] of [
     ['npm publish', /\bnpm +publish\b/],
-    ['gh pr merge', /\bgh +pr +merge\b/],
-    ['--auto', /--auto\b/],
     ['the REST merge endpoint', /\/merge\b/],
     ['GraphQL auto-merge', /enablePullRequestAutoMerge/],
+    ['an admin merge', /--admin\b/],
   ] as const) {
     assert.doesNotMatch(body, pattern, `the drift workflow runs ${what}`);
   }
+  const merges = [...body.matchAll(/\bgh +pr +merge\b.*$/gm)].map((match) => match[0].trim()).sort();
+  assert.deepEqual(merges, ['gh pr merge "$number" --auto --rebase', 'gh pr merge "$number" --disable-auto'],
+    'the drift workflow merges in a way other than turning auto-merge on or off');
+  const script = code(stepScript(workflow(), 'propose'));
+  for (const merge of merges) assert.ok(script.includes(merge), `${merge} is not in the propose step`);
 });
 
-test('the workflow grants nothing by default, and the build job can only read', () => {
-  // The build job runs the generator over content anyone can edit.
+test('the workflow has a build, a pr and an alert job, and grants nothing by default', () => {
+  assert.deepEqual(keys(jobs()), ['build', 'pr', 'alert']);
   assert.match(code(workflow()), /^permissions: *\{\}$/m, 'the workflow-level permissions grant something');
+});
+
+test('the build job can only read, and reads no secret', () => {
+  // It runs the generator over content anyone can edit.
   assert.deepEqual(grants(under(buildJob(), 'permissions')), ['contents: read'],
     'the build job does not hold exactly contents: read');
+  assert.doesNotMatch(buildJob(), /\bsecrets\b|\bgithub\.token\b|^ *environment:/m, 'the build job reads a token');
 });
 
-test('the pr job holds exactly contents: write and pull-requests: write', () => {
-  assert.deepEqual(grants(under(prJob(), 'permissions')), ['contents: write', 'pull-requests: write']);
+test('the pr job holds exactly contents: read, and writes only through the drift token', () => {
+  // Its own token only reads, for the checkout. Every write goes through DRIFT_TOKEN, so the
+  // pull request's CI starts and its merge starts release.yml.
+  assert.deepEqual(grants(under(prJob(), 'permissions')), ['contents: read']);
+  assert.doesNotMatch(prJob(), /\bgithub\.token\b/, 'the pr job uses github.token');
+});
+
+test('only the pr job runs in the drift environment', () => {
+  // The environment gives DRIFT_TOKEN to runs on main alone, whatever a job's if says.
+  assert.equal(scalar(prJob(), 'environment'), 'drift', 'the pr job does not run in the drift environment');
+  assert.deepEqual([...code(workflow()).matchAll(/^ *environment:.*$/gm)].map((match) => match[0].trim()), ['environment: drift'],
+    'a job other than the pr job names an environment');
+});
+
+test('the drift token is the one secret the workflow reads, and it reaches the propose step alone, through its env', () => {
+  const secrets = code(workflow()).split('\n').filter((line) => /\bsecrets\b/.test(line)).map((line) => line.trim());
+  assert.deepEqual(secrets, ['GH_TOKEN: ${{ secrets.DRIFT_TOKEN }}']);
+  assert.equal(scalar(under(stepBody(proposeStep()), 'env'), 'GH_TOKEN'), '${{ secrets.DRIFT_TOKEN }}',
+    'the token does not reach the propose step through its env as GH_TOKEN');
+  assert.doesNotMatch(stepScript(workflow(), 'propose'), /DRIFT_TOKEN/, 'the propose script names the secret');
 });
 
 test('the pr job waits for the build job, and runs only on main when the digests differ', () => {
   assert.equal(scalar(prJob(), 'needs'), 'build', 'the pr job does not need the build job');
   assert.equal(scalar(prJob(), 'if'), "${{ github.ref == 'refs/heads/main' && needs.build.outputs.changed == 'true' }}",
     'the pr job is not gated on main and on a changed digest');
+});
+
+test('the pr job is bounded at 75 minutes, room for the 60 minute wait for the merge', () => {
+  assert.equal(scalar(prJob(), 'timeout-minutes'), '75');
+});
+
+test('the alert job runs on main alone, after both jobs, when one failed or the refresh was held', () => {
+  // A dispatch from another branch builds, tests and guards, and alerts nothing.
+  const alert = alertJob();
+  assert.equal(scalar(alert, 'needs'), '[build, pr]', 'the alert job does not need both jobs');
+  assert.equal(scalar(alert, 'if'),
+    "${{ always() && github.ref == 'refs/heads/main' && (needs.build.result == 'failure' || needs.pr.result == 'failure' || needs.build.outputs.hold == 'true') }}",
+    'the alert job is not gated on main and on a failure or a hold');
+  assert.equal(scalar(alert, 'runs-on'), 'ubuntu-latest');
+  assert.equal(scalar(alert, 'timeout-minutes'), '5', 'the alert job is not bounded at 5 minutes');
+});
+
+test('the alert job holds exactly issues: write, checks nothing out and comments with github.token', () => {
+  const alert = alertJob();
+  assert.deepEqual(grants(under(alert, 'permissions')), ['issues: write']);
+  assert.doesNotMatch(alert, /^ *(?:- +)?uses:/m, 'the alert job runs an action');
+  const list = steps(alert);
+  assert.equal(list.length, 1, 'expected exactly one alert job step');
+  stepIndex(list, 'alert');
+  assert.deepEqual(keys(under(stepBody(list[0]!), 'env')).sort(), ['BUILD_RESULT', 'GH_TOKEN', 'HOLD', 'PR_RESULT', 'REASONS']);
+  assert.equal(scalar(under(stepBody(list[0]!), 'env'), 'GH_TOKEN'), '${{ github.token }}', 'the alert step does not use github.token');
 });
 
 test('drift runs take turns in their own concurrency group, and none is cancelled', () => {
@@ -201,6 +250,73 @@ test('the build job tests the rebuilt index, and uploads it only after that and 
     'the upload is not gated on a changed digest');
 });
 
+/** The build job's guard command, as the workflow runs it. */
+const GUARD = 'node scripts/drift-guard.ts "$RUNNER_TEMP/committed.db" index.db';
+
+test('the build job keeps a copy of the committed index before build-index overwrites it', () => {
+  const list = steps(buildJob());
+  const keep = list.findIndex((step) => /^ *cp index\.db "\$RUNNER_TEMP\/committed\.db"$/m.test(step));
+  const build = list.findIndex((step) => /\bpnpm build-index\b/.test(step));
+  assert.notEqual(keep, -1, 'the build job never copies index.db to $RUNNER_TEMP/committed.db');
+  assert.ok(keep < build, 'the committed index is copied after build-index has overwritten it');
+});
+
+test('the build job runs the guard after the suite, and only when the content changed', () => {
+  const list = steps(buildJob());
+  const suite = list.findIndex((step) => /^ *(?:- +)?run: *pnpm test$/m.test(step));
+  const guard = stepIndex(list, 'guard');
+  assert.ok(suite < guard, 'the guard runs before pnpm test has passed');
+  assert.equal(stepIf(list[guard]!), "${{ steps.digests.outputs.changed == 'true' }}", 'the guard is not gated on a changed digest');
+  assert.ok(stepScript(workflow(), 'guard').includes(GUARD), `the guard step does not run ${GUARD}`);
+});
+
+/** A stand-in for scripts/drift-guard.ts that checks its arguments, prints `stdout` and exits `exit`. */
+const fakeGuard = (stdout: string, exit = 0): string =>
+  `const args = process.argv.slice(2);\n` +
+  `if (args.length !== 2 || args[0] !== process.env.RUNNER_TEMP + '/committed.db' || args[1] !== 'index.db') { process.exitCode = 2; }\n` +
+  `else { process.stdout.write(${JSON.stringify(stdout)}); process.exitCode = ${exit}; }\n`;
+
+/** Runs the guard step with the stand-in guard, and reads the outputs it wrote. */
+const runGuard = (stdout: string, exit = 0) => {
+  const run = runStep(stepScript(workflow(), 'guard'), { files: { 'scripts/drift-guard.ts': fakeGuard(stdout, exit) } });
+  const heredoc = /^reasons<<(\S+)\n(?:([\s\S]*?)\n)?\1\n/m.exec(run.output);
+  return { ...run, hold: /^hold=(.*)$/m.exec(run.output)?.[1], delimiter: heredoc?.[1], reasons: heredoc ? heredoc[2] ?? '' : undefined };
+};
+
+const REASONS = 'item lost 150 of 9,800 rows (1.5%)\ntable npc_job is missing';
+
+test('the guard step holds with the reasons the guard printed, and goes when it printed none', () => {
+  const held = runGuard(`${REASONS}\n`);
+  assert.equal(held.status, 0, held.log);
+  assert.equal(held.hold, 'true');
+  assert.equal(held.reasons, REASONS);
+  assert.match(held.log, /npc_job is missing/, 'the step does not log the reasons');
+
+  const go = runGuard('');
+  assert.equal(go.status, 0, go.log);
+  assert.equal(go.hold, 'false');
+  assert.equal(go.reasons, '');
+  assert.equal(go.output.split('\n').filter((line) => line.startsWith('hold=')).length, 1, 'hold is written more than once');
+});
+
+test('the guard step writes the reasons under a random delimiter', () => {
+  // A fixed one could be ended early by a reason that holds it.
+  const first = runGuard(`${REASONS}\n`);
+  const second = runGuard(`${REASONS}\n`);
+  assert.match(first.delimiter ?? '', /^\S{20,}$/, 'the delimiter is short enough to guess');
+  assert.notEqual(first.delimiter, second.delimiter, 'two runs used the same delimiter');
+});
+
+test('the guard step fails, and writes no hold, when the guard cannot read an index', () => {
+  // The guard prints nothing and exits 1, and an empty stdout must never read as go.
+  const run = runGuard('', 1);
+  assert.notEqual(run.status, 0, `the step passed when the guard failed\n${run.log}`);
+  assert.equal(run.output, '', 'the step wrote an output when the guard failed');
+  const partial = runGuard('item lost 150 of 9,800 rows (1.5%)\n', 1);
+  assert.notEqual(partial.status, 0, `the step passed when the guard failed after printing\n${partial.log}`);
+  assert.equal(partial.output, '', 'the step wrote an output when the guard failed after printing');
+});
+
 test('the pr job runs no pnpm script', () => {
   // R33: the job that can push runs only git, gh and node one-liners.
   assert.doesNotMatch(prJob(), /\bpnpm\b|\bnpx\b|\bnpm +(?:run|run-script|test|start|exec|install|i|ci)\b/);
@@ -210,15 +326,20 @@ test('every output and step value the jobs pass along is one that is written', (
   // A misspelt reference evaluates to an empty string, not an error. An empty `changed`
   // would skip the pr job forever, and look like a wiki that never moves.
   const outputs = under(buildJob(), 'outputs');
-  const declared = new Map([...outputs.matchAll(/^ *([\w-]+): *\$\{\{ *steps\.([\w-]+)\.outputs\.([\w-]+) *\}\}$/gm)]
+  const declared = new Map([...outputs.matchAll(/^ *([\w-]+): *\$\{\{ *steps\.([\w-]+)\.outputs\.([\w-]+)(?: *\|\| *'false')? *\}\}$/gm)]
     .map((match) => [match[1]!, { step: match[2]!, name: match[3]! }]));
-  assert.deepEqual([...declared.keys()].sort(), ['changed', 'committed', 'rebuilt', 'sha256']);
-  const writes = (id: string) => new Set([...stepScript(workflow(), id).matchAll(/^ *echo "([\w-]+)=/gm)].map((match) => match[1]!));
+  assert.equal(outputs.split('\n').filter((line) => line.trim() !== '').length, declared.size, 'the build job declares an output this test cannot read');
+  assert.deepEqual([...declared.keys()].sort(), ['changed', 'committed', 'hold', 'reasons', 'rebuilt', 'sha256']);
+  // The guard runs only when the content changed, and a skipped step's output is empty, so hold
+  // falls back to false. Nothing else may fall back.
+  assert.equal(scalar(outputs, 'hold'), "${{ steps.guard.outputs.hold || 'false' }}", 'hold does not fall back to false');
+  assert.equal(outputs.match(/\|\|/g)?.length, 1, 'an output other than hold falls back to a value');
+  const writes = (id: string) => new Set([...stepScript(workflow(), id).matchAll(/^ *echo "([\w-]+)(?:=|<<)/gm)].map((match) => match[1]!));
   for (const [output, { step, name }] of declared) {
     assert.equal(name, output, `the build output ${output} reads ${name}`);
     assert.ok(writes(step).has(name), `the build output ${output} reads ${step}.${name}, which that step never writes`);
   }
-  for (const [job, block] of [['build', buildJob()], ['pr', prJob()]] as const) {
+  for (const [job, block] of [['build', buildJob()], ['pr', prJob()], ['alert', alertJob()]] as const) {
     for (const [, id, name] of block.matchAll(/steps\.([\w-]+)\.outputs\.([\w-]+)/g)) {
       stepIndex(steps(block), id!);
       assert.ok(writes(id!).has(name!), `the ${job} job reads ${id}.${name}, which that step never writes`);
@@ -356,29 +477,77 @@ test('the version step fails, and sets nothing, when it cannot find a version np
   }
 });
 
-/** A stand-in gh: the open pull request lookup prints `open`, and every write prints a URL. */
-const fakeGh = (open: string): string =>
+/** How the stand-in gh answers the propose step. */
+type GhScenario = {
+  /** What the lookup of the open pull request prints: `<number> <auto-merge on>`, or nothing. */
+  open?: string;
+  /** The exit code of `gh pr merge --disable-auto`, and of `gh pr merge --auto`. */
+  disable?: number;
+  enable?: number;
+  /** What each poll of the pull request prints, in turn, the last one repeated. */
+  polls?: string[];
+};
+
+const MERGED = 'closed\ntrue\n';
+const OPEN = 'open\nfalse\n';
+const CLOSED = 'closed\nfalse\n';
+
+/**
+ * A stand-in gh for the propose step. It answers the lookup, a write, a merge and a poll as gh
+ * would with the step's --jq filters, and fails any other call. It counts polls in RUNNER_TEMP,
+ * since each call is a process of its own.
+ */
+const fakeGh = ({ open = '', disable = 0, enable = 0, polls = [MERGED] }: GhScenario = {}): string =>
+  `const fs = require('node:fs');\n` +
   `const args = process.argv.slice(2);\n` +
-  `if (args.includes('--method')) process.stdout.write('https://github.com/tibia-sh/tibiawiki-data/pull/12\\n');\n` +
-  `else process.stdout.write(${JSON.stringify(open)});\n`;
+  `if (args[0] === 'pr' && args[1] === 'merge') process.exitCode = args.includes('--disable-auto') ? ${disable} : ${enable};\n` +
+  `else if (args.includes('--method')) process.stdout.write(args.includes('POST') ? '12\\n' : 'https://github.com/tibia-sh/tibiawiki-data/pull/7\\n');\n` +
+  `else if (args[0] === 'api' && /\\/pulls\\?head=/.test(args[1])) process.stdout.write(${JSON.stringify(open)});\n` +
+  `else if (args[0] === 'api' && /\\/pulls\\/\\d+$/.test(args[1])) {\n` +
+  `  const counter = process.env.RUNNER_TEMP + '/polls';\n` +
+  `  const count = fs.existsSync(counter) ? Number(fs.readFileSync(counter, 'utf8')) : 0;\n` +
+  `  fs.writeFileSync(counter, String(count + 1));\n` +
+  `  const polls = ${JSON.stringify(polls)};\n` +
+  `  process.stdout.write(polls[Math.min(count, polls.length - 1)]);\n` +
+  `} else { process.stderr.write('the stand-in gh does not answer this call\\n'); process.exitCode = 98; }\n`;
 
 const PROPOSE_ENV = {
   GH_TOKEN: 'stand-in-token-value',
   VERSION: '3.0.1',
   COMMITTED: DIGEST_A,
   REBUILT: DIGEST_B,
+  HOLD: 'false',
+  REASONS: '',
   GITHUB_REPOSITORY: 'tibia-sh/tibiawiki-data',
   GITHUB_REPOSITORY_OWNER: 'tibia-sh',
   GITHUB_SERVER_URL: 'https://github.com',
   GITHUB_RUN_ID: '4242',
+  POLL_SECONDS: '0',
+  MERGE_DEADLINE_SECONDS: '60',
 };
+
+const HELD_ENV = { ...PROPOSE_ENV, HOLD: 'true', REASONS };
+
+const runPropose = (gh: GhScenario, env: Record<string, string> = PROPOSE_ENV) =>
+  runStep(stepScript(workflow(), 'propose'), { commands: { git: '', gh: fakeGh(gh) }, env });
 
 /** The value after `flag` in `args`, for each time `flag` appears. */
 const flagValues = (args: string[], flag: string): string[] =>
   args.flatMap((arg, index) => (arg === flag ? [args[index + 1]!] : []));
 
+/** What the step did, in order, one word each: lookup, disable, push, create, update, enable, poll. */
+const actions = (calls: Call[]): string[] =>
+  calls.flatMap(({ command, args }) => {
+    if (command === 'git') return args.includes('push') ? ['push'] : [];
+    if (args[0] === 'pr' && args[1] === 'merge') return [args.includes('--disable-auto') ? 'disable' : 'enable'];
+    if (args.includes('--method')) return [args.includes('POST') ? 'create' : 'update'];
+    return [/\/pulls\?head=/.test(args[1] ?? '') ? 'lookup' : 'poll'];
+  });
+
+const ghCalls = (calls: Call[]): string[][] => calls.filter((call) => call.command === 'gh').map((call) => call.args);
+
 test('the pr job force-pushes drift/index and opens a pull request carrying both digests', () => {
-  const run = runStep(stepScript(workflow(), 'propose'), { commands: { git: '', gh: fakeGh('') }, env: PROPOSE_ENV });
+  const run = runPropose({});
   assert.equal(run.status, 0, run.log);
 
   const git = run.calls.filter((call) => call.command === 'git').map((call) => call.args);
@@ -389,8 +558,7 @@ test('the pr job force-pushes drift/index and opens a pull request carrying both
   const add = git.find((args) => args[0] === 'add');
   assert.deepEqual(add?.slice(1).sort(), ['index.db', 'package.json'], 'the commit does not take exactly index.db and package.json');
 
-  const gh = run.calls.filter((call) => call.command === 'gh').map((call) => call.args);
-  const writes = gh.filter((args) => args.includes('--method'));
+  const writes = ghCalls(run.calls).filter((args) => args.includes('--method'));
   assert.equal(writes.length, 1, 'expected exactly one pull request write');
   const [create] = writes as [string[]];
   assert.deepEqual(flagValues(create, '--method'), ['POST']);
@@ -402,41 +570,199 @@ test('the pr job force-pushes drift/index and opens a pull request carrying both
   const body = fields.find((field) => field.startsWith('body='));
   assert.ok(body?.includes(DIGEST_A) && body.includes(DIGEST_B), 'the pull request body does not carry both digests');
   assert.ok(body?.includes('https://github.com/tibia-sh/tibiawiki-data/actions/runs/4242'), 'the body does not link the run');
+  assert.doesNotMatch(body ?? '', /Held for review/, 'a refresh that was not held says it was');
 
   for (const call of run.calls) {
     assert.ok(!call.args.join(' ').includes(PROPOSE_ENV.GH_TOKEN), `the token appears on the command line of ${call.command}`);
-    assert.ok(!call.args.some((arg) => /\bmerge\b/.test(arg)), `${call.command} was asked to merge: ${call.args.join(' ')}`);
   }
 });
 
-test('the pr job updates the open drift pull request instead of opening another', () => {
-  const run = runStep(stepScript(workflow(), 'propose'), { commands: { git: '', gh: fakeGh('7\n') }, env: PROPOSE_ENV });
+test('the pr job turns on auto-merge with a rebase on the pull request it opened, and waits for the merge', () => {
+  const run = runPropose({ polls: [OPEN, OPEN, MERGED] });
   assert.equal(run.status, 0, run.log);
-  const gh = run.calls.filter((call) => call.command === 'gh').map((call) => call.args);
-  const lookup = gh.filter((args) => !args.includes('--method'));
+  assert.deepEqual(actions(run.calls), ['lookup', 'push', 'create', 'enable', 'poll', 'poll', 'poll']);
+  const gh = ghCalls(run.calls);
+  assert.deepEqual(gh.find((args) => args[0] === 'pr'), ['pr', 'merge', '12', '--auto', '--rebase']);
+  for (const poll of gh.filter((args) => /\/pulls\/\d+$/.test(args[1] ?? ''))) {
+    assert.deepEqual(poll, ['api', 'repos/tibia-sh/tibiawiki-data/pulls/12', '--jq', '.state, .merged']);
+  }
+  assert.match(run.log, /merged/i, 'the step does not say the pull request merged');
+});
+
+test('the pr job updates the open drift pull request instead of opening another, and turns on its auto-merge', () => {
+  const run = runPropose({ open: '7 false\n' });
+  assert.equal(run.status, 0, run.log);
+  assert.deepEqual(actions(run.calls), ['lookup', 'push', 'update', 'enable', 'poll']);
+  const gh = ghCalls(run.calls);
+  const lookup = gh.filter((args) => /\/pulls\?head=/.test(args[1] ?? ''));
   assert.equal(lookup.length, 1, 'expected one lookup of the open pull request');
   assert.ok(lookup[0]!.some((arg) => arg.includes('head=tibia-sh:drift/index') && arg.includes('state=open')),
     `the lookup does not ask for an open pull request from drift/index: ${lookup[0]!.join(' ')}`);
   const writes = gh.filter((args) => args.includes('--method'));
-  assert.equal(writes.length, 1, 'expected exactly one pull request write');
   assert.deepEqual(flagValues(writes[0]!, '--method'), ['PATCH']);
   assert.ok(writes[0]!.includes('repos/tibia-sh/tibiawiki-data/pulls/7'), `pull request 7 is not the one updated: ${writes[0]!.join(' ')}`);
   const fields = flagValues(writes[0]!, '-f');
   assert.ok(fields.includes('title=chore: release a refreshed index as 3.0.1'), `unexpected title in ${fields.join(' | ')}`);
   const body = fields.find((field) => field.startsWith('body='));
   assert.ok(body?.includes(DIGEST_A) && body.includes(DIGEST_B), 'the updated body does not carry both digests');
+  assert.deepEqual(gh.find((args) => args[0] === 'pr'), ['pr', 'merge', '7', '--auto', '--rebase']);
 });
 
-test('the pr job pushes and opens nothing when a digest or the version is not valid', () => {
+test('the pr job leaves auto-merge alone when the open pull request already has it', () => {
+  const run = runPropose({ open: '7 true\n', polls: [OPEN, MERGED] });
+  assert.equal(run.status, 0, run.log);
+  assert.deepEqual(actions(run.calls), ['lookup', 'push', 'update', 'poll', 'poll']);
+});
+
+test('the pr job fails when the pull request is closed unmerged, or still open at the deadline', () => {
+  const closed = runPropose({ polls: [OPEN, CLOSED] });
+  assert.notEqual(closed.status, 0, `the step passed when the pull request was closed unmerged\n${closed.log}`);
+  assert.match(closed.log, /^::error::.*closed/m, 'the step does not say the pull request was closed');
+  assert.deepEqual(actions(closed.calls), ['lookup', 'push', 'create', 'enable', 'poll', 'poll']);
+
+  const late = runPropose({ polls: [OPEN] }, { ...PROPOSE_ENV, MERGE_DEADLINE_SECONDS: '0' });
+  assert.notEqual(late.status, 0, `the step passed when the pull request was still open at the deadline\n${late.log}`);
+  assert.match(late.log, /^::error::.*not merged/m, 'the step does not say the pull request has not merged');
+  assert.deepEqual(actions(late.calls), ['lookup', 'push', 'create', 'enable', 'poll']);
+
+  const odd = runPropose({ polls: ['open\ntrue\n'] });
+  assert.notEqual(odd.status, 0, `the step passed on a poll answer of another shape\n${odd.log}`);
+});
+
+test('a held refresh turns off auto-merge before it pushes, and opens or updates the pull request with the reasons', () => {
+  const run = runPropose({ open: '7 true\n' }, HELD_ENV);
+  assert.equal(run.status, 0, run.log);
+  assert.deepEqual(actions(run.calls), ['lookup', 'disable', 'push', 'update']);
+  assert.deepEqual(ghCalls(run.calls).find((args) => args[0] === 'pr'), ['pr', 'merge', '7', '--disable-auto']);
+  const body = flagValues(ghCalls(run.calls).find((args) => args.includes('--method'))!, '-f').find((field) => field.startsWith('body='));
+  assert.ok(body?.startsWith('body=**Held for review.** The refresh was not merged, because:\n\n' +
+    '- item lost 150 of 9,800 rows (1.5%)\n- table npc_job is missing\n\n'), `the held body does not start with the reasons: ${body}`);
+  assert.ok(body?.includes(DIGEST_A) && body.includes(DIGEST_B), 'the held body does not carry both digests');
+});
+
+test('a held refresh without auto-merge on turns it neither off nor on', () => {
+  const updated = runPropose({ open: '7 false\n' }, HELD_ENV);
+  assert.equal(updated.status, 0, updated.log);
+  assert.deepEqual(actions(updated.calls), ['lookup', 'push', 'update']);
+  const created = runPropose({}, HELD_ENV);
+  assert.equal(created.status, 0, created.log);
+  assert.deepEqual(actions(created.calls), ['lookup', 'push', 'create']);
+  const body = flagValues(ghCalls(created.calls).find((args) => args.includes('--method'))!, '-f').find((field) => field.startsWith('body='));
+  assert.ok(body?.startsWith('body=**Held for review.**'), 'the new held pull request does not say it is held');
+});
+
+test('a held refresh pushes nothing when auto-merge cannot be turned off', () => {
+  const run = runPropose({ open: '7 true\n', disable: 1 }, HELD_ENV);
+  assert.notEqual(run.status, 0, `the step passed when --disable-auto failed\n${run.log}`);
+  assert.deepEqual(actions(run.calls), ['lookup', 'disable']);
+  assert.deepEqual(run.calls.filter((call) => call.command === 'git'), [], 'git ran after --disable-auto failed');
+});
+
+test('the pr job pushes nothing when the lookup answers with another shape', () => {
+  for (const open of ['7\n', 'x true\n', '7 yes\n', '7 true extra\n']) {
+    const run = runPropose({ open });
+    assert.notEqual(run.status, 0, `the step passed when the lookup printed ${JSON.stringify(open)}\n${run.log}`);
+    assert.deepEqual(actions(run.calls), ['lookup'], `the step went on after the lookup printed ${JSON.stringify(open)}`);
+  }
+});
+
+test('the pr job pushes and opens nothing when a value it was given is not valid', () => {
   const cases: Array<[string, Record<string, string>]> = [
     ['the committed digest is empty', { COMMITTED: '' }],
     ['the rebuilt digest is not hex', { REBUILT: `${DIGEST_B.slice(1)}g` }],
     ['the version is empty', { VERSION: '' }],
     ['the version is not x.y.z', { VERSION: '3.0.1; echo' }],
+    ['hold is empty', { HOLD: '' }],
+    ['hold is neither true nor false', { HOLD: 'yes' }],
+    ['a held refresh has no reasons', { HOLD: 'true', REASONS: '' }],
+    ['the poll interval is not a whole number', { POLL_SECONDS: 'x' }],
+    ['the deadline is negative', { MERGE_DEADLINE_SECONDS: '-1' }],
   ];
   for (const [what, override] of cases) {
-    const run = runStep(stepScript(workflow(), 'propose'), { commands: { git: '', gh: fakeGh('') }, env: { ...PROPOSE_ENV, ...override } });
+    const run = runPropose({}, { ...PROPOSE_ENV, ...override });
     assert.notEqual(run.status, 0, `the step passed when ${what}\n${run.log}`);
     assert.deepEqual(run.calls, [], `the step ran ${run.calls.map((call) => call.command).join(', ')} when ${what}`);
   }
+});
+
+/** The title the alert job looks for and opens its issue with. */
+const ALERT_TITLE = 'The drift job needs a look';
+
+const ALERT_ENV = {
+  GH_TOKEN: 'stand-in-token-value',
+  BUILD_RESULT: 'success',
+  PR_RESULT: 'success',
+  HOLD: 'true',
+  REASONS,
+  GITHUB_REPOSITORY: 'tibia-sh/tibiawiki-data',
+  GITHUB_SERVER_URL: 'https://github.com',
+  GITHUB_RUN_ID: '4242',
+};
+
+const BOT = { login: 'github-actions[bot]' };
+const ALERT_ISSUE = { number: 30, title: ALERT_TITLE, user: BOT };
+/** Issues the alert job must pass over: the title by another author, a pull request, another title. */
+const NOT_ALERT_ISSUES = [
+  { number: 31, title: ALERT_TITLE, user: { login: 'drptbl' } },
+  { number: 32, title: ALERT_TITLE, user: BOT, pull_request: { url: 'https://api.github.com/repos/tibia-sh/tibiawiki-data/pulls/32' } },
+  { number: 33, title: `${ALERT_TITLE} again`, user: BOT },
+];
+
+/** A stand-in gh that lists `issues` as one page, answers a write with a URL, and exits `listExit` for the list. */
+const fakeAlertGh = (issues: unknown[], listExit = 0): string =>
+  `const args = process.argv.slice(2);\n` +
+  `if (args.includes('--method')) process.stdout.write('https://github.com/tibia-sh/tibiawiki-data/issues/40\\n');\n` +
+  `else { process.stdout.write(${JSON.stringify(`${JSON.stringify([issues])}\n`)}); process.exitCode = ${listExit}; }\n`;
+
+const runAlert = (issues: unknown[], env: Record<string, string> = ALERT_ENV, listExit = 0) =>
+  runStep(stepScript(workflow(), 'alert'), { commands: { gh: fakeAlertGh(issues, listExit) }, env });
+
+test('the alert comments on the open alert issue with the run and the reasons it held', () => {
+  const run = runAlert([...NOT_ALERT_ISSUES, ALERT_ISSUE]);
+  assert.equal(run.status, 0, run.log);
+  const gh = ghCalls(run.calls);
+  const [list, ...writes] = gh;
+  assert.ok(list!.some((arg) => arg === 'repos/tibia-sh/tibiawiki-data/issues?state=open&per_page=100'), `unexpected list call: ${list!.join(' ')}`);
+  assert.ok(list!.includes('--paginate') && list!.includes('--slurp'), 'the list does not read every page');
+  assert.equal(writes.length, 1, 'expected exactly one write');
+  assert.deepEqual(flagValues(writes[0]!, '--method'), ['POST']);
+  assert.ok(writes[0]!.includes('repos/tibia-sh/tibiawiki-data/issues/30/comments'), `the comment is not on issue 30: ${writes[0]!.join(' ')}`);
+  assert.deepEqual(flagValues(writes[0]!, '-f'), [
+    'body=Run: https://github.com/tibia-sh/tibiawiki-data/actions/runs/4242\n\nThe refresh was held for review:\n\n' +
+      '- item lost 150 of 9,800 rows (1.5%)\n- table npc_job is missing',
+  ]);
+});
+
+test('the alert opens the issue, assigned to the maintainer, when none of the open ones is its own', () => {
+  for (const issues of [[], NOT_ALERT_ISSUES]) {
+    const run = runAlert(issues);
+    assert.equal(run.status, 0, run.log);
+    const writes = ghCalls(run.calls).filter((args) => args.includes('--method'));
+    assert.equal(writes.length, 1, 'expected exactly one write');
+    assert.deepEqual(flagValues(writes[0]!, '--method'), ['POST']);
+    assert.ok(writes[0]!.includes('repos/tibia-sh/tibiawiki-data/issues'), `the issue is not opened: ${writes[0]!.join(' ')}`);
+    const fields = flagValues(writes[0]!, '-f');
+    assert.ok(fields.includes(`title=${ALERT_TITLE}`), `unexpected title in ${fields.join(' | ')}`);
+    assert.ok(fields.includes('assignees[]=drptbl'), 'the issue is not assigned to drptbl');
+    const body = fields.find((field) => field.startsWith('body='));
+    assert.ok(body?.endsWith('Run: https://github.com/tibia-sh/tibiawiki-data/actions/runs/4242\n\nThe refresh was held for review:\n\n' +
+      '- item lost 150 of 9,800 rows (1.5%)\n- table npc_job is missing'), `the issue body does not end with the alert: ${body}`);
+    assert.ok((body?.length ?? 0) > 'body=Run: '.length + 200, 'the issue body does not say what the issue is for');
+  }
+});
+
+test('the alert names the job that failed', () => {
+  for (const [job, env] of [['build', { BUILD_RESULT: 'failure', HOLD: 'false', REASONS: '' }], ['pr', { PR_RESULT: 'failure', HOLD: 'false', REASONS: '' }]] as const) {
+    const run = runAlert([ALERT_ISSUE], { ...ALERT_ENV, ...env });
+    assert.equal(run.status, 0, run.log);
+    const writes = ghCalls(run.calls).filter((args) => args.includes('--method'));
+    assert.deepEqual(flagValues(writes[0]!, '-f'), [`body=Run: https://github.com/tibia-sh/tibiawiki-data/actions/runs/4242\n\nThe ${job} job failed.`]);
+  }
+});
+
+test('the alert opens nothing when it cannot list the open issues', () => {
+  // Opening one then would put a second alert issue beside the first.
+  const run = runAlert([ALERT_ISSUE], ALERT_ENV, 1);
+  assert.notEqual(run.status, 0, `the step passed when the list failed\n${run.log}`);
+  assert.equal(ghCalls(run.calls).filter((args) => args.includes('--method')).length, 0, 'the step wrote after the list failed');
 });

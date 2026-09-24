@@ -467,14 +467,17 @@ test('the hosting dispatch is a job of its own, run once npm accepted the publis
   assert.doesNotMatch(stepScript(workflow(), DISPATCH_ID), /\bset +\+[a-z]*e|\bset +\+o +errexit\b/, `${stepName(step)} turns off -e`);
 });
 
-test('the hosting token is the one secret any workflow references, and it reaches the dispatch step through its env', () => {
+test('the hosting and drift tokens are the only secrets any workflow references, and the hosting one reaches the dispatch step through its env', () => {
   // Written into a run script, a secret would be pasted into the shell as code. In a step's env
   // it is a variable only the processes of that step see, and gh reads GH_TOKEN by itself, so the
-  // script never names the token. No other workflow reads a secret: the release job publishes
-  // through OIDC, and the drift job writes with github.token.
+  // script never names the token. The release job publishes through OIDC. The drift workflow's
+  // pr job writes with DRIFT_TOKEN, which test/drift-workflow.test.ts pins to its propose step.
   const references = workflowFiles().flatMap((file) =>
     code(read(file)).split('\n').filter((line) => /\bsecrets\b/.test(line)).map((line) => `${file}: ${line.trim()}`));
-  assert.deepEqual(references, ['release.yml: GH_TOKEN: ${{ secrets.HOSTING_DISPATCH_TOKEN }}']);
+  assert.deepEqual(references.sort(), [
+    'drift.yml: GH_TOKEN: ${{ secrets.DRIFT_TOKEN }}',
+    'release.yml: GH_TOKEN: ${{ secrets.HOSTING_DISPATCH_TOKEN }}',
+  ]);
   assert.equal(scalar(under(stepBody(dispatchStep()), 'env'), 'GH_TOKEN'), '${{ secrets.HOSTING_DISPATCH_TOKEN }}',
     'the token does not reach the dispatch step through its env as GH_TOKEN');
   assert.doesNotMatch(stepScript(workflow(), DISPATCH_ID), /GH_TOKEN|HOSTING_DISPATCH_TOKEN/, 'the dispatch script names its token');
