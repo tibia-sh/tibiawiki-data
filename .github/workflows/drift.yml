@@ -267,11 +267,12 @@ jobs:
             echo "The refresh is held, but no reason came with it." >&2
             exit 1
           fi
-          # How often and how long the wait for the merge polls, from the environment so the
-          # tests can shorten them.
+          # How often and how long the wait for the merge polls, and how long it pauses after a
+          # failed read, from the environment so the tests can shorten them.
           poll=${POLL_SECONDS:-30}
           limit=${MERGE_DEADLINE_SECONDS:-3600}
-          for value in "$poll" "$limit"; do
+          retry=${RETRY_SECONDS:-10}
+          for value in "$poll" "$limit" "$retry"; do
             if [[ ! $value =~ ^[0-9]+$ ]]; then
               echo "Not a whole number of seconds: '$value'" >&2
               exit 1
@@ -311,6 +312,12 @@ jobs:
 
           git add index.db package.json
           git commit --quiet -m "$title" -m "$digests"
+          # The commit this run pushes. The wait takes only a merge of it as this run's.
+          head=$(git rev-parse HEAD)
+          if [[ ! $head =~ ^[0-9a-f]{40}$ ]]; then
+            echo "git rev-parse HEAD printed '$head', not a commit." >&2
+            exit 1
+          fi
           # The stable branch, replaced on every run. The token reaches git through a credential
           # helper that reads it from the environment, so it is never written to .git/config and
           # never appears on a command line.
@@ -319,18 +326,37 @@ jobs:
             -c 'credential.helper=!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f' \
             push --force origin HEAD:refs/heads/drift/index
 
+          # The pull request the lookup found can have merged or closed between the lookup and the
+          # push. So it is read again by number after the update, and when it is no longer open a
+          # new one is opened for drift/index. Auto-merge is turned on or off from this state.
           if [ -n "$number" ]; then
             gh api --method PATCH "repos/$GITHUB_REPOSITORY/pulls/$number" -f title="$title" -f body="$body" --jq .html_url
-          else
+            now=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$number" --jq '"\(.state) \(.auto_merge != null)"')
+            if [[ ! $now =~ ^(open|closed)\ (true|false)$ ]]; then
+              echo "Reading pull request #$number again printed '$now'." >&2
+              exit 1
+            fi
+            armed=${BASH_REMATCH[2]}
+            if [ "${BASH_REMATCH[1]}" != open ]; then
+              echo "Pull request #$number closed before this push, so a new one is opened."
+              number=
+            fi
+          fi
+          if [ -z "$number" ]; then
             number=$(gh api --method POST "repos/$GITHUB_REPOSITORY/pulls" -f head=drift/index -f base=main -f title="$title" -f body="$body" --jq .number)
             if [[ ! $number =~ ^[0-9]+$ ]]; then
               echo "Opening the pull request printed '$number', not its number." >&2
               exit 1
             fi
             echo "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/pull/$number"
+            armed=false
           fi
 
           if [ "$HOLD" = true ]; then
+            # Auto-merge turned on since the lookup, by a person or by another run.
+            if [ "$armed" = true ]; then
+              gh pr merge "$number" --disable-auto
+            fi
             echo "The refresh is held for review, so pull request #$number is left for a person to merge or close."
             exit 0
           fi
@@ -340,26 +366,55 @@ jobs:
             gh pr merge "$number" --auto --rebase
           fi
           # A red check leaves the pull request open, and the run red, rather than a green run
-          # beside a pull request nobody sees.
-          echo "Waiting up to $limit seconds for pull request #$number to merge."
+          # beside a pull request nobody sees. Only a merge of the commit this run pushed counts.
+          echo "Waiting up to $limit seconds for pull request #$number to merge $head."
           deadline=$((SECONDS + limit))
+          failed=0
+          rearmed=false
           while :; do
-            state=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$number" --jq '.state, .merged')
-            case $state in
-              $'closed\ntrue')
-                echo "Pull request #$number merged, so release.yml publishes $VERSION."
-                exit 0
-                ;;
-              $'closed\nfalse')
-                echo "::error::Pull request #$number was closed without merging."
+            # gh can fail for a moment in an hour of reads. Three failed reads in a row end the
+            # wait, and a good read starts the count again.
+            if ! view=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$number" --jq '"\(.state) \(.merged) \(.auto_merge != null) \(.head.sha)"'); then
+              failed=$((failed + 1))
+              if ((failed >= 3)); then
+                echo "::error::Reading pull request #$number failed 3 times in a row."
                 exit 1
-                ;;
-              $'open\nfalse') ;;
-              *)
-                echo "::error::Reading pull request #$number printed '$state'."
+              fi
+              echo "Reading pull request #$number failed, so it is read again in $retry seconds."
+              sleep "$retry"
+              continue
+            fi
+            failed=0
+            if [[ ! $view =~ ^(open|closed)\ (true|false)\ (true|false)\ ([0-9a-f]{40})$ ]]; then
+              echo "::error::Reading pull request #$number printed '$view'."
+              exit 1
+            fi
+            state=${BASH_REMATCH[1]}
+            merged=${BASH_REMATCH[2]}
+            auto=${BASH_REMATCH[3]}
+            sha=${BASH_REMATCH[4]}
+            if [ "$merged" = true ]; then
+              if [ "$sha" != "$head" ]; then
+                echo "::error::Pull request #$number merged $sha, not $head, the commit this run pushed."
                 exit 1
-                ;;
-            esac
+              fi
+              echo "Pull request #$number merged $head, so release.yml publishes $VERSION."
+              exit 0
+            fi
+            if [ "$state" = closed ]; then
+              echo "::error::Pull request #$number was closed without merging."
+              exit 1
+            fi
+            # Auto-merge found off is turned on again once, as the hosting repository's bump does.
+            if [ "$auto" = false ]; then
+              if [ "$rearmed" = true ]; then
+                echo "::error::Auto-merge on pull request #$number was found off a second time."
+                exit 1
+              fi
+              echo "Auto-merge on pull request #$number was found off, so it is turned on again."
+              gh pr merge "$number" --auto --rebase
+              rearmed=true
+            fi
             if ((SECONDS + poll >= deadline)); then
               echo "::error::Pull request #$number has not merged $limit seconds after auto-merge was on. Its checks may have failed."
               exit 1
