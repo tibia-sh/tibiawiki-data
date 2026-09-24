@@ -72,7 +72,7 @@ test('the drift workflow never publishes, and merges only through auto-merge in 
   ] as const) {
     assert.doesNotMatch(body, pattern, `the drift workflow runs ${what}`);
   }
-  const merges = [...body.matchAll(/\bgh +pr +merge\b.*$/gm)].map((match) => match[0].trim()).sort();
+  const merges = [...new Set([...body.matchAll(/\bgh +pr +merge\b.*$/gm)].map((match) => match[0].trim()))].sort();
   assert.deepEqual(merges, ['gh pr merge "$number" --auto --rebase', 'gh pr merge "$number" --disable-auto'],
     'the drift workflow merges in a way other than turning auto-merge on or off');
   const script = code(stepScript(workflow(), 'propose'));
@@ -477,39 +477,63 @@ test('the version step fails, and sets nothing, when it cannot find a version np
   }
 });
 
+/** The commit the stand-in git names as HEAD, and another one. */
+const HEAD_SHA = 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678';
+const OTHER_SHA = 'ffeeddccbbaa99887766554433221100ffeeddcc';
+
+/** What a poll prints for the pull request: its state, whether it merged, whether auto-merge is on, and its head. */
+const poll = (state: 'open' | 'closed', merged: boolean, armed: boolean, sha = HEAD_SHA): string =>
+  `${state} ${merged} ${armed} ${sha}\n`;
+
+const MERGED = poll('closed', true, false);
+const OPEN = poll('open', false, true);
+const DISARMED = poll('open', false, false);
+const CLOSED = poll('closed', false, false);
+/** A poll gh fails. */
+const FAIL = 'FAIL';
+
 /** How the stand-in gh answers the propose step. */
 type GhScenario = {
   /** What the lookup of the open pull request prints: `<number> <auto-merge on>`, or nothing. */
   open?: string;
+  /** What the read of that pull request after the push prints: `<state> <auto-merge on>`. */
+  reread?: string;
   /** The exit code of `gh pr merge --disable-auto`, and of `gh pr merge --auto`. */
   disable?: number;
   enable?: number;
-  /** What each poll of the pull request prints, in turn, the last one repeated. */
+  /** What each poll of the pull request prints, in turn, the last one repeated. FAIL makes gh fail. */
   polls?: string[];
+  /** What `git rev-parse HEAD` prints. */
+  head?: string;
 };
 
-const MERGED = 'closed\ntrue\n';
-const OPEN = 'open\nfalse\n';
-const CLOSED = 'closed\nfalse\n';
-
 /**
- * A stand-in gh for the propose step. It answers the lookup, a write, a merge and a poll as gh
- * would with the step's --jq filters, and fails any other call. It counts polls in RUNNER_TEMP,
- * since each call is a process of its own.
+ * A stand-in gh for the propose step. It answers the lookup, a write, a merge, the read after the
+ * push and a poll as gh would with the step's --jq filters, and fails any other call. A poll is
+ * the read whose filter takes head.sha. It counts polls in RUNNER_TEMP, since each call is a
+ * process of its own.
  */
-const fakeGh = ({ open = '', disable = 0, enable = 0, polls = [MERGED] }: GhScenario = {}): string =>
+const fakeGh = ({ open = '', reread = 'open false\n', disable = 0, enable = 0, polls = [MERGED] }: GhScenario = {}): string =>
   `const fs = require('node:fs');\n` +
   `const args = process.argv.slice(2);\n` +
+  `const jq = args[args.indexOf('--jq') + 1] ?? '';\n` +
   `if (args[0] === 'pr' && args[1] === 'merge') process.exitCode = args.includes('--disable-auto') ? ${disable} : ${enable};\n` +
   `else if (args.includes('--method')) process.stdout.write(args.includes('POST') ? '12\\n' : 'https://github.com/tibia-sh/tibiawiki-data/pull/7\\n');\n` +
   `else if (args[0] === 'api' && /\\/pulls\\?head=/.test(args[1])) process.stdout.write(${JSON.stringify(open)});\n` +
-  `else if (args[0] === 'api' && /\\/pulls\\/\\d+$/.test(args[1])) {\n` +
+  `else if (args[0] === 'api' && /\\/pulls\\/\\d+$/.test(args[1]) && jq.includes('head.sha')) {\n` +
   `  const counter = process.env.RUNNER_TEMP + '/polls';\n` +
   `  const count = fs.existsSync(counter) ? Number(fs.readFileSync(counter, 'utf8')) : 0;\n` +
   `  fs.writeFileSync(counter, String(count + 1));\n` +
   `  const polls = ${JSON.stringify(polls)};\n` +
-  `  process.stdout.write(polls[Math.min(count, polls.length - 1)]);\n` +
-  `} else { process.stderr.write('the stand-in gh does not answer this call\\n'); process.exitCode = 98; }\n`;
+  `  const answer = polls[Math.min(count, polls.length - 1)];\n` +
+  `  if (answer === ${JSON.stringify(FAIL)}) { process.stderr.write('gh: Server Error (HTTP 502)\\n'); process.exitCode = 1; }\n` +
+  `  else process.stdout.write(answer);\n` +
+  `} else if (args[0] === 'api' && /\\/pulls\\/\\d+$/.test(args[1])) process.stdout.write(${JSON.stringify(reread)});\n` +
+  `else { process.stderr.write('the stand-in gh does not answer this call\\n'); process.exitCode = 98; }\n`;
+
+/** A stand-in git that names `head` as HEAD and does nothing else. */
+const fakeGit = (head = HEAD_SHA): string =>
+  `if (process.argv[2] === 'rev-parse') process.stdout.write(${JSON.stringify(`${head}\n`)});\n`;
 
 const PROPOSE_ENV = {
   GH_TOKEN: 'stand-in-token-value',
@@ -524,24 +548,28 @@ const PROPOSE_ENV = {
   GITHUB_RUN_ID: '4242',
   POLL_SECONDS: '0',
   MERGE_DEADLINE_SECONDS: '60',
+  RETRY_SECONDS: '0',
 };
 
 const HELD_ENV = { ...PROPOSE_ENV, HOLD: 'true', REASONS };
 
 const runPropose = (gh: GhScenario, env: Record<string, string> = PROPOSE_ENV) =>
-  runStep(stepScript(workflow(), 'propose'), { commands: { git: '', gh: fakeGh(gh) }, env });
+  runStep(stepScript(workflow(), 'propose'), { commands: { git: fakeGit(gh.head), gh: fakeGh(gh) }, env });
 
 /** The value after `flag` in `args`, for each time `flag` appears. */
 const flagValues = (args: string[], flag: string): string[] =>
   args.flatMap((arg, index) => (arg === flag ? [args[index + 1]!] : []));
 
-/** What the step did, in order, one word each: lookup, disable, push, create, update, enable, poll. */
+const isPoll = (args: string[]): boolean => (args[args.indexOf('--jq') + 1] ?? '').includes('head.sha');
+
+/** What the step did, in order, one word each: lookup, disable, push, create, update, reread, enable, poll. */
 const actions = (calls: Call[]): string[] =>
   calls.flatMap(({ command, args }) => {
     if (command === 'git') return args.includes('push') ? ['push'] : [];
     if (args[0] === 'pr' && args[1] === 'merge') return [args.includes('--disable-auto') ? 'disable' : 'enable'];
     if (args.includes('--method')) return [args.includes('POST') ? 'create' : 'update'];
-    return [/\/pulls\?head=/.test(args[1] ?? '') ? 'lookup' : 'poll'];
+    if (/\/pulls\?head=/.test(args[1] ?? '')) return ['lookup'];
+    return [isPoll(args) ? 'poll' : 'reread'];
   });
 
 const ghCalls = (calls: Call[]): string[][] => calls.filter((call) => call.command === 'gh').map((call) => call.args);
@@ -557,6 +585,10 @@ test('the pr job force-pushes drift/index and opens a pull request carrying both
   assert.ok(git.some((args) => args[0] === 'commit'), 'nothing was committed');
   const add = git.find((args) => args[0] === 'add');
   assert.deepEqual(add?.slice(1).sort(), ['index.db', 'package.json'], 'the commit does not take exactly index.db and package.json');
+  const commit = git.findIndex((args) => args[0] === 'commit');
+  const revParse = git.findIndex((args) => args[0] === 'rev-parse');
+  assert.deepEqual(git[revParse], ['rev-parse', 'HEAD'], 'the step does not record the commit it pushes');
+  assert.ok(commit < revParse && revParse < git.findIndex((args) => args.includes('push')), 'HEAD is not read between the commit and the push');
 
   const writes = ghCalls(run.calls).filter((args) => args.includes('--method'));
   assert.equal(writes.length, 1, 'expected exactly one pull request write');
@@ -577,22 +609,22 @@ test('the pr job force-pushes drift/index and opens a pull request carrying both
   }
 });
 
-test('the pr job turns on auto-merge with a rebase on the pull request it opened, and waits for the merge', () => {
+test('the pr job turns on auto-merge with a rebase on the pull request it opened, and waits for the merge of its commit', () => {
   const run = runPropose({ polls: [OPEN, OPEN, MERGED] });
   assert.equal(run.status, 0, run.log);
   assert.deepEqual(actions(run.calls), ['lookup', 'push', 'create', 'enable', 'poll', 'poll', 'poll']);
   const gh = ghCalls(run.calls);
   assert.deepEqual(gh.find((args) => args[0] === 'pr'), ['pr', 'merge', '12', '--auto', '--rebase']);
-  for (const poll of gh.filter((args) => /\/pulls\/\d+$/.test(args[1] ?? ''))) {
-    assert.deepEqual(poll, ['api', 'repos/tibia-sh/tibiawiki-data/pulls/12', '--jq', '.state, .merged']);
+  for (const args of gh.filter(isPoll)) {
+    assert.deepEqual(args.slice(0, 2), ['api', 'repos/tibia-sh/tibiawiki-data/pulls/12']);
   }
-  assert.match(run.log, /merged/i, 'the step does not say the pull request merged');
+  assert.match(run.log, new RegExp(`#12 merged ${HEAD_SHA}`), 'the step does not say the pull request merged its commit');
 });
 
 test('the pr job updates the open drift pull request instead of opening another, and turns on its auto-merge', () => {
   const run = runPropose({ open: '7 false\n' });
   assert.equal(run.status, 0, run.log);
-  assert.deepEqual(actions(run.calls), ['lookup', 'push', 'update', 'enable', 'poll']);
+  assert.deepEqual(actions(run.calls), ['lookup', 'push', 'update', 'reread', 'enable', 'poll']);
   const gh = ghCalls(run.calls);
   const lookup = gh.filter((args) => /\/pulls\?head=/.test(args[1] ?? ''));
   assert.equal(lookup.length, 1, 'expected one lookup of the open pull request');
@@ -605,13 +637,28 @@ test('the pr job updates the open drift pull request instead of opening another,
   assert.ok(fields.includes('title=chore: release a refreshed index as 3.0.1'), `unexpected title in ${fields.join(' | ')}`);
   const body = fields.find((field) => field.startsWith('body='));
   assert.ok(body?.includes(DIGEST_A) && body.includes(DIGEST_B), 'the updated body does not carry both digests');
+  const reread = gh.find((args) => !isPoll(args) && /\/pulls\/\d+$/.test(args[1] ?? '') && !args.includes('--method'));
+  assert.equal(reread?.[1], 'repos/tibia-sh/tibiawiki-data/pulls/7', 'the pull request is not read again by its number');
   assert.deepEqual(gh.find((args) => args[0] === 'pr'), ['pr', 'merge', '7', '--auto', '--rebase']);
 });
 
-test('the pr job leaves auto-merge alone when the open pull request already has it', () => {
-  const run = runPropose({ open: '7 true\n', polls: [OPEN, MERGED] });
+test('the pr job decides auto-merge from the pull request as it is after the push', () => {
+  const armed = runPropose({ open: '7 true\n', reread: 'open true\n', polls: [OPEN, MERGED] });
+  assert.equal(armed.status, 0, armed.log);
+  assert.deepEqual(actions(armed.calls), ['lookup', 'push', 'update', 'reread', 'poll', 'poll'], 'auto-merge was turned on again');
+  const cleared = runPropose({ open: '7 true\n', reread: 'open false\n' });
+  assert.equal(cleared.status, 0, cleared.log);
+  assert.deepEqual(actions(cleared.calls), ['lookup', 'push', 'update', 'reread', 'enable', 'poll'], 'auto-merge found off after the push stayed off');
+});
+
+test('a pull request that merged between the lookup and the push is replaced by a new one, which the job waits on', () => {
+  // Waiting on the old number would take its earlier merge for this run's.
+  const run = runPropose({ open: '7 true\n', reread: 'closed true\n', polls: [OPEN, MERGED] });
   assert.equal(run.status, 0, run.log);
-  assert.deepEqual(actions(run.calls), ['lookup', 'push', 'update', 'poll', 'poll']);
+  assert.deepEqual(actions(run.calls), ['lookup', 'push', 'update', 'reread', 'create', 'enable', 'poll', 'poll']);
+  const gh = ghCalls(run.calls);
+  assert.deepEqual(gh.find((args) => args[0] === 'pr'), ['pr', 'merge', '12', '--auto', '--rebase']);
+  for (const args of gh.filter(isPoll)) assert.equal(args[1], 'repos/tibia-sh/tibiawiki-data/pulls/12', 'the wait reads the old pull request');
 });
 
 test('the pr job fails when the pull request is closed unmerged, or still open at the deadline', () => {
@@ -625,14 +672,48 @@ test('the pr job fails when the pull request is closed unmerged, or still open a
   assert.match(late.log, /^::error::.*not merged/m, 'the step does not say the pull request has not merged');
   assert.deepEqual(actions(late.calls), ['lookup', 'push', 'create', 'enable', 'poll']);
 
-  const odd = runPropose({ polls: ['open\ntrue\n'] });
-  assert.notEqual(odd.status, 0, `the step passed on a poll answer of another shape\n${odd.log}`);
+  for (const odd of ['open\nfalse\n', `open maybe true ${HEAD_SHA}\n`, `open false true ${HEAD_SHA.slice(1)}\n`]) {
+    const run = runPropose({ polls: [odd] });
+    assert.notEqual(run.status, 0, `the step passed on the poll answer ${JSON.stringify(odd)}\n${run.log}`);
+  }
+});
+
+test('the pr job fails when the pull request merged a head other than the commit it pushed', () => {
+  const run = runPropose({ polls: [poll('closed', true, false, OTHER_SHA)] });
+  assert.notEqual(run.status, 0, `the step passed on a merge of another head\n${run.log}`);
+  assert.match(run.log, new RegExp(`^::error::.*${OTHER_SHA}.*${HEAD_SHA}`, 'm'), 'the error does not name both commits');
+});
+
+test('the pr job turns auto-merge on again once when it finds it off during the wait', () => {
+  const run = runPropose({ polls: [OPEN, DISARMED, OPEN, MERGED] });
+  assert.equal(run.status, 0, run.log);
+  assert.deepEqual(actions(run.calls), ['lookup', 'push', 'create', 'enable', 'poll', 'poll', 'enable', 'poll', 'poll']);
+  assert.match(run.log, /auto-merge .*off.*turned on again/i, 'the step does not log that it turned auto-merge on again');
+
+  const twice = runPropose({ polls: [DISARMED] });
+  assert.notEqual(twice.status, 0, `the step passed when auto-merge was found off a second time\n${twice.log}`);
+  assert.deepEqual(actions(twice.calls), ['lookup', 'push', 'create', 'enable', 'poll', 'enable', 'poll']);
+  assert.match(twice.log, /^::error::.*second time/m);
+});
+
+test('the wait reads the pull request again after a failed read, and fails on the third in a row', () => {
+  const twice = runPropose({ polls: [FAIL, FAIL, MERGED] });
+  assert.equal(twice.status, 0, `two failed reads ended the wait\n${twice.log}`);
+  assert.deepEqual(actions(twice.calls).filter((action) => action === 'poll').length, 3);
+
+  const reset = runPropose({ polls: [FAIL, FAIL, OPEN, FAIL, FAIL, MERGED] });
+  assert.equal(reset.status, 0, `a good read did not reset the count\n${reset.log}`);
+
+  const thrice = runPropose({ polls: [FAIL, FAIL, FAIL, MERGED] });
+  assert.notEqual(thrice.status, 0, `the step passed after three failed reads in a row\n${thrice.log}`);
+  assert.deepEqual(actions(thrice.calls).filter((action) => action === 'poll').length, 3, 'the step read a fourth time');
+  assert.match(thrice.log, /^::error::.*3 times/m);
 });
 
 test('a held refresh turns off auto-merge before it pushes, and opens or updates the pull request with the reasons', () => {
   const run = runPropose({ open: '7 true\n' }, HELD_ENV);
   assert.equal(run.status, 0, run.log);
-  assert.deepEqual(actions(run.calls), ['lookup', 'disable', 'push', 'update']);
+  assert.deepEqual(actions(run.calls), ['lookup', 'disable', 'push', 'update', 'reread']);
   assert.deepEqual(ghCalls(run.calls).find((args) => args[0] === 'pr'), ['pr', 'merge', '7', '--disable-auto']);
   const body = flagValues(ghCalls(run.calls).find((args) => args.includes('--method'))!, '-f').find((field) => field.startsWith('body='));
   assert.ok(body?.startsWith('body=**Held for review.** The refresh was not merged, because:\n\n' +
@@ -640,15 +721,24 @@ test('a held refresh turns off auto-merge before it pushes, and opens or updates
   assert.ok(body?.includes(DIGEST_A) && body.includes(DIGEST_B), 'the held body does not carry both digests');
 });
 
+test('a held refresh turns off auto-merge that is on again after the push', () => {
+  const run = runPropose({ open: '7 false\n', reread: 'open true\n' }, HELD_ENV);
+  assert.equal(run.status, 0, run.log);
+  assert.deepEqual(actions(run.calls), ['lookup', 'push', 'update', 'reread', 'disable']);
+});
+
 test('a held refresh without auto-merge on turns it neither off nor on', () => {
   const updated = runPropose({ open: '7 false\n' }, HELD_ENV);
   assert.equal(updated.status, 0, updated.log);
-  assert.deepEqual(actions(updated.calls), ['lookup', 'push', 'update']);
+  assert.deepEqual(actions(updated.calls), ['lookup', 'push', 'update', 'reread']);
   const created = runPropose({}, HELD_ENV);
   assert.equal(created.status, 0, created.log);
   assert.deepEqual(actions(created.calls), ['lookup', 'push', 'create']);
   const body = flagValues(ghCalls(created.calls).find((args) => args.includes('--method'))!, '-f').find((field) => field.startsWith('body='));
   assert.ok(body?.startsWith('body=**Held for review.**'), 'the new held pull request does not say it is held');
+  const replaced = runPropose({ open: '7 false\n', reread: 'closed true\n' }, HELD_ENV);
+  assert.equal(replaced.status, 0, replaced.log);
+  assert.deepEqual(actions(replaced.calls), ['lookup', 'push', 'update', 'reread', 'create']);
 });
 
 test('a held refresh pushes nothing when auto-merge cannot be turned off', () => {
@@ -658,11 +748,24 @@ test('a held refresh pushes nothing when auto-merge cannot be turned off', () =>
   assert.deepEqual(run.calls.filter((call) => call.command === 'git'), [], 'git ran after --disable-auto failed');
 });
 
-test('the pr job pushes nothing when the lookup answers with another shape', () => {
+test('the pr job goes no further when the lookup or the read after the push answers with another shape', () => {
   for (const open of ['7\n', 'x true\n', '7 yes\n', '7 true extra\n']) {
     const run = runPropose({ open });
     assert.notEqual(run.status, 0, `the step passed when the lookup printed ${JSON.stringify(open)}\n${run.log}`);
     assert.deepEqual(actions(run.calls), ['lookup'], `the step went on after the lookup printed ${JSON.stringify(open)}`);
+  }
+  for (const reread of ['', 'open\n', 'merged true\n', 'open yes\n']) {
+    const run = runPropose({ open: '7 false\n', reread });
+    assert.notEqual(run.status, 0, `the step passed when the read after the push printed ${JSON.stringify(reread)}\n${run.log}`);
+    assert.deepEqual(actions(run.calls), ['lookup', 'push', 'update', 'reread'], `the step went on after the read printed ${JSON.stringify(reread)}`);
+  }
+});
+
+test('the pr job pushes nothing when git does not name the commit it made', () => {
+  for (const head of ['', HEAD_SHA.slice(1), HEAD_SHA.toUpperCase(), `${HEAD_SHA}\n${OTHER_SHA}`]) {
+    const run = runPropose({ head });
+    assert.notEqual(run.status, 0, `the step passed when git rev-parse HEAD printed ${JSON.stringify(head)}\n${run.log}`);
+    assert.deepEqual(actions(run.calls), ['lookup'], `the step pushed when git rev-parse HEAD printed ${JSON.stringify(head)}`);
   }
 });
 
@@ -677,6 +780,7 @@ test('the pr job pushes and opens nothing when a value it was given is not valid
     ['a held refresh has no reasons', { HOLD: 'true', REASONS: '' }],
     ['the poll interval is not a whole number', { POLL_SECONDS: 'x' }],
     ['the deadline is negative', { MERGE_DEADLINE_SECONDS: '-1' }],
+    ['the retry pause is not a whole number', { RETRY_SECONDS: '1.5' }],
   ];
   for (const [what, override] of cases) {
     const run = runPropose({}, { ...PROPOSE_ENV, ...override });
