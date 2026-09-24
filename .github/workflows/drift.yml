@@ -425,8 +425,10 @@ jobs:
   alert:
     needs: [build, pr]
     # On main only, so a dispatch from another branch alerts nothing. always() lets it run after a
-    # job that failed.
-    if: ${{ always() && github.ref == 'refs/heads/main' && (needs.build.result == 'failure' || needs.pr.result == 'failure' || needs.build.outputs.hold == 'true') }}
+    # job that did not succeed. GitHub can report a job that hit its timeout-minutes as cancelled
+    # rather than failed, so anything but success alerts, except a pr job skipped because nothing
+    # changed or the build job did not succeed.
+    if: ${{ always() && github.ref == 'refs/heads/main' && (needs.build.result != 'success' || (needs.pr.result != 'success' && needs.pr.result != 'skipped') || needs.build.outputs.hold == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     # Comments on one issue with github.token. It checks nothing out and runs no action.
@@ -445,12 +447,12 @@ jobs:
           title='The drift job needs a look'
           text="Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           said=false
-          if [ "$BUILD_RESULT" = failure ]; then
-            text=$(printf '%s\n\nThe build job failed.' "$text")
+          if [ "$BUILD_RESULT" != success ]; then
+            text=$(printf '%s\n\nThe build job did not succeed. Its result is %s.' "$text" "$BUILD_RESULT")
             said=true
           fi
-          if [ "$PR_RESULT" = failure ]; then
-            text=$(printf '%s\n\nThe pr job failed.' "$text")
+          if [ "$PR_RESULT" != success ] && [ "$PR_RESULT" != skipped ]; then
+            text=$(printf '%s\n\nThe pr job did not succeed. Its result is %s.' "$text" "$PR_RESULT")
             said=true
           fi
           if [ "$HOLD" = true ]; then
@@ -459,7 +461,7 @@ jobs:
             said=true
           fi
           if [ "$said" != true ]; then
-            echo "::error::The alert job ran, but no job failed and nothing was held."
+            echo "::error::The alert job ran, but every job succeeded and nothing was held."
             exit 1
           fi
 

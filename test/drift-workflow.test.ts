@@ -123,13 +123,15 @@ test('the pr job is bounded at 75 minutes, room for the 60 minute wait for the m
   assert.equal(scalar(prJob(), 'timeout-minutes'), '75');
 });
 
-test('the alert job runs on main alone, after both jobs, when one failed or the refresh was held', () => {
-  // A dispatch from another branch builds, tests and guards, and alerts nothing.
+test('the alert job runs on main alone, after both jobs, when one did not succeed or the refresh was held', () => {
+  // A dispatch from another branch builds, tests and guards, and alerts nothing. GitHub can report
+  // a job that hit its timeout-minutes as cancelled rather than failed, so anything but success
+  // alerts, except a pr job skipped because nothing changed.
   const alert = alertJob();
   assert.equal(scalar(alert, 'needs'), '[build, pr]', 'the alert job does not need both jobs');
   assert.equal(scalar(alert, 'if'),
-    "${{ always() && github.ref == 'refs/heads/main' && (needs.build.result == 'failure' || needs.pr.result == 'failure' || needs.build.outputs.hold == 'true') }}",
-    'the alert job is not gated on main and on a failure or a hold');
+    "${{ always() && github.ref == 'refs/heads/main' && (needs.build.result != 'success' || (needs.pr.result != 'success' && needs.pr.result != 'skipped') || needs.build.outputs.hold == 'true') }}",
+    'the alert job is not gated on main and on a job that did not succeed or a hold');
   assert.equal(scalar(alert, 'runs-on'), 'ubuntu-latest');
   assert.equal(scalar(alert, 'timeout-minutes'), '5', 'the alert job is not bounded at 5 minutes');
 });
@@ -855,13 +857,24 @@ test('the alert opens the issue, assigned to the maintainer, when none of the op
   }
 });
 
-test('the alert names the job that failed', () => {
-  for (const [job, env] of [['build', { BUILD_RESULT: 'failure', HOLD: 'false', REASONS: '' }], ['pr', { PR_RESULT: 'failure', HOLD: 'false', REASONS: '' }]] as const) {
-    const run = runAlert([ALERT_ISSUE], { ...ALERT_ENV, ...env });
+test('the alert names each job that did not succeed, and its result', () => {
+  const cases: Array<[Record<string, string>, string[]]> = [
+    [{ BUILD_RESULT: 'failure', PR_RESULT: 'skipped' }, ['build', 'failure']],
+    [{ BUILD_RESULT: 'cancelled', PR_RESULT: 'skipped' }, ['build', 'cancelled']],
+    [{ PR_RESULT: 'failure' }, ['pr', 'failure']],
+    [{ PR_RESULT: 'cancelled' }, ['pr', 'cancelled']],
+  ];
+  for (const [env, [job, result]] of cases) {
+    const run = runAlert([ALERT_ISSUE], { ...ALERT_ENV, HOLD: 'false', REASONS: '', ...env });
     assert.equal(run.status, 0, run.log);
     const writes = ghCalls(run.calls).filter((args) => args.includes('--method'));
-    assert.deepEqual(flagValues(writes[0]!, '-f'), [`body=Run: https://github.com/tibia-sh/tibiawiki-data/actions/runs/4242\n\nThe ${job} job failed.`]);
+    assert.deepEqual(flagValues(writes[0]!, '-f'),
+      [`body=Run: https://github.com/tibia-sh/tibiawiki-data/actions/runs/4242\n\nThe ${job} job did not succeed. Its result is ${result}.`]);
   }
+  // A pr job skipped because nothing changed, or because the build failed, is not named.
+  const held = runAlert([ALERT_ISSUE], { ...ALERT_ENV, PR_RESULT: 'skipped' });
+  assert.equal(held.status, 0, held.log);
+  assert.doesNotMatch(flagValues(ghCalls(held.calls).find((args) => args.includes('--method'))!, '-f')[0]!, /pr job/);
 });
 
 test('the alert opens nothing when it cannot list the open issues', () => {
