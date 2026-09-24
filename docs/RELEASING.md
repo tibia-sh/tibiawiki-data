@@ -15,7 +15,7 @@ and passes the gate, ends this way. If it does not, the run installs from the lo
 - A registry the check cannot read fails the run. It is never taken for a missing
   version.
 - The run packs the committed `index.db` and never rebuilds it, so the file published is
-  the file reviewed in the pull request.
+  the file the pull request carried and its checks tested.
 - It publishes through npm trusted publishing, so no npm token exists to leak, and npm
   attaches a provenance attestation for the merged commit. The trusted publisher is
   registered for the file name `release.yml`, and renaming the file breaks publishing
@@ -29,6 +29,11 @@ and passes the gate, ends this way. If it does not, the run installs from the lo
   release for it, with notes generated from the index. When that job is red, follow
   [The GitHub release](#the-github-release).
 - Every pull request runs the same `pnpm test` and the same gate, in `.github/workflows/ci.yml`.
+- A data refresh reaches `main` by itself. The drift job pushes its pull request and turns on
+  auto-merge with `DRIFT_TOKEN`, so the merge is a push by you, the token's owner, and this
+  workflow runs on it as on any merge. [The drift token](#the-drift-token) says what that token
+  can do, and [When the drift job needs a look](#when-the-drift-job-needs-a-look) covers a
+  refresh the drift job held.
 
 The tag and the release are created only after npm accepted the publish, so a failed publish
 still strands nothing.
@@ -135,6 +140,108 @@ That is the job's own logic, so it covers a first release too: with no tag below
 
 Do not re-run the release run once npm accepted the publish. Its release job finds the version on npm and publishes nothing, so `released` stays empty and both this job and `hosting` are skipped.
 
+## The drift token
+
+`DRIFT_TOKEN` is your fine-grained personal access token, with `tibia-sh` as its resource owner and
+`tibiawiki-data` as the only repository it can reach. It is a secret of this repository's `drift`
+environment, which deploys from `main` only, and admins cannot bypass that rule. One step reads it,
+`Push drift/index, open or update its pull request, and get it merged` in the `pr` job of
+`drift.yml`. It is not `HOSTING_DISPATCH_TOKEN`, which the `hosting` job reads from the
+`release-trigger` environment and which reaches `mcp.tibia.sh` only. Each token reaches one repository.
+
+The token holds these permissions on `tibiawiki-data`:
+
+| Permission | Access |
+|---|---|
+| Contents | Read and write |
+| Pull requests | Read and write |
+| Metadata | Read, which GitHub adds to every fine-grained token |
+
+The token has no expiry, so it lasts until it is rotated or revoked.
+
+The drift job needs it because GitHub starts no workflow for a push, a pull request or a merge made
+with `GITHUB_TOKEN`. With that token the pull request's CI would never run, and neither would
+`release.yml` after the merge. With this one, the push, the pull request and the merge are yours.
+
+The token means control of what npm publishes as `@tibia.sh/tibiawiki-data`. The ruleset requires
+`test` and `oldest-consumer` and has no review rule, and those checks run the pull request's own
+scripts and tests. So a holder can push a branch whose checks pass by construction, open a pull
+request, turn on auto-merge, and land whatever `index.db`, `src/`, `package.json` or lockfile they
+like on `main`. They can also push to `main` a commit whose checks already passed. `release.yml` then
+publishes that content to npm with provenance, `package.json` and its scripts included.
+`@tibia.sh/tibiawiki-mcp` installs it through `^3`, and the hosted endpoint serves it within
+minutes. The token is your own identity, so no rule can tell its pull requests and merges from
+yours, and the provenance attestation looks like any other release's. It cannot publish to npm
+outside `release.yml`, and it cannot touch the other repositories. Without the Workflows permission
+it cannot change a workflow file. The maintainer accepted that trade-off, as for the hosting
+repository's release trigger token.
+
+If this token leaks, revoke it first, on github.com under Settings, Developer settings, Personal
+access tokens, Fine-grained tokens. Then check what `main` and npm hold:
+
+1. Turn off auto-merge on every open pull request, or close it, your own included. One with
+   auto-merge on merges without the token once its checks pass, and its merge publishes.
+2. Read `git log` on `main` for commits you did not land yourself.
+3. Run `npm view @tibia.sh/tibiawiki-data time` for versions published since the leak.
+4. In a pull request, revert anything you did not land, and set `version` to the next patch npm
+   does not have. Its merge publishes clean content above whatever the holder published, and the
+   hosting repository moves to it, since its `bump.yml` pins the version it is told about.
+5. Deprecate each version the holder published, with `npm login` and then
+   `npm deprecate @tibia.sh/tibiawiki-data@X.Y.Z "<why>"`. npm never accepts the same version
+   twice, so a bad one cannot be replaced, and deprecation warns everyone who installs it.
+
+Then rotate it. Until the new token is stored, a drift run that finds a change fails in its `pr`
+job and comments on the alert issue.
+
+To rotate it:
+
+1. Create a new token the same way: resource owner `tibia-sh`, repository access `tibiawiki-data`
+   only, the permissions above, and no expiration.
+2. Run `gh secret set DRIFT_TOKEN --env drift --repo tibia-sh/tibiawiki-data`. It prompts for the
+   token, so it stays out of your shell history.
+3. Revoke the old token.
+
+The next drift run that finds a change uses the new token. To try it at once, run
+`gh workflow run drift.yml --repo tibia-sh/tibiawiki-data --ref main`, which merges and publishes a
+refresh when the wiki changed.
+
+## When the drift job needs a look
+
+A run of `drift.yml` on `main` that fails, or holds a refresh, comments on one issue, titled
+`The drift job needs a look`, opened by `github-actions[bot]` and assigned to `drptbl`. An assignee
+is notified of every comment whatever their watch settings. When no such issue is open, the run
+opens it. Each comment links the run and says what happened:
+
+| The comment says | What to do |
+|---|---|
+| `The build job failed.` | Open the run and read the red step. A tripped gate in `pnpm build-index`, a failing `pnpm test`, a wiki the build could not read, or `The guard could not compare the indexes.` each end it there, before anything is pushed. Fix the cause, or run drift again once the wiki is back. |
+| `The pr job failed.` | Open the run and read the red step. `npm does not list X.Y.Z from package.json yet` means the release of the version on `main` is still running or failed, so follow [When a release run fails](#when-a-release-run-fails) and run drift again once npm has it. `was closed without merging` means someone closed the pull request. `has not merged 3600 seconds after auto-merge was on` means its checks failed or are still running: auto-merge stays on, so it merges by itself once they pass, for example after you re-run a check that failed for a reason outside the repository. `Bad credentials` from `gh` means the token expired or was revoked, so rotate it as [The drift token](#the-drift-token) describes. |
+| `The refresh was held for review:` and its reasons | Follow the steps below. |
+
+A held refresh has its reasons twice: in the comment, and at the top of the pull request's body,
+under **Held for review.** Each reason names a table, such as `item lost 120 of 9,800 rows (1.2%)`,
+`table quest is empty, it had 370 rows` or `table spell is missing`.
+
+1. Read the reasons, and find out whether the wiki really lost those pages, or whether the
+   generator or a bad week on the wiki dropped them.
+2. When the refresh is right, merge the pull request by hand once its checks pass, with Rebase and
+   merge, as the drift job would. The merge publishes it like any other.
+3. When it is not, close the pull request and find the cause. While the cause lasts, every run that
+   finds a change opens a new pull request, holds it and comments again.
+
+You can also leave the pull request open and wait. A later run updates it, and when that run's
+guard finds no reason to hold, it turns auto-merge on and the pull request merges by itself.
+
+Close the issue once each comment is dealt with, and the next alert opens a new one.
+
+The alert issue does not cover the release. Once a drift pull request merges, the `pr` job ends
+green, and `release.yml` runs on the merge as on any push to `main`. When that run is red, GitHub
+emails whoever pushed, which for a drift merge is the token's owner, as long as your notification
+settings for Actions send email. [When a release run fails](#when-a-release-run-fails) says what
+to do. While npm lacks that version, the next drift run that finds a change fails at
+`Set version to the next patch npm does not have`, and that failure does comment on the alert
+issue.
+
 ## Bumping the schema version
 
 **Not yet exercised.** No schema bump has gone through this procedure.
@@ -181,7 +288,10 @@ pipeline. It is this package, because no published server installs `N.0.0`. Serv
 
 Do not merge a data refresh here between steps 2 and 4. `main` is still on N-1 then, and
 npm refuses to publish a version below `N.0.0` without a dist-tag, so its release run
-fails.
+fails. The drift job merges a refresh by itself, so before step 2 run
+`gh workflow disable drift.yml --repo tibia-sh/tibiawiki-data` and turn off auto-merge on an
+open drift pull request, or close it. Once step 4 has merged, run
+`gh workflow enable drift.yml --repo tibia-sh/tibiawiki-data`.
 
 Both repositories set `trustPolicy: no-downgrade`, which makes pnpm refuse a version with
 weaker trust evidence than any version published before it. The release workflow publishes

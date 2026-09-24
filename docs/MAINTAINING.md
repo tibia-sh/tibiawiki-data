@@ -30,8 +30,8 @@ major.
 
 - **A fresh clone is a complete package.** It has an index to test and to pack, so
   publishing a release packs the committed file and never needs a crawl.
-- **A data refresh is reviewable.** It is a pull request whose diff is the new
-  `index.db`, so the file reviewed is the file published.
+- **A data refresh is a pull request.** Its diff is the new `index.db`, so the file its
+  checks tested, and the file you look at when the drift job holds it, is the file published.
 
 **Measured cost, for the `3.0.0` index (2026-09-12):**
 
@@ -124,28 +124,54 @@ The sweep covers items only, not creatures, NPCs, quests or spells. So the `9.0.
 
 ### Drift
 
-`.github/workflows/drift.yml` rebuilds the index every Monday at 06:17 UTC, and when you
-run it by hand from the Actions tab. It digests the committed `index.db` with the
-devDependency's `tibiawiki-mcp index-digest`, runs `pnpm build-index`, digests the
-rebuilt index, and runs `pnpm test` against it. The digest covers what the server reads,
-and leaves out stamps that change on every run, such as `generate_time`. The run's log
+`.github/workflows/drift.yml` rebuilds the index on Tuesdays and Fridays at 06:17 UTC, and
+when you run it by hand from the Actions tab. It digests the committed `index.db` with the
+devDependency's `tibiawiki-mcp index-digest`, keeps a copy of it, runs `pnpm build-index`,
+digests the rebuilt index, and runs `pnpm test` against it. The digest covers what the server
+reads, and leaves out stamps that change on every run, such as `generate_time`. The run's log
 shows both digests.
 
-When the digests match, the run ends green and opens nothing. When they differ, the
-content changed. The run pushes the rebuilt `index.db` to the `drift/index` branch, with
-`version` set to the next patch npm does not have. It opens a pull request carrying both
-digests, or updates the one already open. Merging that pull request publishes the new
-patch.
+When the digests match, the run ends green and opens nothing. When they differ, the content
+changed, and `scripts/drift-guard.ts` compares the row counts of the kept copy with those of
+the rebuilt index. It holds the refresh for a person when:
 
-- The pull request is opened with `GITHUB_TOKEN`, so its CI waits for you. Click
-  "Approve workflows to run" on it, then review the pull request before you merge it.
-- The workflow never merges and never turns on auto-merge, so a bad day on the wiki can at
-  most open a pull request.
-- A red run is a signal. A tripped gate, a failing test, an unreadable registry, or a
-  `version` on `main` that npm does not list yet each end the run red, and nothing is
-  pushed or opened. Find out why before the next run.
-- Each run that finds a change replaces `drift/index`, so an open pull request always
-  carries the newest rebuild.
+1. one of the eight main tables, `item`, `creature`, `npc`, `book`, `house`, `achievement`,
+   `quest` and `spell`, lost more than 1% of its committed rows
+2. any table of the committed index is missing from the rebuilt one
+3. any table that had rows in the committed index has none
+
+Growth never holds, and a table only the rebuilt index has is growth. Each reason is one line,
+one per table at most, such as `item lost 120 of 9,800 rows (1.2%)` or
+`table quest is empty, it had 370 rows`.
+
+The `pr` job then sets `version` to the next patch npm does not have, pushes the rebuilt
+`index.db` to the `drift/index` branch, and opens a pull request titled
+`chore: release a refreshed index as X.Y.Z` that carries both digests, or updates the one
+already open. It pushes and opens with `DRIFT_TOKEN`, so the pull request's CI starts by
+itself. [The drift token](RELEASING.md#the-drift-token) says what that token can do.
+
+- **Not held.** The job turns on auto-merge with rebase and waits up to 60 minutes for the
+  merge, checking every 30 seconds. Auto-merge merges the pull request once `test` and
+  `oldest-consumer`, which the ruleset requires, pass, and the merge publishes the new patch
+  through `release.yml`. The job
+  ends red when the pull request is closed without merging, or is still open at the deadline.
+- **Held.** The job turns auto-merge off first when the open pull request has it, then pushes
+  and opens or updates the pull request. Its body starts with **Held for review.** and lists
+  the reasons. The run ends green and the pull request waits for you.
+
+A run on `main` that fails, or holds a refresh, comments on the issue
+`The drift job needs a look`, or opens it assigned to `drptbl`.
+[When the drift job needs a look](RELEASING.md#when-the-drift-job-needs-a-look) says what to do.
+
+- A tripped gate, a failing test, a guard that cannot read an index, an unreadable registry, or
+  a `version` on `main` that npm does not list yet each end the run red before anything is
+  pushed. A pull request closed without merging, or not merged within 60 minutes, ends it red
+  after the push.
+- Each run that finds a change replaces `drift/index`, so an open pull request always carries
+  the newest rebuild. A held pull request you leave open is not frozen: when a later run's
+  guard finds no reason to hold, that run turns auto-merge on and it merges by itself.
+- A run you dispatch from another branch builds, tests and guards, and pushes, opens, merges
+  and alerts nothing. Only `main` can use the `drift` environment that holds the token.
 - GitHub turns off a schedule after 60 days without activity in a public repository, and
   that stops the job without a red run. Turn it back on from the Actions tab.
 
