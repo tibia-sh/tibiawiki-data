@@ -207,7 +207,7 @@ explicitly, and checks that the answer's `indexGeneratedAt` matches `index.db`.
 ## Development
 
 Requires Node 22.18 or later, because the tests run TypeScript directly, and pnpm
-12.4.1, pinned in `packageManager`.
+12.6.0, pinned in `packageManager`.
 
 ```bash
 pnpm install --frozen-lockfile
@@ -240,8 +240,8 @@ After changing `version` in `package.json`, run `pnpm install` before `pnpm test
 run scripts until you do.
 
 The tarball ships `index.db` and `dist/`, plus the `package.json`, `README.md` and
-`LICENSE` that npm always adds. `@tibia.sh/*` packages are exempt from this
-repository's seven-day install cooldown. `pnpm-workspace.yaml` says why.
+`LICENSE` that npm always adds. `@tibia.sh/*` packages and pnpm itself are
+exempt from this repository's seven-day install cooldown. `pnpm-workspace.yaml` says why.
 
 ### Checking a release, before and after publishing
 
