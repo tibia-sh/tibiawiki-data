@@ -66,13 +66,14 @@ holds: those two values, and how the row counts moved since the release before i
 
 ## How it stays current
 
-A workflow rebuilds the index every Monday. When the wiki's content changed, it opens a pull
-request with the new `index.db`. A maintainer reviews and merges it. The merge publishes the next
-patch version to npm with a provenance attestation. The hosted server picks the new version
-up by itself within minutes.
+A workflow rebuilds the index on Tuesdays and Fridays. When the wiki's content changed, it opens a
+pull request with the new `index.db` and merges it by itself once the checks pass. The merge
+publishes the next patch version to npm with a provenance attestation, and the hosted server picks
+the new version up by itself within minutes. A refresh that loses rows, such as a main table with
+more than 1% fewer rows than the snapshot before it, is held for a person to look at instead.
 
-The file you install is the file that was reviewed. It is committed to this repository, and a
-release packs it without rebuilding.
+The file you install is the file the pull request carried and its checks tested. It is committed
+to this repository, and a release packs it without rebuilding.
 
 ## Contributing
 
