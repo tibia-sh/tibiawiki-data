@@ -97,6 +97,33 @@ test('a main table that empties gets the empty reason only', () => {
   assert.deepEqual(holdReasons(MAIN, { ...MAIN, npc: 0 }), ['table npc is empty, it had 1,245 rows']);
 });
 
+test('each of the eight main tables holds when it loses more than 1%', () => {
+  // Written out, not read from the shared list, so a table dropped from that list fails here. A
+  // table outside it that shrinks this much holds nothing.
+  const cases: Array<[keyof typeof MAIN, number, string]> = [
+    ['item', 9604, 'item lost 196 of 9,800 rows (2.0%)'],
+    ['creature', 2150, 'creature lost 43 of 2,193 rows (2.0%)'],
+    ['npc', 1221, 'npc lost 24 of 1,245 rows (1.9%)'],
+    ['book', 1470, 'book lost 30 of 1,500 rows (2.0%)'],
+    ['house', 980, 'house lost 20 of 1,000 rows (2.0%)'],
+    ['achievement', 588, 'achievement lost 12 of 600 rows (2.0%)'],
+    ['quest', 392, 'quest lost 8 of 400 rows (2.0%)'],
+    ['spell', 294, 'spell lost 6 of 300 rows (2.0%)'],
+  ];
+  assert.deepEqual(cases.map(([name]) => name).sort(), Object.keys(MAIN).sort(), 'the cases do not cover every main table');
+  for (const [name, after, reason] of cases) {
+    assert.deepEqual(holdReasons(MAIN, { ...MAIN, [name]: after }), [reason], `${name} did not hold`);
+  }
+});
+
+test('a committed table named constructor or __proto__ that goes missing holds as missing', () => {
+  // JSON.parse makes __proto__ an own key, as readSnapshot's prototype-less objects do. The rebuilt
+  // counts are a plain object, which inherits both names without owning either.
+  const committed = { ...MAIN, ...(JSON.parse('{"constructor": 4, "__proto__": 7}') as Record<string, number>) };
+  assert.ok(Object.hasOwn(committed, '__proto__'), 'the fixture has no own __proto__ key');
+  assert.deepEqual(holdReasons(committed, { ...MAIN }), ['table __proto__ is missing', 'table constructor is missing']);
+});
+
 test('the command prints each reason on its own line, or nothing, and exits 0 either way', () => {
   const dir = mkdtempSync(join(tmpdir(), 'tibiawiki-data-drift-guard-'));
   try {
