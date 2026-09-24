@@ -190,11 +190,18 @@ refresh, comments on the issue
 the index, its `index-digest` tells the drift job whether a rebuild changed it, and its
 `serve` validates it, in `pnpm test` here and in `pnpm smoke` against an installed copy.
 
-**When to bump it.** On a `0.x` version, `^0.3.0` means `>=0.3.0 <0.4.0`. Left alone,
-it pins every rebuild to the 0.3 generator and its gates while the server moves on.
-Bump it whenever the server's indexer changes: `build-index`, its enrichment, its
-gates, or the schema. Write the new range by hand. This repository saves exact
-versions, so `pnpm add` records a pin instead.
+**When to bump it.** It is pinned to an exact version, so it moves only by a commit, and
+a test in `test/drift-workflow.test.ts` fails on a range. Bump it whenever the server's
+indexer changes: `build-index`, its enrichment, its gates or the schema. Bump it too
+whenever the server's `REQUIRED_COLUMNS` grows, since `index-digest` covers exactly
+those columns.
+A digest that covers fewer columns than the server reads cannot see a wiki edit to the
+others, so the drift job would not refresh for it. `pnpm add -D` keeps the old range
+style of an existing entry, so write the exact version by hand, then run `pnpm install`.
+
+The drift job digests the committed and the rebuilt index with the same pinned server,
+so a bump alone never opens a refresh. The next run opens one only when a covered column
+changed, and after a bump that widens the coverage, the new columns count too.
 
 **The dependency cycle is intentional.** The server depends on this package, and this
 package devDepends on the server. npm and pnpm allow it because this side is
