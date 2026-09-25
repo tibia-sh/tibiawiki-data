@@ -125,11 +125,23 @@ The sweep covers items only, not creatures, NPCs, quests or spells. So the `9.0.
 ### Drift
 
 `.github/workflows/drift.yml` rebuilds the index on Tuesdays and Fridays at 06:17 UTC, and
-when you run it by hand from the Actions tab. It digests the committed `index.db` with the
-devDependency's `tibiawiki-mcp index-digest`, keeps a copy of it, runs `pnpm build-index`,
-digests the rebuilt index, and runs `pnpm test` against it. The digest covers what the server
-reads, and leaves out stamps that change on every run, such as `generate_time`. The run's log
-shows both digests.
+when you run it by hand from the Actions tab. It digests the committed `index.db` with
+`scripts/index-digest.ts`, keeps a copy of it, runs `pnpm build-index`, digests the rebuilt
+index, and runs `pnpm test` against it. The run's log shows both digests.
+
+The digest covers the whole index this package publishes: every table, and every column of
+it, generated and hidden columns included. It leaves out two things that change without the
+content changing:
+
+- the `timestamp` column the generator gives every row of the main tables. It is the wiki
+  page's last-edit time, so an edit that changes nothing the generator extracts still moves
+  it, and that is no reason to publish.
+- every `database_info` row but `version`. The others stamp the run or the build host, such
+  as `generate_time` and `python_version`.
+
+The script refuses an index with no table or without the `version` row, and the run ends red.
+The same script digests both indexes, so a change to the script alone never opens a refresh.
+`test/index-digest.test.ts` pins what moves the digest and what does not.
 
 When the digests match, the run ends green and opens nothing. When they differ, the content
 changed, and `scripts/drift-guard.ts` compares the row counts of the kept copy with those of
@@ -186,22 +198,19 @@ refresh, comments on the issue
 
 ## The devDependency on the server
 
-`@tibia.sh/tibiawiki-mcp` is a devDependency for three jobs: its `build-index` produces
-the index, its `index-digest` tells the drift job whether a rebuild changed it, and its
-`serve` validates it, in `pnpm test` here and in `pnpm smoke` against an installed copy.
+`@tibia.sh/tibiawiki-mcp` is a devDependency for two jobs: its `build-index` produces
+the index, and its `serve` validates it, in `pnpm test` here and in `pnpm smoke` against
+an installed copy.
 
 **When to bump it.** It is pinned to an exact version, so it moves only by a commit, and
 a test in `test/drift-workflow.test.ts` fails on a range. Bump it whenever the server's
-indexer changes: `build-index`, its enrichment, its gates or the schema. Bump it too
-whenever the server's `REQUIRED_COLUMNS` grows, since `index-digest` covers exactly
-those columns.
-A digest that covers fewer columns than the server reads cannot see a wiki edit to the
-others, so the drift job would not refresh for it. `pnpm add -D` keeps the old range
-style of an existing entry, so write the exact version by hand, then run `pnpm install`.
+indexer changes: `build-index`, its enrichment, its gates or the schema. `pnpm add -D`
+keeps the old range style of an existing entry, so write the exact version by hand, then
+run `pnpm install`.
 
-The drift job digests the committed and the rebuilt index with the same pinned server,
-so a bump alone never opens a refresh. The next run opens one only when a covered column
-changed, and after a bump that widens the coverage, the new columns count too.
+The drift job's digest is this repository's own `scripts/index-digest.ts`, so a bump never
+changes how an index is digested. When the new `build-index` produces other content, the
+next run sees it in the digest and opens a refresh.
 
 **The dependency cycle is intentional.** The server depends on this package, and this
 package devDepends on the server. npm and pnpm allow it because this side is
