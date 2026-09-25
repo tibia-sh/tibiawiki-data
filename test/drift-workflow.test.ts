@@ -27,7 +27,7 @@ const DIGEST_B = '95893758373511f414cf538f81b500c2c6bf9765704e0f0a0ff0aca9d21fbc
 /** sha256 of the text `rebuilt index`, taken with shasum and openssl. */
 const REBUILT_INDEX_SHA256 = '95893758373511f414cf538f81b500c2c6bf9765704e0f0a0ff0aca9d21fbc61';
 
-/** What index-digest could print instead of a digest, each of which must stop the run. */
+/** What scripts/index-digest.ts could print instead of a digest, each of which must stop the run. */
 const NOT_DIGESTS: Array<[string, string]> = [
   ['nothing', ''],
   ['63 hex characters', DIGEST_A.slice(1)],
@@ -37,12 +37,18 @@ const NOT_DIGESTS: Array<[string, string]> = [
   ['a prefixed digest', `sha256:${DIGEST_A}`],
 ];
 
-/** A stand-in for the server binary that prints `stdout` for index-digest and exits `exit`. */
-const fakeServer = (stdout: string, exit = 0): string =>
-  `if (process.argv[2] !== 'index-digest' || process.argv[3] !== 'index.db') { process.exitCode = 2; return; }\n` +
-  `process.stdout.write(${JSON.stringify(stdout)});\nprocess.exitCode = ${exit};\n`;
-
-const SERVER = 'node_modules/.bin/tibiawiki-mcp';
+/**
+ * The checkout files that stand in for scripts/index-digest.ts: a script that prints `stdout`
+ * when given index.db alone, and exits `exit`. `node` itself is not a stand-in command, so the
+ * step runs this file with the real node. The package.json makes it an ES module, as this
+ * repository's is, so the stand-in has no top-level return and no require.
+ */
+const fakeDigest = (stdout: string, exit = 0): Record<string, string> => ({
+  'package.json': '{ "type": "module" }\n',
+  'scripts/index-digest.ts':
+    `if (process.argv.length !== 3 || process.argv[2] !== 'index.db') {\n  process.exitCode = 2;\n} else {\n` +
+    `  process.stdout.write(${JSON.stringify(stdout)});\n  process.exitCode = ${exit};\n}\n`,
+});
 
 test('the workflow runs on Tuesdays and Fridays at 06:17 UTC and by hand, and on nothing else', () => {
   // Twice a week. Daily would release almost every day, since the wiki is edited daily.
@@ -234,14 +240,23 @@ test('the build job digests the committed index before build-index overwrites it
   const build = list.findIndex((step) => /\bpnpm build-index\b/.test(step));
   assert.notEqual(build, -1, 'the build job never runs pnpm build-index');
   assert.ok(committed < build, 'the committed digest is taken after build-index has overwritten index.db');
-  assert.match(list[committed]!, /tibiawiki-mcp index-digest index\.db/, 'the committed step does not digest index.db');
 });
 
-test('the digest comes from an exactly pinned server, so a newer one is a reviewed change', () => {
-  // index-digest covers the columns the pinned server's tools read. `^0.3.0` could never reach
-  // 0.4, and nothing moved it, so the drift job stayed on 0.3.1 while the server went to
-  // 0.10.0 and read ten more columns. An exact pin says which server the digest is, and moves
-  // only by a commit that docs/MAINTAINING.md asks for whenever REQUIRED_COLUMNS grows.
+test("both digest steps run this repository's scripts/index-digest.ts on index.db", () => {
+  // The same script digests both indexes, so a change to the script alone never opens a refresh.
+  for (const id of ['committed', 'digests']) {
+    const script = stepScript(workflow(), id);
+    assert.match(script, /^\w+=\$\(node scripts\/index-digest\.ts index\.db\)$/m, `the ${id} step does not digest index.db with the script`);
+    assert.doesNotMatch(script, /tibiawiki-mcp/, `the ${id} step still calls the server`);
+  }
+});
+
+test('the server is pinned exactly, so a newer one is a reviewed change', () => {
+  // The pinned server builds the index with build-index and validates it with serve, so which
+  // server that is decides what the drift job publishes. `^0.3.0` could never reach 0.4, and
+  // nothing moved it, so the drift job stayed on 0.3.1 while the server went to 0.10.0. An exact
+  // pin says which server it is, and moves only by a commit that docs/MAINTAINING.md asks for
+  // whenever the server's indexer changes.
   const manifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as
     { devDependencies?: Record<string, string> };
   const pin = manifest.devDependencies?.['@tibia.sh/tibiawiki-mcp'];
@@ -373,44 +388,44 @@ test('the pr job commits as github-actions[bot]', () => {
   }
 });
 
-test('the committed digest step writes a digest only when index-digest printed one', () => {
+test('the committed digest step writes a digest only when the script printed one', () => {
   const script = stepScript(workflow(), 'committed');
-  const good = runStep(script, { commands: { [SERVER]: fakeServer(`${DIGEST_A}\n`) } });
+  const good = runStep(script, { files: fakeDigest(`${DIGEST_A}\n`) });
   assert.equal(good.status, 0, good.log);
   assert.equal(good.output, `digest=${DIGEST_A}\n`);
   for (const [what, stdout] of NOT_DIGESTS) {
-    const run = runStep(script, { commands: { [SERVER]: fakeServer(`${stdout}\n`) } });
-    assert.notEqual(run.status, 0, `the step passed when index-digest printed ${what}\n${run.log}`);
-    assert.equal(run.output, '', `the step wrote an output when index-digest printed ${what}`);
+    const run = runStep(script, { files: fakeDigest(`${stdout}\n`) });
+    assert.notEqual(run.status, 0, `the step passed when the script printed ${what}\n${run.log}`);
+    assert.equal(run.output, '', `the step wrote an output when the script printed ${what}`);
   }
-  const refused = runStep(script, { commands: { [SERVER]: fakeServer('', 1) } });
-  assert.notEqual(refused.status, 0, 'the step passed when index-digest refused the index');
-  assert.equal(refused.output, '', 'the step wrote an output when index-digest refused the index');
+  const refused = runStep(script, { files: fakeDigest('', 1) });
+  assert.notEqual(refused.status, 0, 'the step passed when the script refused the index');
+  assert.equal(refused.output, '', 'the step wrote an output when the script refused the index');
 });
 
 test('the rebuilt digest step compares the digests and hashes the index it would upload', () => {
   const script = stepScript(workflow(), 'digests');
-  const files = { 'index.db': 'rebuilt index' };
-  const changed = runStep(script, { files, commands: { [SERVER]: fakeServer(`${DIGEST_B}\n`) }, env: { COMMITTED: DIGEST_A } });
+  const index = { 'index.db': 'rebuilt index' };
+  const changed = runStep(script, { files: { ...index, ...fakeDigest(`${DIGEST_B}\n`) }, env: { COMMITTED: DIGEST_A } });
   assert.equal(changed.status, 0, changed.log);
   assert.equal(changed.output, `committed=${DIGEST_A}\nrebuilt=${DIGEST_B}\nsha256=${REBUILT_INDEX_SHA256}\nchanged=true\n`);
   assert.match(changed.log, new RegExp(`${DIGEST_A}[\\s\\S]*${DIGEST_B}`), 'the step does not log both digests');
 
-  const same = runStep(script, { files, commands: { [SERVER]: fakeServer(`${DIGEST_A}\n`) }, env: { COMMITTED: DIGEST_A } });
+  const same = runStep(script, { files: { ...index, ...fakeDigest(`${DIGEST_A}\n`) }, env: { COMMITTED: DIGEST_A } });
   assert.equal(same.status, 0, same.log);
   assert.equal(same.output, `committed=${DIGEST_A}\nrebuilt=${DIGEST_A}\nsha256=${REBUILT_INDEX_SHA256}\nchanged=false\n`);
 });
 
 test('the rebuilt digest step fails, and decides nothing, on a value that is not a digest', () => {
   const script = stepScript(workflow(), 'digests');
-  const files = { 'index.db': 'rebuilt index' };
+  const index = { 'index.db': 'rebuilt index' };
   for (const [what, value] of NOT_DIGESTS) {
-    const committed = runStep(script, { files, commands: { [SERVER]: fakeServer(`${DIGEST_B}\n`) }, env: { COMMITTED: value } });
+    const committed = runStep(script, { files: { ...index, ...fakeDigest(`${DIGEST_B}\n`) }, env: { COMMITTED: value } });
     assert.notEqual(committed.status, 0, `the step passed with ${what} as the committed digest\n${committed.log}`);
     assert.equal(committed.output, '', `the step wrote outputs with ${what} as the committed digest`);
-    const rebuilt = runStep(script, { files, commands: { [SERVER]: fakeServer(`${value}\n`) }, env: { COMMITTED: DIGEST_A } });
-    assert.notEqual(rebuilt.status, 0, `the step passed when index-digest printed ${what}\n${rebuilt.log}`);
-    assert.equal(rebuilt.output, '', `the step wrote outputs when index-digest printed ${what}`);
+    const rebuilt = runStep(script, { files: { ...index, ...fakeDigest(`${value}\n`) }, env: { COMMITTED: DIGEST_A } });
+    assert.notEqual(rebuilt.status, 0, `the step passed when the script printed ${what}\n${rebuilt.log}`);
+    assert.equal(rebuilt.output, '', `the step wrote outputs when the script printed ${what}`);
   }
 });
 

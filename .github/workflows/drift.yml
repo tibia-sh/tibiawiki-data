@@ -67,13 +67,14 @@ jobs:
         with:
           version: '0.12.4'
           enable-cache: false
-      # Before the build, which overwrites index.db in place.
+      # Before the build, which overwrites index.db in place. The digest covers every table and
+      # column but the per-row timestamp and database_info's run stamps, as the script says.
       - name: Digest the committed index
         id: committed
         run: |
-          digest=$(node_modules/.bin/tibiawiki-mcp index-digest index.db)
+          digest=$(node scripts/index-digest.ts index.db)
           if [[ ! $digest =~ ^[0-9a-f]{64}$ ]]; then
-            echo "index-digest did not print a SHA-256 hex digest for the committed index." >&2
+            echo "scripts/index-digest.ts did not print a SHA-256 hex digest for the committed index." >&2
             exit 1
           fi
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
@@ -89,7 +90,7 @@ jobs:
         env:
           COMMITTED: ${{ steps.committed.outputs.digest }}
         run: |
-          rebuilt=$(node_modules/.bin/tibiawiki-mcp index-digest index.db)
+          rebuilt=$(node scripts/index-digest.ts index.db)
           # The pr job checks the artifact it downloads against this.
           sha256=$(node -e 'process.stdout.write(require("node:crypto").createHash("sha256").update(require("node:fs").readFileSync("index.db")).digest("hex"))')
           # COMMITTED too: a misspelt output reference arrives as an empty string, and two
