@@ -109,6 +109,9 @@ is anything but `9.0.0+tibiash.1`. From `0.12.0`, the server's `build-index` run
 copy of tibiawiki-sql, and `+tibiash.1` marks that copy. The major version covers only the
 server's enrichment tables, and no version covers the tables tibiawiki-sql writes.
 
+The generator's tables can grow within a major. A published `^N` server never asks for a
+table or a column it does not know, so an index that only adds them ships in a minor.
+
 A generator upgrade does not bump the major. If you installed any published server that depends
 on `^N`, your next install gets every new `N.x` of this package. So before every publish, and in
 CI, the `oldest-consumer` job installs the oldest and the newest published `^N` server from npm,
