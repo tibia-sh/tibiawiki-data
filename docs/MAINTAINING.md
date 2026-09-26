@@ -105,9 +105,10 @@ its journal beside that. `.gitignore` excludes both, and must never exclude
 crawl.
 
 `pnpm test` pins the generator too. It fails for an index whose `database_info` `version`
-is anything but `9.0.0+tibiash.1`. From `0.12.0`, the server's `build-index` runs tibia.sh's
-copy of tibiawiki-sql. `+tibiash.1` marks that copy. The major version covers only the
-server's enrichment tables, and no version covers the tables tibiawiki-sql writes.
+is anything but the one `test/data.test.ts` names. From `0.12.0`, the server's `build-index`
+runs tibia.sh's copy of tibiawiki-sql, and the `+tibiash.N` suffix of that version marks the
+copy. The major version covers only the server's enrichment tables, and no version covers the
+tables tibiawiki-sql writes.
 
 The generator's tables can grow within a major, but only because of how the servers read them.
 Every published `^N` server checks that the tables and columns it requires are present, and
@@ -214,6 +215,10 @@ a test in `test/drift-workflow.test.ts` fails on a range. Bump it whenever the s
 indexer changes: `build-index`, its enrichment, its gates or the schema. `pnpm add -D`
 keeps the old range style of an existing entry, so write the exact version by hand, then
 run `pnpm install`.
+
+When the bump brings a new generator release, you change two pins: the exact server version in
+`package.json` and the generator version in `test/data.test.ts`. A generator bump no longer edits
+the README. The README links to the releases page of tibia.sh's copy and names no release.
 
 The drift job's digest is this repository's own `scripts/index-digest.ts`, so a bump never
 changes how an index is digested. When the new `build-index` produces other content, the
