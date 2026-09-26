@@ -105,8 +105,9 @@ its journal beside that. `.gitignore` excludes both, and must never exclude
 crawl.
 
 `pnpm test` pins the generator too. It fails for an index whose `database_info` `version`
-is anything but `9.0.0`. The major version covers only the server's enrichment tables,
-and no version covers the tables tibiawiki-sql writes.
+is anything but `9.0.0+tibiash.1`. From `0.12.0`, the server's `build-index` runs the tibia-sh
+copy of tibiawiki-sql, and `+tibiash.1` marks that copy. The major version covers only the
+server's enrichment tables, and no version covers the tables tibiawiki-sql writes.
 
 A generator upgrade does not bump the major. If you installed any published server that depends
 on `^N`, your next install gets every new `N.x` of this package. So before every publish, and in
@@ -119,7 +120,7 @@ is an error, every page carries the candidate index's `generate_time`, and every
 index comes back exactly once. `pnpm oldest-consumer` runs the same gate, and needs network
 access to npm.
 
-The sweep covers items only, not creatures, NPCs, quests or spells. So the `9.0.0` pin in
+The sweep covers items only, not creatures, NPCs, quests or spells. So the generator pin in
 `test/data.test.ts` stays as the explicit decision point for a generator upgrade.
 
 ### Drift
