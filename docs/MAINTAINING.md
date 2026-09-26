@@ -105,12 +105,15 @@ its journal beside that. `.gitignore` excludes both, and must never exclude
 crawl.
 
 `pnpm test` pins the generator too. It fails for an index whose `database_info` `version`
-is anything but `9.0.0+tibiash.1`. From `0.12.0`, the server's `build-index` runs the tibia-sh
-copy of tibiawiki-sql, and `+tibiash.1` marks that copy. The major version covers only the
+is anything but `9.0.0+tibiash.1`. From `0.12.0`, the server's `build-index` runs tibia.sh's
+copy of tibiawiki-sql. `+tibiash.1` marks that copy. The major version covers only the
 server's enrichment tables, and no version covers the tables tibiawiki-sql writes.
 
-The generator's tables can grow within a major. A published `^N` server never asks for a
-table or a column it does not know, so an index that only adds them ships in a minor.
+The generator's tables can grow within a major, but only because of how the servers read them.
+Every published `^N` server checks that the tables and columns it requires are present, and
+reads columns by name. So an index that only adds tables or columns ships in a minor. A change
+that would break a `^N` server is not a minor. That includes an added column, once a server reads
+columns by position or refuses columns it does not know.
 
 A generator upgrade does not bump the major. If you installed any published server that depends
 on `^N`, your next install gets every new `N.x` of this package. So before every publish, and in
