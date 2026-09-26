@@ -24,8 +24,8 @@ index with it. To ask questions over the data without installing anything, add t
 | `spell` | 211 |
 
 The counts are from the `3.0.3` snapshot. The tables come from tibia.sh's copy of
-[tibiawiki-sql](https://github.com/tibia-sh/tibiawiki-sql), which generates the file, and the
-server adds a few more for its own queries. The copy is based on
+[tibiawiki-sql](https://github.com/tibia-sh/tibiawiki-sql), which generates the file. The server
+adds a few more for its own queries. The copy is based on
 [tibiawiki-sql](https://github.com/Galarzaa90/tibiawiki-sql) by Allan Galarza, the original
 project. Images are not included, only links to them.
 
