@@ -48,38 +48,38 @@ const run = (args: string[]): { status: number | null; stdout: string; stderr: s
   spawnSync(process.execPath, [SCRIPT, ...args], { cwd: ROOT, encoding: 'utf8' });
 
 test('the same counts hold nothing', () => {
-  assert.deepEqual(holdReasons({ ...MAIN, creature_drop: 19_496 }, { ...MAIN, creature_drop: 19_496 }), []);
+  assert.deepEqual(holdReasons({ ...MAIN, creature_drop: 19_496 }, { ...MAIN, creature_drop: 19_496 }, []), []);
 });
 
 test('growth holds nothing, in a main table, a secondary table or a new one', () => {
-  assert.deepEqual(holdReasons({ ...MAIN, creature_drop: 5 }, { ...MAIN, item: 12_000, creature_drop: 9, npc_job: 3 }), []);
+  assert.deepEqual(holdReasons({ ...MAIN, creature_drop: 5 }, { ...MAIN, item: 12_000, creature_drop: 9, npc_job: 3 }, []), []);
 });
 
 test('a main table that lost exactly 1% holds nothing', () => {
-  assert.deepEqual(holdReasons({ ...MAIN, item: 10_000 }, { ...MAIN, item: 9900 }), []);
+  assert.deepEqual(holdReasons({ ...MAIN, item: 10_000 }, { ...MAIN, item: 9900 }, []), []);
 });
 
 test('a main table that lost just over 1% holds, naming the loss, the count and the percentage', () => {
-  assert.deepEqual(holdReasons(MAIN, { ...MAIN, item: 9650 }), ['item lost 150 of 9,800 rows (1.5%)']);
+  assert.deepEqual(holdReasons(MAIN, { ...MAIN, item: 9650 }, []), ['item lost 150 of 9,800 rows (1.5%)']);
   // 99 of 9,800 is 1.01%, over the line, and still reads with its one decimal.
-  assert.deepEqual(holdReasons(MAIN, { ...MAIN, item: 9701 }), ['item lost 99 of 9,800 rows (1.0%)']);
+  assert.deepEqual(holdReasons(MAIN, { ...MAIN, item: 9701 }, []), ['item lost 99 of 9,800 rows (1.0%)']);
 });
 
 test('a committed table missing from the rebuilt index holds', () => {
-  assert.deepEqual(holdReasons({ ...MAIN, npc_job: 12 }, MAIN), ['table npc_job is missing']);
+  assert.deepEqual(holdReasons({ ...MAIN, npc_job: 12 }, MAIN, []), ['table npc_job is missing']);
 });
 
 test('a secondary table that empties holds, and one that shrinks does not', () => {
-  assert.deepEqual(holdReasons({ ...MAIN, creature_drop: 19_496 }, { ...MAIN, creature_drop: 0 }),
+  assert.deepEqual(holdReasons({ ...MAIN, creature_drop: 19_496 }, { ...MAIN, creature_drop: 0 }, []),
     ['table creature_drop is empty, it had 19,496 rows']);
-  assert.deepEqual(holdReasons({ ...MAIN, creature_drop: 19_496 }, { ...MAIN, creature_drop: 1 }), []);
+  assert.deepEqual(holdReasons({ ...MAIN, creature_drop: 19_496 }, { ...MAIN, creature_drop: 1 }, []), []);
 });
 
 test('reasons come main tables first in their fixed order, then the other tables by name', () => {
   // creature comes before achievement in the fixed order and after it by name.
   const committed = { ...MAIN, npc_job: 3, creature_drop: 19_496 };
   const rebuilt = { ...MAIN, achievement: 500, creature: 2000, creature_drop: 0 };
-  assert.deepEqual(holdReasons(committed, rebuilt), [
+  assert.deepEqual(holdReasons(committed, rebuilt, []), [
     'creature lost 193 of 2,193 rows (8.8%)',
     'achievement lost 100 of 600 rows (16.7%)',
     'table creature_drop is empty, it had 19,496 rows',
@@ -88,13 +88,13 @@ test('reasons come main tables first in their fixed order, then the other tables
 });
 
 test('a main table with 0 committed rows never holds on the percentage, but holds when it goes missing', () => {
-  assert.deepEqual(holdReasons({ ...MAIN, spell: 0 }, { ...MAIN, spell: 0 }), []);
+  assert.deepEqual(holdReasons({ ...MAIN, spell: 0 }, { ...MAIN, spell: 0 }, []), []);
   const { spell: _spell, ...withoutSpell } = MAIN;
-  assert.deepEqual(holdReasons({ ...MAIN, spell: 0 }, withoutSpell), ['table spell is missing']);
+  assert.deepEqual(holdReasons({ ...MAIN, spell: 0 }, withoutSpell, []), ['table spell is missing']);
 });
 
 test('a main table that empties gets the empty reason only', () => {
-  assert.deepEqual(holdReasons(MAIN, { ...MAIN, npc: 0 }), ['table npc is empty, it had 1,245 rows']);
+  assert.deepEqual(holdReasons(MAIN, { ...MAIN, npc: 0 }, []), ['table npc is empty, it had 1,245 rows']);
 });
 
 test('each of the eight main tables holds when it loses more than 1%', () => {
@@ -112,7 +112,7 @@ test('each of the eight main tables holds when it loses more than 1%', () => {
   ];
   assert.deepEqual(cases.map(([name]) => name).sort(), Object.keys(MAIN).sort(), 'the cases do not cover every main table');
   for (const [name, after, reason] of cases) {
-    assert.deepEqual(holdReasons(MAIN, { ...MAIN, [name]: after }), [reason], `${name} did not hold`);
+    assert.deepEqual(holdReasons(MAIN, { ...MAIN, [name]: after }, []), [reason], `${name} did not hold`);
   }
 });
 
@@ -121,7 +121,16 @@ test('a committed table named constructor or __proto__ that goes missing holds a
   // counts are a plain object, which inherits both names without owning either.
   const committed = { ...MAIN, ...(JSON.parse('{"constructor": 4, "__proto__": 7}') as Record<string, number>) };
   assert.ok(Object.hasOwn(committed, '__proto__'), 'the fixture has no own __proto__ key');
-  assert.deepEqual(holdReasons(committed, { ...MAIN }), ['table __proto__ is missing', 'table constructor is missing']);
+  assert.deepEqual(holdReasons(committed, { ...MAIN }, []), ['table __proto__ is missing', 'table constructor is missing']);
+});
+
+test('each entry gone from the rebuilt schema holds, after the row count reasons and in the order given', () => {
+  assert.deepEqual(holdReasons(MAIN, MAIN, ['creature.race_id']), ['creature.race_id is gone from the rebuilt index']);
+  assert.deepEqual(holdReasons({ ...MAIN, npc_job: 12 }, MAIN, ['creature.race_id', 'npc_job']), [
+    'table npc_job is missing',
+    'creature.race_id is gone from the rebuilt index',
+    'npc_job is gone from the rebuilt index',
+  ]);
 });
 
 test('the command prints each reason on its own line, or nothing, and exits 0 either way', () => {
@@ -136,13 +145,37 @@ test('the command prints each reason on its own line, or nothing, and exits 0 ei
 
     const hold = run([committed, held]);
     assert.equal(hold.status, 0, hold.stderr);
-    assert.equal(hold.stdout, 'item lost 10 of 200 rows (5.0%)\ntable npc_job is missing\n');
+    assert.equal(hold.stdout, 'item lost 10 of 200 rows (5.0%)\ntable npc_job is missing\nnpc_job is gone from the rebuilt index\n');
     assert.equal(hold.stderr, '');
 
     const go = run([committed, grown]);
     assert.equal(go.status, 0, go.stderr);
     assert.equal(go.stdout, '');
     assert.equal(go.stderr, '');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the command holds on a column gone from the rebuilt index, with every row still there', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tibiawiki-data-drift-guard-'));
+  try {
+    const committed = join(dir, 'committed.db');
+    const rebuilt = join(dir, 'rebuilt.db');
+    makeIndex(committed, { item: 200, creature: 50 });
+    makeIndex(rebuilt, { item: 200, creature: 50 });
+    for (const [path, sql] of [[committed, 'alter table creature add column race_id integer'], [rebuilt, 'alter table item add column value integer']] as const) {
+      const db = new DatabaseSync(path);
+      try {
+        db.exec(sql);
+      } finally {
+        db.close();
+      }
+    }
+    const result = run([committed, rebuilt]);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, 'creature.race_id is gone from the rebuilt index\n', 'an added column held, or a removed one did not');
+    assert.equal(result.stderr, '');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

