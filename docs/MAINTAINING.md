@@ -208,7 +208,9 @@ the level says, pushes the rebuilt `index.db`, with the moved pin if there is on
 `chore: release a refreshed index as X.Y.Z` that carries both digests, or updates the one
 already open. When only the pin moved, the pull request carries `package.json` and
 `pnpm-lock.yaml` alone, at the version `main` has, is titled `chore: pin the server at X.Y.Z`,
-and says that merging it publishes nothing. It pushes and opens with a token of the tibia-sh
+and says that merging it publishes nothing. That holds only while npm lists that version, since
+`release.yml` publishes a version on `main` that npm lacks, so the job reads npm's version list
+first and ends red when it does not list it. It pushes and opens with a token of the tibia-sh
 App, so the pull request's CI starts by itself.
 [The tibia-sh App](RELEASING.md#the-tibia-sh-app) says what that token can do.
 

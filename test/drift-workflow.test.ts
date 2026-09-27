@@ -119,6 +119,55 @@ fi
 echo "package.json and pnpm-lock.yaml are the ones the build job built index.db with."
 `;
 
+/**
+ * The pr job's version step, word for word. A pin-only run keeps package.json's version, and that publishes nothing
+ * only while npm lists the version already, so the step reads npm's list on both paths and fails closed.
+ */
+const VERSION_RUN = String.raw`name=$(node -p 'require("./package.json").name')
+# The whole version list, read as release.yml reads it. npm exits non-zero when it
+# cannot read the list, and node throws unless it got a non-empty one. Either
+# assignment then ends this step red, so an outage never passes for an empty list.
+versions=$(npm view "$name" versions --json)
+version=$(node -e '
+  const fs = require("node:fs");
+  const [text, changed, level] = process.argv.slice(1);
+  if (changed !== "true" && changed !== "false") throw new Error("changed is neither true nor false: " + changed);
+  if (level !== "patch" && level !== "minor") throw new Error("level is neither patch nor minor: " + level);
+  const list = JSON.parse(text);
+  if (!Array.isArray(list)) throw new Error("npm printed no version list: " + text);
+  const manifest = JSON.parse(fs.readFileSync("package.json", "utf8"));
+  // Only x.y.z counts. release.yml cannot publish a prerelease, and npm leaves prereleases
+  // out when it checks a new version against latest.
+  const parse = (version) => /^(\d+)\.(\d+)\.(\d+)$/.exec(version)?.slice(1).map(Number);
+  const current = parse(manifest.version);
+  if (!current) throw new Error("package.json version " + manifest.version + " is not x.y.z");
+  const missing = "npm does not list " + manifest.version + " from package.json yet. Let its release finish, or fix it, then run drift again.";
+  if (changed === "false") {
+    // A pin-only run keeps the version, which npm must list already.
+    if (!list.includes(manifest.version)) throw new Error(missing);
+    console.log(manifest.version);
+  } else {
+    // The package major is SCHEMA_VERSION. The suite in the build job checked that on this commit.
+    const major = current[0];
+    const highest = list.map(parse).filter((v) => v && v[0] === major).sort((a, b) => b[1] - a[1] || b[2] - a[2])[0];
+    if (!highest) throw new Error("npm lists no " + major + ".x.y version");
+    // Above the highest version npm lists in the major, so npm does not have it.
+    const next = level === "minor" ? [major, highest[1] + 1, 0] : [major, highest[1], highest[2] + 1];
+    // A next version at or below package.json means npm does not list that version yet, so
+    // its release is pending or failed. A pull request that kept it would publish nothing
+    // once that release lands.
+    if (next[1] < current[1] || (next[1] === current[1] && next[2] <= current[2])) throw new Error(missing);
+    manifest.version = next.join(".");
+    fs.writeFileSync("package.json", JSON.stringify(manifest, null, 2) + "\n");
+    console.log(manifest.version);
+  }
+' "$versions" "$CHANGED" "$LEVEL")
+if [ "$CHANGED" = false ]; then
+  echo "The content did not change, so the version stays $version, which npm lists, and nothing is published."
+fi
+echo "version=$version" >> "$GITHUB_OUTPUT"
+`;
+
 const DIGEST_A = '18ca2b2bf2c566fa6c7006977dea3558309bea165cb7d567daac1766a28bd27d';
 const DIGEST_B = '95893758373511f414cf538f81b500c2c6bf9765704e0f0a0ff0aca9d21fbc61';
 
@@ -1391,6 +1440,8 @@ test('the pr job checks what the build job handed on, recomputes the pin and com
     'CHANGED: ${{ needs.build.outputs.changed }}',
     'LEVEL: ${{ needs.build.outputs.level }}',
   ]);
+  assert.equal(stepScript(workflow(), 'version'), VERSION_RUN, 'the version step runs another script');
+  assert.equal(stepIf(prStep('version')), undefined, 'the version step runs only sometimes');
 });
 
 test("the pr job's pnpm/setup installs pnpm alone and restores no cache", () => {
@@ -1557,15 +1608,77 @@ test('the version step sets the next minor when the rebuilt index grew its schem
   }
 });
 
-test('a pin-only run of the version step leaves the version as it is, and asks npm nothing', () => {
-  const run = runStep(stepScript(workflow(), 'version'), {
+/** Runs the version step for a pin-only run in a checkout at 3.2.1, with npm printing `npmStdout` and exiting `npmExit`. */
+const runPinOnlyVersion = (npmStdout: string, npmExit = 0) =>
+  runStep(stepScript(workflow(), 'version'), {
     files: { 'package.json': manifestWithPin('0.14.1', '3.2.1') },
+    commands: { npm: `process.stdout.write(${JSON.stringify(npmStdout)});\nprocess.exitCode = ${npmExit};\n` },
     env: { CHANGED: 'false', LEVEL: 'patch' },
   });
-  assert.equal(run.status, 0, run.log);
-  assert.equal(run.output, 'version=3.2.1\n');
-  assert.deepEqual(run.calls, [], 'the step asked npm for a version it does not change');
-  assert.equal(run.checkout['package.json'], manifestWithPin('0.14.1', '3.2.1'), 'package.json changed');
+
+test('a pin-only run of the version step keeps the version when npm lists it already', () => {
+  // Kept, the version publishes nothing once merged, because release.yml finds it on npm.
+  for (const versions of [['3.2.0', '3.2.1'], ['3.2.1', '3.2.2']]) {
+    const run = runPinOnlyVersion(`${JSON.stringify(versions)}\n`);
+    assert.equal(run.status, 0, `${versions.join(', ')} on npm\n${run.log}`);
+    assert.equal(run.output, 'version=3.2.1\n');
+    assert.deepEqual(run.calls, [{ command: 'npm', args: ['view', '@tibia.sh/tibiawiki-data', 'versions', '--json'] }]);
+    assert.equal(run.checkout['package.json'], manifestWithPin('0.14.1', '3.2.1'), 'package.json changed');
+    assert.match(run.log, /the version stays 3\.2\.1, which npm lists, and nothing is published/);
+  }
+});
+
+test('a pin-only run of the version step fails, and sets no version, when npm does not list it or cannot be read', () => {
+  // Merged with a version npm lacks, the push to main would start release.yml, and that would publish it.
+  const cases: Array<[string, string, number]> = [
+    ['npm does not list the version from package.json', '["3.2.0"]\n', 0],
+    ['npm lists only a prerelease of it', '["3.2.0", "3.2.1-rc.1"]\n', 0],
+    ['npm cannot read the registry', '', 1],
+    ['npm prints nothing', '', 0],
+    ['npm prints an empty list', '[]\n', 0],
+    ['npm prints something other than a list', '"3.2.1"\n', 0],
+    ['npm prints what is not JSON', 'npm error\n', 0],
+  ];
+  for (const [what, npmStdout, npmExit] of cases) {
+    const run = runPinOnlyVersion(npmStdout, npmExit);
+    assert.notEqual(run.status, 0, `the step passed when ${what}\n${run.log}`);
+    assert.equal(run.output, '', `the step wrote a version when ${what}`);
+    assert.equal(run.checkout['package.json'], manifestWithPin('0.14.1', '3.2.1'), `package.json changed when ${what}`);
+  }
+  const missing = runPinOnlyVersion('["3.2.0"]\n');
+  assert.match(missing.log, /npm does not list 3\.2\.1 from package\.json yet\. Let its release finish, or fix it, then run drift again\./,
+    'the step does not say npm lacks the version and what to do');
+});
+
+test('the version step checks changed and level itself', () => {
+  for (const [changed, level] of [['', 'patch'], ['yes', 'patch'], ['false', 'major'], ['false', '']]) {
+    const run = runStep(stepScript(workflow(), 'version'), {
+      files: { 'package.json': manifestWithPin('0.14.1', '3.2.1') },
+      commands: { npm: `process.stdout.write('["3.2.1"]\\n');\n` },
+      env: { CHANGED: changed!, LEVEL: level! },
+    });
+    assert.notEqual(run.status, 0, `the step passed with changed=${JSON.stringify(changed)} and level=${JSON.stringify(level)}\n${run.log}`);
+    assert.equal(run.output, '');
+  }
+});
+
+test('a pin-only run whose version npm does not list stops at the version step, before propose', () => {
+  // As the runner chains them: the version step fails, so propose, which needs its version, never runs.
+  const version = runStep(stepScript(workflow(), 'version'), {
+    files: { 'package.json': manifestWithPin('0.14.1', '3.2.1'), 'pnpm-lock.yaml': `${LOCK}server: 0.14.1\n` },
+    commands: { npm: `process.stdout.write('["3.2.0"]\\n');\n` },
+    env: { CHANGED: 'false', LEVEL: 'patch' },
+  });
+  assert.notEqual(version.status, 0, `the version step passed with 3.2.1 missing from npm\n${version.log}`);
+  assert.equal(stepOutputs(version.output)['version'], undefined, 'the version step handed propose a version');
+  // propose refuses the empty version the runner would give it, before git or gh.
+  const propose = runStep(stepScript(workflow(), 'propose'), {
+    files: version.checkout,
+    commands: { git: fakeGit(), gh: fakeGh({}) },
+    env: { ...PR_ENV, CHANGED: 'false', SERVER: '0.14.1', VERSION: '', GH_TOKEN: APP_TOKEN },
+  });
+  assert.notEqual(propose.status, 0, propose.log);
+  assert.deepEqual(propose.calls, [], 'propose pushed or opened something without a version');
 });
 
 test('a pin-only run proposes package.json and pnpm-lock.yaml alone, at the same version, and says nothing publishes', () => {
@@ -1581,11 +1694,12 @@ test('a pin-only run proposes package.json and pnpm-lock.yaml alone, at the same
 
   const version = runStep(stepScript(workflow(), 'version'), {
     files: recompute.checkout,
+    commands: { npm: `process.stdout.write('["3.2.0", "3.2.1"]\\n');\n` },
     env: { CHANGED: 'false', LEVEL: 'patch' },
   });
   assert.equal(version.status, 0, version.log);
   assert.equal(version.output, 'version=3.2.1\n', 'a pin-only run changed the version');
-  assert.deepEqual(version.calls, []);
+  assert.deepEqual(commandsOf(version.calls), ['npm']);
 
   const propose = runStep(stepScript(workflow(), 'propose'), {
     files: version.checkout,
