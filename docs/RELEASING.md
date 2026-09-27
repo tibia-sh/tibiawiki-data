@@ -215,15 +215,24 @@ dropped. Each comment links the run and says what happened:
 |---|---|
 | `The build job did not succeed.` and its result | `cancelled` means the job hit its 60 minute bound, most often a slow wiki, or someone cancelled the run. Run drift again. For `failure`, open the run and read the red step. A tripped gate in `pnpm build-index`, a failing `pnpm test`, a wiki the build could not read, or `The guard could not compare the indexes.` each end it there, before anything is pushed. Fix the cause, or run drift again once the wiki is back. |
 | `The pr job did not succeed.` and its result | `cancelled` means the job hit its 75 minute bound or someone cancelled the run. Auto-merge stays on, so check the drift pull request. For `failure`, open the run and read the red step. `npm does not list X.Y.Z from package.json yet` means the release of the version on `main` is still running or failed, so follow [When a release run fails](#when-a-release-run-fails) and run drift again once npm has it. `was closed without merging` means someone closed the pull request. `merged <commit>, not <commit>` means the pull request merged a commit other than the one this run pushed, so read `git log` on `main` for what landed. `is off. Merge it, or turn auto-merge on again, by hand` means someone or something turned auto-merge off during the wait: merge the pull request with Rebase and merge once its checks pass, or turn auto-merge on again with `gh pr merge <number> --auto --rebase`, and the merge publishes. `failed 3 times in a row` means `gh` could not read the pull request, so check it by hand. `has not merged 3600 seconds after auto-merge was on` means its checks failed or are still running: auto-merge stays on, so it merges by itself once they pass, for example after you re-run a check that failed for a reason outside the repository. A red `Get a token of the tibia-sh App` step, or `Bad credentials` from `gh`, means the App's key or its installation no longer works, as [The tibia-sh App](#the-tibia-sh-app) describes. |
+| `The build job did not succeed.`, with `npm did not serve server X.Y.Z within 900 seconds.` in `Pin the server` | The run was moving the pin to server X.Y.Z, and for 15 minutes npm either did not list that version's tarball or a `HEAD` on it did not answer 200. Nothing was built or pushed. Check the server's release run in tibiawiki-mcp and `npm view @tibia.sh/tibiawiki-mcp@X.Y.Z dist.tarball`. Once npm serves it, run drift again by hand. A scheduled run also picks it up when it is `latest`. |
+| `The build job did not succeed.`, with `The server-release dispatch asks for '…', not an x.y.z version.` in `Pin the server` | A `server-release` dispatch carried a payload version that is not `x.y.z`, and the step used none of it. Nothing was built or pushed. Fix the sender, tibiawiki-mcp's release workflow. Then run drift by hand, which moves the pin to npm's `latest`. |
+| `The pr job did not succeed.`, with a red `Check the build job's outputs` step | The build job handed on a value the `pr` job refuses: `changed`, `pin_moved` or `level` out of range, `Not a server version`, `moved the pin from A to B, which is not above it`, `kept the pin at B, but main pins A`, or `Neither the content nor the pin changed`. Nothing was pushed, and no token was minted. The build job runs the generator, so a value like this means either a mistake in `drift.yml`, such as a misspelt output, or a build job something tampered with. Read the build job's log, and in particular `Pin the server`. Run drift again only once you know which it was. |
+| `The pr job did not succeed.`, with `The recompute changed other files than package.json and pnpm-lock.yaml:` or `package.json changed in more than the pin of @tibia.sh/tibiawiki-mcp` in `Keep the recompute to the pin` | The `pr` job's own `pnpm add --lockfile-only` changed more than the server's pin. Nothing was pushed. That usually means a pnpm or `pnpm-workspace.yaml` change rewrote the manifests. Run the same command, `pnpm add -D --save-exact --lockfile-only --ignore-scripts --ignore-pnpmfile @tibia.sh/tibiawiki-mcp@X.Y.Z`, on a clean checkout of `main` and read `git diff`. When the extra change is right, land it in a reviewed pull request of its own, then run drift again. |
+| `The pr job did not succeed.`, with `The recomputed package.json hashes to …` or `The recomputed pnpm-lock.yaml hashes to …, but the build job built with …` in `Require the manifests the build job built with` | The manifests the `pr` job recomputed differ from the ones the build job installed and built `index.db` with, so the job refused to commit them. Nothing was pushed. A first-party release published between the two jobs can change the resolution, since `@tibia.sh/*` skips the cooldown, so run drift again. When it repeats, compare a full `pnpm add -D --save-exact` with the `--lockfile-only` one on a clean checkout. When those two agree, suspect the build job. |
 | `The refresh was held for review:` and its reasons | Follow the steps below. |
 | `The release workflow did not succeed.` and its conclusion | Open the run and find the red job. Follow [When a release run fails](#when-a-release-run-fails), [When the oldest-consumer job fails](#when-the-oldest-consumer-job-fails), [The hosting dispatch](#the-hosting-dispatch) or [The GitHub release](#the-github-release), whichever covers that job. |
 
 A held refresh has its reasons twice: in the comment, and at the top of the pull request's body,
-under **Held for review.** Each reason names a table, such as `item lost 120 of 9,800 rows (1.2%)`,
-`table quest is empty, it had 370 rows` or `table spell is missing`.
+under **Held for review.** Each reason names a table or a column, such as
+`item lost 120 of 9,800 rows (1.2%)`, `table quest is empty, it had 370 rows`,
+`table spell is missing` or `creature.race_id is gone from the rebuilt index`.
 
 1. Read the reasons, and find out whether the wiki really lost those pages, or whether the
-   generator or a bad week on the wiki dropped them.
+   generator or a bad week on the wiki dropped them. A table or column that is `gone from the
+   rebuilt index` is a schema removal, most often from a new generator or server the pin moved to.
+   A published `^N` server can require it, so do not merge that refresh. Close it, and when the
+   removal is meant, follow [Bumping the schema version](#bumping-the-schema-version).
 2. When the refresh is right, merge the pull request by hand once its checks pass, with Rebase and
    merge, as the drift job would. The merge publishes it like any other.
 3. When it is not, close the pull request and find the cause. While the cause lasts, every run that
@@ -237,7 +246,7 @@ Close the issue once each comment is dealt with, and the next alert opens a new 
 The alert issue covers the release of a refresh too. Once a drift pull request merges, the `pr` job
 ends green, and `release.yml` runs on the merge as on any push to `main`. When that run does not
 succeed, `alert.yml` comments on the issue. While npm lacks that version, the next drift run that
-finds a change fails at `Set version to the next patch npm does not have`, and comments as well.
+finds a change fails at `Set version to the next patch or minor npm does not have`, and comments as well.
 
 ## Bumping the schema version
 

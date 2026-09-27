@@ -253,6 +253,7 @@ test('the merge wait reads with github.token', () => {
   const wait = waitStep();
   assert.equal(stepIf(wait), "${{ steps.propose.outputs.wait == 'true' }}", 'the wait does not run on propose handing on wait=true alone');
   assert.deepEqual(sortedLines(under(stepBody(wait), 'env')), [
+    'CHANGED: ${{ needs.build.outputs.changed }}',
     'GH_TOKEN: ${{ github.token }}',
     'HEAD: ${{ steps.propose.outputs.head }}',
     'NUMBER: ${{ steps.propose.outputs.number }}',
@@ -932,6 +933,22 @@ test('a pull request that merged the pushed commit before the read after the pus
   assert.deepEqual(actions(closed.calls), ['lookup', 'push', 'update', 'reread', 'create', 'enable', 'poll']);
 });
 
+test('a merged refresh says release.yml publishes its version, and a merged pin-only pull request says nothing publishes', () => {
+  const refresh = runPr({ polls: [OPEN, MERGED] });
+  assert.equal(refresh.status, 0, refresh.log);
+  assert.match(refresh.log, new RegExp(`^Pull request #12 merged ${HEAD_SHA}, so release\\.yml publishes 3\\.0\\.1\\.$`, 'm'));
+  const pinOnly = runPr({ polls: [OPEN, MERGED] }, { ...PR_ENV, CHANGED: 'false', SERVER: '0.14.1' });
+  assert.equal(pinOnly.status, 0, pinOnly.log);
+  assert.match(pinOnly.log, new RegExp(`^Pull request #12 merged ${HEAD_SHA}, so release\\.yml publishes nothing: it moved the pin alone, and the version stays 3\\.0\\.1\\.$`, 'm'));
+  assert.doesNotMatch(pinOnly.log, /release\.yml publishes 3\.0\.1/, 'a pin-only merge says it publishes its version');
+  // The same, when the pull request merged the pushed commit before propose read it again.
+  const early = runPr({ open: '7 true\n', reread: MERGED }, { ...PR_ENV, CHANGED: 'false', SERVER: '0.14.1' });
+  assert.equal(early.status, 0, early.log);
+  assert.match(early.log, new RegExp(`^Pull request #7 merged ${HEAD_SHA} already, so release\\.yml publishes nothing: it moved the pin alone, and the version stays 3\\.0\\.1\\.$`, 'm'));
+  const earlyRefresh = runPr({ open: '7 true\n', reread: MERGED });
+  assert.match(earlyRefresh.log, new RegExp(`^Pull request #7 merged ${HEAD_SHA} already, so release\\.yml publishes 3\\.0\\.1\\.$`, 'm'));
+});
+
 test('the pr job fails when the pull request is closed unmerged, or still open at the deadline', () => {
   const closed = runPr({ polls: [OPEN, CLOSED] });
   assert.notEqual(closed.status, 0, `the step passed when the pull request was closed unmerged\n${closed.log}`);
@@ -1077,6 +1094,8 @@ test('the wait reads nothing when a value propose handed on, or one of its bound
     ['the poll interval is not a whole number', { POLL_SECONDS: 'x' }],
     ['the deadline is negative', { MERGE_DEADLINE_SECONDS: '-1' }],
     ['the retry pause is not a whole number', { RETRY_SECONDS: '1.5' }],
+    ['changed is empty', { CHANGED: '' }],
+    ['changed is neither true nor false', { CHANGED: 'yes' }],
   ];
   const script = stepScript(workflow(), 'wait');
   const valid = runStep(script, { commands: { gh: fakeGh({}) }, env: good });
