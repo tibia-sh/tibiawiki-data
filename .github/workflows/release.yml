@@ -41,14 +41,19 @@ jobs:
       # The npm the release job installs, so the gate packs and installs with that same npm.
       - run: npm install -g npm@12.0.2
       # Installs the pnpm that `packageManager` names, then runs `pnpm install --frozen-lockfile`.
-      # It leaves the pnpm store uncached. It caches its lockfile-verification record whatever the
-      # inputs say, and saves the record right after the install, before the gate runs the servers
-      # it installs from npm. When that save does not go through, its post step tries again at the
-      # end of the job, after them.
+      # It leaves the pnpm store uncached, and restores and saves no lockfile-verification record
+      # either. pnpm/setup keys that record on the hash of the file cache-dependency-path names,
+      # and restores it whatever the other inputs say. drift's build job writes a new
+      # pnpm-lock.yaml when it moves the server pin and then runs the generator, so the first
+      # record under that lockfile's key can come from the generator. This gate decides whether
+      # the release job publishes, so it trusts no such record. The path names a file the
+      # repository never holds, so the hash is empty and the action neither restores nor saves one.
+      # require-lockfile still finds pnpm-lock.yaml by itself.
       - uses: pnpm/setup@703c52620218391530e48b9e8870d5c0082e1b9b # v2.1.0
         with:
           install: true
           require-lockfile: true
+          cache-dependency-path: .release-restores-no-cache
       - run: pnpm oldest-consumer
 
   release:
@@ -104,14 +109,17 @@ jobs:
             echo "publish=true" >> "$GITHUB_OUTPUT"
           fi
       # Installs the pnpm that `packageManager` names, then runs `pnpm install --frozen-lockfile`.
-      # It leaves the pnpm store uncached. It caches its lockfile-verification record whatever the
-      # inputs say, and saves the record right after the install. When that save does not go
-      # through, its post step tries again at the end of the job.
+      # No dependency cache in the job that publishes: it leaves the pnpm store uncached, and
+      # restores and saves no lockfile-verification record, which drift's generator could have
+      # planted under a lockfile its pin step wrote, as the gate above says. The path names a file
+      # the repository never holds, so the hash is empty and the action neither restores nor saves
+      # one.
       - uses: pnpm/setup@703c52620218391530e48b9e8870d5c0082e1b9b # v2.1.0
         if: ${{ steps.registry.outputs.publish == 'true' }}
         with:
           install: true
           require-lockfile: true
+          cache-dependency-path: .release-restores-no-cache
       # The suite is the major-version guard: SCHEMA_VERSION, the package major and the
       # index's mcp_schema_version row must agree before anything is published.
       - run: pnpm test

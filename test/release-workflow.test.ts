@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { basename, dirname } from 'node:path';
 import { APP_TOKEN_ACTION, appTokenInputs, code, keys, read, runScripts, runStep, scalar, sortedLines, stepBody, stepIf, stepIndex, stepInputs, stepName, stepOutputs, steps, stepScript, under, workflowFiles } from './workflow.ts';
 import type { Call } from './workflow.ts';
@@ -233,6 +233,37 @@ test('only the ci.yml test and oldest-consumer jobs cache the pnpm store', () =>
   });
   assert.deepEqual(cached, ['ci.yml test cache: true', 'ci.yml oldest-consumer cache: true'],
     'pnpm/setup caches the store somewhere other than the ci.yml test and oldest-consumer jobs');
+});
+
+/**
+ * A file the repository never holds, which release.yml's pnpm/setup steps key their lockfile-verification record on,
+ * so they restore and save none.
+ */
+const RELEASE_NO_CACHE = '.release-restores-no-cache';
+
+test('every pnpm/setup step in every workflow has exactly the inputs its job may have', () => {
+  // pnpm/setup restores the lockfile-verification record keyed on the hash of cache-dependency-path, pnpm-lock.yaml by
+  // default, whatever its other inputs say. drift's build job writes a new pnpm-lock.yaml when it moves the server pin
+  // and then runs the generator, which could save the first record under that lockfile's key. So the jobs that decide
+  // or make a publish, release.yml's gate and its release job with id-token: write, and drift's pr job with the App
+  // token, key on a file that never exists and restore nothing. ci.yml's jobs and drift's build job hold no secret, no
+  // OIDC and no write token.
+  const expected: Record<string, string[]> = {
+    'ci.yml test': ['cache: true', 'install: true', 'require-lockfile: true'],
+    'ci.yml oldest-consumer': ['cache: true', 'install: true', 'require-lockfile: true'],
+    'drift.yml build': ['install: true', 'require-lockfile: true'],
+    'drift.yml pr': ['cache-dependency-path: .pr-job-restores-no-cache', 'install: false'],
+    'release.yml oldest-consumer': [`cache-dependency-path: ${RELEASE_NO_CACHE}`, 'install: true', 'require-lockfile: true'],
+    'release.yml release': [`cache-dependency-path: ${RELEASE_NO_CACHE}`, 'install: true', 'require-lockfile: true'],
+  };
+  const setups = pnpmSetupSteps();
+  const found = Object.fromEntries(setups.map(({ file, job, step }) => [`${file} ${job}`, sortedLines(stepInputs(step))]));
+  assert.equal(setups.length, Object.keys(found).length, 'a job has more than one pnpm/setup step');
+  assert.deepEqual(found, expected);
+});
+
+test(`no file ${RELEASE_NO_CACHE} exists, so release.yml's pnpm/setup steps find no lockfile to key a record on`, () => {
+  assert.ok(!existsSync(new URL(`../${RELEASE_NO_CACHE}`, import.meta.url)), `${RELEASE_NO_CACHE} exists`);
 });
 
 test('no run script in any workflow interpolates an expression', () => {

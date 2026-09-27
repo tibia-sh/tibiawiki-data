@@ -639,7 +639,11 @@ jobs:
             gh api --method PATCH "repos/$GITHUB_REPOSITORY/pulls/$number" -f title="$title" -f body="$body" --jq .html_url
             read_pull_request
             if [ "$merged" = true ] && [ "$sha" = "$head" ]; then
-              echo "Pull request #$number merged $head already, so release.yml publishes $VERSION."
+              if [ "$CHANGED" = true ]; then
+                echo "Pull request #$number merged $head already, so release.yml publishes $VERSION."
+              else
+                echo "Pull request #$number merged $head already, so release.yml publishes nothing: it moved the pin alone, and the version stays $VERSION."
+              fi
               exit 0
             fi
             armed=$auto
@@ -689,6 +693,7 @@ jobs:
           NUMBER: ${{ steps.propose.outputs.number }}
           HEAD: ${{ steps.propose.outputs.head }}
           VERSION: ${{ steps.version.outputs.version }}
+          CHANGED: ${{ needs.build.outputs.changed }}
         run: |
           if [[ ! $NUMBER =~ ^[0-9]+$ ]]; then
             echo "Not a pull request number: '$NUMBER'" >&2
@@ -700,6 +705,16 @@ jobs:
           fi
           if [[ ! $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "Not a version: '$VERSION'" >&2
+            exit 1
+          fi
+          # A refresh publishes its version once merged. A pin-only pull request keeps the version
+          # npm has, so its merge publishes nothing.
+          if [ "$CHANGED" = true ]; then
+            merged_means="release.yml publishes $VERSION"
+          elif [ "$CHANGED" = false ]; then
+            merged_means="release.yml publishes nothing: it moved the pin alone, and the version stays $VERSION"
+          else
+            echo "Changed is neither true nor false: '$CHANGED'" >&2
             exit 1
           fi
           # How often and how long the wait polls, and how long it pauses after a failed read,
@@ -751,7 +766,7 @@ jobs:
                 echo "::error::Pull request #$NUMBER merged $sha, not $HEAD, the commit this run pushed."
                 exit 1
               fi
-              echo "Pull request #$NUMBER merged $HEAD, so release.yml publishes $VERSION."
+              echo "Pull request #$NUMBER merged $HEAD, so $merged_means."
               exit 0
             fi
             if [ "$state" = closed ]; then
