@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { basename, dirname } from 'node:path';
-import { code, keys, read, runScripts, runStep, scalar, stepBody, stepIf, stepIndex, stepInputs, stepName, steps, stepScript, under, workflowFiles } from './workflow.ts';
+import { APP_TOKEN_ACTION, appTokenInputs, code, keys, read, runScripts, runStep, scalar, sortedLines, stepBody, stepIf, stepIndex, stepInputs, stepName, stepOutputs, steps, stepScript, under, workflowFiles } from './workflow.ts';
 import type { Call } from './workflow.ts';
 
 /**
@@ -35,24 +35,21 @@ const PUBLISH_ID = 'publish';
 /** The job that tells the hosting repository about the release, once npm accepted the publish. */
 const hostingJob = (): string => under(under(code(workflow()), 'jobs'), 'hosting');
 
-/** The hosting job's one step, which sends the dispatch. docs/RELEASING.md names it. */
+/** The hosting job's step that sends the dispatch. docs/RELEASING.md names it. */
 const DISPATCH_ID = 'dispatch';
 
-const dispatchStep = (): string => {
+const hostingStep = (id: string): string => {
   const list = steps(hostingJob());
-  return list[stepIndex(list, DISPATCH_ID)]!;
+  return list[stepIndex(list, id)]!;
 };
+
+const dispatchStep = (): string => hostingStep(DISPATCH_ID);
+
+/** The hosting job's first step, which mints the App token the dispatch sends with. */
+const tokenStep = (): string => hostingStep('token');
 
 /** The `::error::` lines a step's log carries, which are the lines GitHub shows as the job's errors. */
 const errorLines = (log: string): string[] => log.split('\n').filter((line) => line.startsWith('::error::'));
-
-/** A step's `$GITHUB_OUTPUT` as a map. Every line is `name=value`, or the calling test fails. */
-const outputs = (text: string): Record<string, string> =>
-  Object.fromEntries(text.split('\n').filter((line) => line !== '').map((line) => {
-    const at = line.indexOf('=');
-    assert.notEqual(at, -1, `an output line is not name=value: ${line}`);
-    return [line.slice(0, at), line.slice(at + 1)];
-  }));
 
 /**
  * The section of docs/RELEASING.md an `::error::` line names, as `"<section>" in
@@ -433,13 +430,12 @@ test('release runs take turns, and none is cancelled or dropped', () => {
 const RELEASED_GATE = "${{ needs.release.outputs.released == 'true' }}";
 
 test('the hosting dispatch is a job of its own, run once npm accepted the publish', () => {
-  // The token is a secret of the release-trigger environment. A job gets an environment's secrets
-  // only by naming it, and naming one in the release job would put an environment claim in its
-  // OIDC token, which npm's trusted publisher rejects. The job runs only once the release job
-  // published, so a push that publishes nothing skips it. It runs no action and checks nothing
-  // out beside the token. Its one step runs under the default bash -e, as the checks below run
-  // its script: the existence check's test keeps every shell override out of the file, and the
-  // script never turns -e off.
+  // It runs in the release-trigger environment, which deploys from main alone, and naming an environment in the
+  // release job would put an environment claim in its OIDC token, which npm's trusted publisher rejects. The job
+  // runs only once the release job published, so a push that publishes nothing skips it. It checks nothing out and
+  // runs no action but the one that mints the token. Its dispatch step runs under the default bash -e, as the checks
+  // below run its script: the existence check's test keeps every shell override out of the file, and the script
+  // never turns -e off.
   const hosting = hostingJob();
   assert.notEqual(hosting, '', 'the workflow has no hosting job');
   assert.equal(scalar(hosting, 'needs'), 'release', 'the hosting job does not need the release job');
@@ -452,9 +448,10 @@ test('the hosting dispatch is a job of its own, run once npm accepted the publis
   assert.equal(scalar(permissions, 'contents'), 'read', 'the hosting job holds more than contents: read');
   assert.deepEqual(keys(under(hosting, 'env')), ['VERSION'], 'the hosting job sets something besides VERSION');
   assert.equal(scalar(under(hosting, 'env'), 'VERSION'), '${{ needs.release.outputs.version }}', 'VERSION is not the version the release job published');
-  assert.doesNotMatch(hosting, /^ *(?:- +)?uses:/m, 'the hosting job runs an action');
+  assert.deepEqual([...hosting.matchAll(/^ *(?:- +)?uses: *([^@\s]+)@/gm)].map((match) => match[1]), [APP_TOKEN_ACTION],
+    'the hosting job runs an action besides the one that mints the App token');
   assert.equal(scalar(releaseJob(), 'environment'), undefined, 'the release job names an environment');
-  assert.equal(steps(hosting).length, 1, 'expected exactly one hosting job step');
+  assert.equal(steps(hosting).length, 2, 'expected exactly two hosting job steps, the token and the dispatch');
   const step = dispatchStep();
   assert.equal(scalar(stepBody(step), 'name'), 'Tell mcp.tibia.sh about the release', 'the dispatch step is not named as docs/RELEASING.md names it');
   assert.equal(stepIf(step), undefined, `${stepName(step)} sets if`);
@@ -467,20 +464,40 @@ test('the hosting dispatch is a job of its own, run once npm accepted the publis
   assert.doesNotMatch(stepScript(workflow(), DISPATCH_ID), /\bset +\+[a-z]*e|\bset +\+o +errexit\b/, `${stepName(step)} turns off -e`);
 });
 
-test('the hosting and drift tokens are the only secrets any workflow references, and the hosting one reaches the dispatch step through its env', () => {
-  // Written into a run script, a secret would be pasted into the shell as code. In a step's env
-  // it is a variable only the processes of that step see, and gh reads GH_TOKEN by itself, so the
-  // script never names the token. The release job publishes through OIDC. The drift workflow's
-  // pr job writes with DRIFT_TOKEN, which test/drift-workflow.test.ts pins to its propose step.
-  const references = workflowFiles().flatMap((file) =>
-    code(read(file)).split('\n').filter((line) => /\bsecrets\b/.test(line)).map((line) => `${file}: ${line.trim()}`));
-  assert.deepEqual(references.sort(), [
-    'drift.yml: GH_TOKEN: ${{ secrets.DRIFT_TOKEN }}',
-    'release.yml: GH_TOKEN: ${{ secrets.HOSTING_DISPATCH_TOKEN }}',
+test('the hosting dispatch uses an App token limited to mcp.tibia.sh', () => {
+  // A repository_dispatch needs contents: write on the repository it goes to, and nothing else. The token is minted
+  // right before the dispatch, reaches it alone through its env, and gh reads GH_TOKEN by itself, so the script never
+  // names it.
+  const token = tokenStep();
+  assert.equal(scalar(stepBody(token), 'uses')?.replace(/@.*$/, ''), APP_TOKEN_ACTION, 'the token step does not mint an App token');
+  assert.deepEqual(sortedLines(stepInputs(token)), appTokenInputs('mcp.tibia.sh', { contents: 'write' }),
+    'the token step does not ask for contents write on mcp.tibia.sh alone');
+  assert.equal(under(stepBody(token), 'env'), '', 'the token step has an env');
+  assert.equal(stepIf(token), undefined, 'the token step has an if');
+  const list = steps(hostingJob());
+  assert.equal(stepIndex(list, DISPATCH_ID), stepIndex(list, 'token') + 1, 'the token step is not right before the dispatch');
+  assert.equal(scalar(under(stepBody(dispatchStep()), 'env'), 'GH_TOKEN'), '${{ steps.token.outputs.token }}',
+    'the App token does not reach the dispatch step through its env as GH_TOKEN');
+  assert.deepEqual(code(workflow()).split('\n').filter((line) => /\bsteps\.token\b/.test(line)).map((line) => line.trim()),
+    ['GH_TOKEN: ${{ steps.token.outputs.token }}'], 'the App token is read somewhere other than the dispatch');
+  assert.doesNotMatch(stepScript(workflow(), DISPATCH_ID), /GH_TOKEN|TIBIA_SH_APP/, 'the dispatch script names its token');
+});
+
+test('no workflow reads a PAT secret', () => {
+  // The one secret any workflow reads is the tibia-sh App's key, which each token step takes as an input: drift's pr
+  // job for tibiawiki-data, and the hosting job for mcp.tibia.sh. The App's client ID is the one variable. The release
+  // job publishes through OIDC, and every other job holds github.token or nothing. Written into a run script, a secret
+  // would be pasted into the shell as code, so it is never there either.
+  const references = (context: string) => workflowFiles().flatMap((file) =>
+    code(read(file)).split('\n').filter((line) => new RegExp(`\\b${context}\\b`).test(line)).map((line) => `${file}: ${line.trim()}`)).sort();
+  assert.deepEqual(references('secrets'), [
+    'drift.yml: private-key: ${{ secrets.TIBIA_SH_APP_PRIVATE_KEY }}',
+    'release.yml: private-key: ${{ secrets.TIBIA_SH_APP_PRIVATE_KEY }}',
   ]);
-  assert.equal(scalar(under(stepBody(dispatchStep()), 'env'), 'GH_TOKEN'), '${{ secrets.HOSTING_DISPATCH_TOKEN }}',
-    'the token does not reach the dispatch step through its env as GH_TOKEN');
-  assert.doesNotMatch(stepScript(workflow(), DISPATCH_ID), /GH_TOKEN|HOSTING_DISPATCH_TOKEN/, 'the dispatch script names its token');
+  assert.deepEqual(references('vars'), [
+    'drift.yml: client-id: ${{ vars.TIBIA_SH_APP_CLIENT_ID }}',
+    'release.yml: client-id: ${{ vars.TIBIA_SH_APP_CLIENT_ID }}',
+  ]);
 });
 
 /** The token the dispatch runs with in these checks. The stand-in gh reads no token. */
@@ -837,7 +854,7 @@ test('the notes step writes the notes against the previous release, and hands on
   // release's index out of the tag rather than from the network.
   const run = runNotes();
   assert.equal(run.status, 0, run.log);
-  const out = outputs(run.output);
+  const out = stepOutputs(run.output);
   assert.deepEqual(Object.keys(out), ['previous', 'notes'], 'the step does not hand on exactly previous and notes');
   assert.equal(out['previous'], 'v3.0.3', 'the step did not hand on the tag the script found');
   const temp = dirname(out['notes']!);
@@ -857,7 +874,7 @@ test('the notes step writes the notes without a previous release when no tag is 
   // The first release of a major has no tag below it, and that is not a failure.
   const run = runNotes({ tags: [], previous: '' });
   assert.equal(run.status, 0, run.log);
-  const out = outputs(run.output);
+  const out = stepOutputs(run.output);
   assert.equal(out['previous'], '', 'the step handed on a previous tag although there is none');
   assert.deepEqual(run.pipeline, [TAG_LIST_CALL, PREVIOUS_TAG_CALL]);
   assert.deepEqual(run.rest, [{ command: 'node', args: ['scripts/release-notes.ts', '3.0.4', 'index.db'] }]);

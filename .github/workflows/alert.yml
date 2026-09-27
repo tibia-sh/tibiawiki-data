@@ -1,0 +1,57 @@
+name: alert
+
+# Tells the maintainer when a release run, which only a push to main starts, did not pass. It
+# comments on the open issue titled `Automation needs a look` that github-actions[bot] opened, or
+# opens that issue assigned to drptbl.
+# drift.yml writes the same issue from its own alert job, for a drift run that fails or holds a
+# refresh, so this workflow watches release.yml alone. workflow_run matches a workflow by its name:,
+# so `release` below is release.yml's. Every job that writes the issue shares the concurrency group
+# automation-alert, waits its turn and is never replaced, so no alert is dropped and no second issue
+# is opened.
+on:
+  workflow_run:
+    workflows: [release]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  alert:
+    if: ${{ github.event.workflow_run.conclusion != 'success' && github.event.workflow_run.conclusion != 'skipped' && github.event.workflow_run.conclusion != 'neutral' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Comments on one issue with github.token. It checks nothing out and runs no action.
+    permissions:
+      issues: write
+    concurrency: { group: automation-alert, cancel-in-progress: false, queue: max }
+    steps:
+      # The event's fields reach the shell through env. The issue is found and opened as drift.yml's
+      # alert job finds and opens it: the list, not the search API, which lags, and only an open
+      # issue with this title that github-actions[bot] opened counts, not a pull request. A failed
+      # list ends the step, so it never opens a second issue.
+      - name: Comment on the alert issue, or open it
+        id: alert
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          WORKFLOW: ${{ github.event.workflow_run.name }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          title='Automation needs a look'
+          text=$(printf 'Run: %s\n\nThe %s workflow did not succeed. Its conclusion is %s.' "$RUN_URL" "$WORKFLOW" "$CONCLUSION")
+          issues="$RUNNER_TEMP/issues.json"
+          gh api "repos/$GH_REPO/issues?state=open&per_page=100" --paginate --slurp > "$issues"
+          number=$(node -e '
+            const [file, title] = process.argv.slice(1);
+            const found = JSON.parse(require("node:fs").readFileSync(file, "utf8")).flat().find((issue) =>
+              issue.title === title && issue.user?.login === "github-actions[bot]" && issue.pull_request === undefined);
+            if (found) process.stdout.write(String(found.number));
+          ' "$issues" "$title")
+          if [ -n "$number" ]; then
+            gh api --method POST "repos/$GH_REPO/issues/$number/comments" -f body="$text" --jq .html_url
+          else
+            intro='The drift and release workflows comment here when a run on main does not succeed, and drift when it holds a refresh for review. Close this issue once each comment is dealt with, and the next alert opens a new one.'
+            gh api --method POST "repos/$GH_REPO/issues" -f title="$title" -f 'assignees[]=drptbl' \
+              -f body="$(printf '%s\n\n%s' "$intro" "$text")" --jq .html_url
+          fi

@@ -2,12 +2,12 @@ name: drift
 
 # Rebuilds index.db from the live wiki and compares its content with the committed index.
 # When the content changed, it pushes drift/index with the rebuilt index and the next patch
-# version, opens or updates its pull request, turns on auto-merge and waits for the merge.
-# The ruleset merges it once test and oldest-consumer pass, and that merge publishes through
-# release.yml. Nothing here publishes by itself. A refresh that loses rows, as
+# version, opens or updates its pull request as the tibia-sh App, turns on auto-merge and waits
+# for the merge. The ruleset merges it once test and oldest-consumer pass, and that merge
+# publishes through release.yml. Nothing here publishes by itself. A refresh that loses rows, as
 # scripts/drift-guard.ts decides, is held instead: its pull request stays open with auto-merge
 # off until a person merges or closes it. A run on main that fails or holds a refresh comments
-# on one issue, assigned to the maintainer.
+# on the one alert issue, which alert.yml also writes for release.yml, assigned to the maintainer.
 
 on:
   schedule:
@@ -163,14 +163,15 @@ jobs:
     runs-on: ubuntu-latest
     # 60 minutes of it are the wait for the merge, since oldest-consumer takes up to 45.
     timeout-minutes: 75
-    # The one job that writes the repository, and only through DRIFT_TOKEN, a fine-grained token
-    # with Contents and Pull requests on this repository alone. The drift environment gives it to
-    # runs on main only. A push, a pull request or a merge made with github.token starts no
-    # workflow, so the pull request's CI and release.yml would never run. The job runs no pnpm
-    # script and nothing from the artifact, only git, gh, npm view and node one-liners.
+    # The one job that writes the repository, and only through a token of the tibia-sh App, with
+    # contents and pull requests write on this repository alone. The drift environment deploys
+    # from main only. A push, a pull request or a merge made with github.token starts no workflow,
+    # so the pull request's CI and release.yml would never run. The job runs no pnpm script and
+    # nothing from the artifact, only git, gh, npm view and node one-liners.
     environment: drift
     permissions:
-      contents: read         # the checkout. The token does every write.
+      contents: read         # the checkout. The App token does every write.
+      pull-requests: read    # the wait for the merge, which reads with github.token
     steps:
       # No ref: the commit that triggered the run, which is the one the build job rebuilt.
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
@@ -234,11 +235,26 @@ jobs:
             console.log(manifest.version);
           ' "$versions")
           echo "version=$version" >> "$GITHUB_OUTPUT"
-      # The only step that gets the token.
-      - name: Push drift/index, open or update its pull request, and get it merged
+      # A token of the tibia-sh App for this repository alone, with contents and pull requests
+      # write, which expires within the hour. The pull request it opens runs CI, and the merge
+      # auto-merge makes for it starts release.yml, which neither would with github.token. It is
+      # minted after the steps that read the artifact and npm, so none of them runs with it.
+      - name: Get a token of the tibia-sh App
+        id: token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.TIBIA_SH_APP_CLIENT_ID }}
+          private-key: ${{ secrets.TIBIA_SH_APP_PRIVATE_KEY }}
+          owner: tibia-sh
+          repositories: tibiawiki-data
+          permission-contents: write
+          permission-pull-requests: write
+      # The only step that gets the App token. It ends once auto-merge is on, and hands the wait
+      # the pull request and the commit it pushed.
+      - name: Push drift/index, open or update its pull request, and turn on auto-merge
         id: propose
         env:
-          GH_TOKEN: ${{ secrets.DRIFT_TOKEN }}
+          GH_TOKEN: ${{ steps.token.outputs.token }}
           VERSION: ${{ steps.version.outputs.version }}
           COMMITTED: ${{ needs.build.outputs.committed }}
           REBUILT: ${{ needs.build.outputs.rebuilt }}
@@ -268,17 +284,6 @@ jobs:
             echo "The refresh is held, but no reason came with it." >&2
             exit 1
           fi
-          # How often and how long the wait for the merge polls, and how long it pauses after a
-          # failed read, from the environment so the tests can shorten them.
-          poll=${POLL_SECONDS:-30}
-          limit=${MERGE_DEADLINE_SECONDS:-3600}
-          retry=${RETRY_SECONDS:-10}
-          for value in "$poll" "$limit" "$retry"; do
-            if [[ ! $value =~ ^[0-9]+$ ]]; then
-              echo "Not a whole number of seconds: '$value'" >&2
-              exit 1
-            fi
-          done
 
           # The open pull request from drift/index, if there is one, and whether it has auto-merge
           # on, before anything is pushed.
@@ -382,50 +387,99 @@ jobs:
           if [ "$armed" != true ]; then
             gh pr merge "$number" --auto --rebase
           fi
-          # A red check leaves the pull request open, and the run red, rather than a green run
-          # beside a pull request nobody sees. Only a merge of the commit this run pushed counts.
-          echo "Waiting up to $limit seconds for pull request #$number to merge $head."
+          {
+            echo "number=$number"
+            echo "head=$head"
+            echo "wait=true"
+          } >> "$GITHUB_OUTPUT"
+      # A red check leaves the pull request open, and the run red, rather than a green run beside a
+      # pull request nobody sees. Only a merge of the commit propose pushed counts. The wait reads
+      # with github.token, since the App token expires within the hour and the wait can take all of
+      # it. It only reads: auto-merge turned on with github.token would merge as
+      # github-actions[bot], and that push would start no release.yml.
+      - name: Wait for the pull request to merge the pushed commit
+        id: wait
+        if: ${{ steps.propose.outputs.wait == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NUMBER: ${{ steps.propose.outputs.number }}
+          HEAD: ${{ steps.propose.outputs.head }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if [[ ! $NUMBER =~ ^[0-9]+$ ]]; then
+            echo "Not a pull request number: '$NUMBER'" >&2
+            exit 1
+          fi
+          if [[ ! $HEAD =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Not a commit: '$HEAD'" >&2
+            exit 1
+          fi
+          if [[ ! $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Not a version: '$VERSION'" >&2
+            exit 1
+          fi
+          # How often and how long the wait polls, and how long it pauses after a failed read,
+          # from the environment so the tests can shorten them.
+          poll=${POLL_SECONDS:-30}
+          limit=${MERGE_DEADLINE_SECONDS:-3600}
+          retry=${RETRY_SECONDS:-10}
+          for value in "$poll" "$limit" "$retry"; do
+            if [[ ! $value =~ ^[0-9]+$ ]]; then
+              echo "Not a whole number of seconds: '$value'" >&2
+              exit 1
+            fi
+          done
+
+          # Reads pull request $NUMBER into state, merged, auto and sha, as propose does. It returns
+          # non-zero when gh fails, and ends the step when gh answers with another shape.
+          read_pull_request() {
+            local view
+            view=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$NUMBER" --jq '"\(.state) \(.merged) \(.auto_merge != null) \(.head.sha)"') || return 1
+            if [[ ! $view =~ ^(open|closed)\ (true|false)\ (true|false)\ ([0-9a-f]{40})$ ]]; then
+              echo "::error::Reading pull request #$NUMBER printed '$view'."
+              exit 1
+            fi
+            state=${BASH_REMATCH[1]}
+            merged=${BASH_REMATCH[2]}
+            auto=${BASH_REMATCH[3]}
+            sha=${BASH_REMATCH[4]}
+          }
+
+          echo "Waiting up to $limit seconds for pull request #$NUMBER to merge $HEAD."
           deadline=$((SECONDS + limit))
           failed=0
-          rearmed=false
           while :; do
             # gh can fail for a moment in an hour of reads. Three failed reads in a row end the
             # wait, and a good read starts the count again.
             if ! read_pull_request; then
               failed=$((failed + 1))
               if ((failed >= 3)); then
-                echo "::error::Reading pull request #$number failed 3 times in a row."
+                echo "::error::Reading pull request #$NUMBER failed 3 times in a row."
                 exit 1
               fi
-              echo "Reading pull request #$number failed, so it is read again in $retry seconds."
+              echo "Reading pull request #$NUMBER failed, so it is read again in $retry seconds."
               sleep "$retry"
               continue
             fi
             failed=0
             if [ "$merged" = true ]; then
-              if [ "$sha" != "$head" ]; then
-                echo "::error::Pull request #$number merged $sha, not $head, the commit this run pushed."
+              if [ "$sha" != "$HEAD" ]; then
+                echo "::error::Pull request #$NUMBER merged $sha, not $HEAD, the commit this run pushed."
                 exit 1
               fi
-              echo "Pull request #$number merged $head, so release.yml publishes $VERSION."
+              echo "Pull request #$NUMBER merged $HEAD, so release.yml publishes $VERSION."
               exit 0
             fi
             if [ "$state" = closed ]; then
-              echo "::error::Pull request #$number was closed without merging."
+              echo "::error::Pull request #$NUMBER was closed without merging."
               exit 1
             fi
-            # Auto-merge found off is turned on again once, as the hosting repository's bump does.
             if [ "$auto" = false ]; then
-              if [ "$rearmed" = true ]; then
-                echo "::error::Auto-merge on pull request #$number was found off a second time."
-                exit 1
-              fi
-              echo "Auto-merge on pull request #$number was found off, so it is turned on again."
-              gh pr merge "$number" --auto --rebase
-              rearmed=true
+              echo "::error::Auto-merge on pull request #$NUMBER is off. Merge it, or turn auto-merge on again, by hand."
+              exit 1
             fi
             if ((SECONDS + poll >= deadline)); then
-              echo "::error::Pull request #$number has not merged $limit seconds after auto-merge was on. Its checks may have failed."
+              echo "::error::Pull request #$NUMBER has not merged $limit seconds after auto-merge was on. Its checks may have failed."
               exit 1
             fi
             sleep "$poll"
@@ -440,9 +494,12 @@ jobs:
     if: ${{ always() && github.ref == 'refs/heads/main' && (needs.build.result != 'success' || (needs.pr.result != 'success' && needs.pr.result != 'skipped') || needs.build.outputs.hold == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    # Comments on one issue with github.token. It checks nothing out and runs no action.
+    # Comments on one issue with github.token. It checks nothing out and runs no action. It takes
+    # turns with alert.yml, which writes the same issue, and none of their waiting runs is replaced,
+    # so no alert is dropped and no second issue is opened.
     permissions:
       issues: write
+    concurrency: { group: automation-alert, cancel-in-progress: false, queue: max }
     steps:
       - name: Comment on the alert issue, or open it
         id: alert
@@ -453,7 +510,7 @@ jobs:
           HOLD: ${{ needs.build.outputs.hold }}
           REASONS: ${{ needs.build.outputs.reasons }}
         run: |
-          title='The drift job needs a look'
+          title='Automation needs a look'
           text="Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           said=false
           if [ "$BUILD_RESULT" != success ]; then
@@ -478,6 +535,7 @@ jobs:
           # and anyone can open an issue with this title, so only one github-actions[bot] opened
           # counts. A failed list ends the step here, so it never opens a second issue. The pages go
           # to a file, since a page of issue bodies can be longer than one argument may be.
+          # alert.yml finds and opens the issue with this same program and intro.
           issues="$RUNNER_TEMP/issues.json"
           gh api "repos/$GITHUB_REPOSITORY/issues?state=open&per_page=100" --paginate --slurp > "$issues"
           number=$(node -e '
@@ -489,7 +547,7 @@ jobs:
           if [ -n "$number" ]; then
             gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$number/comments" -f body="$text" --jq .html_url
           else
-            intro='The drift workflow comments here when a run on main fails or holds a refresh for review. Close this issue once each comment is dealt with, and the next alert opens a new one.'
+            intro='The drift and release workflows comment here when a run on main does not succeed, and drift when it holds a refresh for review. Close this issue once each comment is dealt with, and the next alert opens a new one.'
             gh api --method POST "repos/$GITHUB_REPOSITORY/issues" -f title="$title" -f 'assignees[]=drptbl' \
               -f body="$(printf '%s\n\n%s' "$intro" "$text")" --jq .html_url
           fi
