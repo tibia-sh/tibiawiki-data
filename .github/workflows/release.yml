@@ -213,10 +213,10 @@ jobs:
           fi
 
   # Tells tibia-sh/mcp.tibia.sh about the release, so its bump.yml pins the version and deploys it.
-  # A job of its own, because the token is a secret of the release-trigger environment, and naming
-  # that environment in the release job would put an environment claim in its OIDC token, which
-  # npm's trusted publisher rejects. It runs only once the release job published, so a push that
-  # publishes nothing skips it.
+  # A job of its own, because it mints a token of the tibia-sh App in the release-trigger
+  # environment, which deploys from main only, and naming that environment in the release job would
+  # put an environment claim in its OIDC token, which npm's trusted publisher rejects. It runs only
+  # once the release job published, so a push that publishes nothing skips it.
   hosting:
     needs: release
     if: ${{ needs.release.outputs.released == 'true' }}
@@ -228,6 +228,17 @@ jobs:
     env:
       VERSION: ${{ needs.release.outputs.version }}
     steps:
+      # A token of the tibia-sh App for mcp.tibia.sh alone, with contents write, which a
+      # repository_dispatch needs, and which expires within the hour.
+      - name: Get a token of the tibia-sh App
+        id: token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.TIBIA_SH_APP_CLIENT_ID }}
+          private-key: ${{ secrets.TIBIA_SH_APP_PRIVATE_KEY }}
+          owner: tibia-sh
+          repositories: mcp.tibia.sh
+          permission-contents: write
       # gh api exits non-zero on an HTTP error and prints it, and timeout stops a request that hangs
       # after 120 seconds, or kills it 10 seconds later if it ignores that. A dispatch that got through
       # twice is harmless, because bump.yml finds the version pinned or its pull request open, so a
@@ -237,7 +248,7 @@ jobs:
       - name: Tell mcp.tibia.sh about the release
         id: dispatch
         env:
-          GH_TOKEN: ${{ secrets.HOSTING_DISPATCH_TOKEN }}
+          GH_TOKEN: ${{ steps.token.outputs.token }}
         run: |
           if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::The published version must look like 1.2.3, and this run has \"$VERSION\"."

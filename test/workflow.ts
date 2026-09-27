@@ -43,6 +43,26 @@ export const under = (yaml: string, key: string): string => {
   return new RegExp(`^ {${depth}}${key}:\\n((?: {${depth + 1},}.*(?:\\n|$))*)`, 'm').exec(yaml)?.[1] ?? '';
 };
 
+/** A block as sorted, trimmed lines, such as a permissions block's `scope: level` or an env's `NAME: value`. */
+export const sortedLines = (block: string): string[] =>
+  block.split('\n').map((line) => line.trim()).filter((line) => line !== '').sort();
+
+/** The action that mints a token of the tibia-sh App, without its commit, which the pin tests check. */
+export const APP_TOKEN_ACTION = 'actions/create-github-app-token';
+
+/**
+ * What a token step passes, as sorted lines: the App by its client ID and private key, the tibia-sh owner, the one
+ * repository its job writes, and the permissions that job needs, each as `permission-<name>: <level>`.
+ */
+export const appTokenInputs = (repository: string, permissions: Record<string, string>): string[] =>
+  [
+    'client-id: ${{ vars.TIBIA_SH_APP_CLIENT_ID }}',
+    'private-key: ${{ secrets.TIBIA_SH_APP_PRIVATE_KEY }}',
+    'owner: tibia-sh',
+    `repositories: ${repository}`,
+    ...Object.entries(permissions).map(([name, level]) => `permission-${name}: ${level}`),
+  ].sort();
+
 /** A scalar key's value at a block's shallowest indentation. */
 export const scalar = (block: string, key: string): string | undefined => {
   const depth = Math.min(...block.split('\n').filter((line) => line.trim() !== '').map((line) => line.search(/\S/)));
@@ -81,6 +101,14 @@ export const stepInputs = (step: string): string => {
   assert.equal(new Set(names).size, names.length, `${stepName(step)} sets an input more than once`);
   return inputs;
 };
+
+/** A step's `$GITHUB_OUTPUT` as a map. Every line is `name=value`, or the calling test fails. */
+export const stepOutputs = (text: string): Record<string, string> =>
+  Object.fromEntries(text.split('\n').filter((line) => line !== '').map((line) => {
+    const at = line.indexOf('=');
+    assert.notEqual(at, -1, `an output line is not name=value: ${line}`);
+    return [line.slice(0, at), line.slice(at + 1)];
+  }));
 
 /** A step's `if:`, whether it is the first key on the `- ` line or a later one. */
 export const stepIf = (step: string): string | undefined => /^ *(?:- +)?if: *(.*)$/m.exec(step)?.[1];
