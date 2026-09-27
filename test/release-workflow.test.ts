@@ -189,7 +189,7 @@ test('every action in every workflow is pinned to a full commit SHA', () => {
   assert.ok(code(workflow()).includes('uses:'), 'release.yml uses no actions, so this check proves nothing for it');
 });
 
-test('every pnpm/setup step in every workflow runs a frozen install, and takes the pnpm version and Node from elsewhere', () => {
+test('every pnpm/setup step in every workflow runs a frozen install, but the drift pr job\'s, and takes the pnpm version and Node from elsewhere', () => {
   // With install and require-lockfile, the action runs `pnpm install --frozen-lockfile` itself and
   // saves its lockfile-verification record right after it. With `install: false` the record is
   // saved only at the end of the job, after the generator and the tests. A version input would be
@@ -200,11 +200,18 @@ test('every pnpm/setup step in every workflow runs a frozen install, and takes t
   for (const { file, job, step } of setups) {
     const inputs = stepInputs(step);
     const where = `pnpm/setup in the ${job} job of ${file}`;
-    assert.equal(scalar(inputs, 'install'), 'true', `${where} does not set install: true`);
-    assert.equal(scalar(inputs, 'require-lockfile'), 'true', `${where} does not set require-lockfile: true`);
     assert.equal(scalar(inputs, 'version'), undefined, `${where} sets a pnpm version beside packageManager`);
     assert.equal(scalar(inputs, 'runtime'), undefined, `${where} installs a runtime`);
+    // The one exception: drift's pr job mints the App token, so it installs pnpm alone, no dependency, and restores
+    // no cache, whose archive the build job could have planted. test/drift-workflow.test.ts pins its inputs.
+    if (file === 'drift.yml' && job === 'pr') {
+      assert.equal(scalar(inputs, 'install'), 'false', `${where} installs`);
+      continue;
+    }
+    assert.equal(scalar(inputs, 'install'), 'true', `${where} does not set install: true`);
+    assert.equal(scalar(inputs, 'require-lockfile'), 'true', `${where} does not set require-lockfile: true`);
   }
+  assert.equal(setups.filter(({ file, job }) => file === 'drift.yml' && job === 'pr').length, 1, 'expected one pnpm/setup in the drift pr job');
   // Without a runtime input, pnpm/setup installs every runtime package.json declares in
   // devEngines.runtime, so a runtime declared there lands on PATH ahead of setup-node's Node too.
   const manifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as {

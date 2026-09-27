@@ -105,7 +105,9 @@ its journal beside that. `.gitignore` excludes both, and must never exclude
 crawl.
 
 `pnpm test` pins the generator too. It fails for an index whose `database_info` `version`
-is anything but the one `test/data.test.ts` names. From `0.12.0`, the server's `build-index`
+is anything but the generator the pinned server installs: `test/data.test.ts` reads it from the
+first line of the server's shipped lock, `data/tibiawikisql-requirements.txt`, which reads
+`# tibiawikisql <version> and every dependency`. From `0.12.0`, the server's `build-index`
 runs tibia.sh's copy of tibiawiki-sql, and the `+tibiash.N` suffix of that version marks the
 copy. The major version covers only the server's enrichment tables, and no version covers the
 tables tibiawiki-sql writes.
@@ -127,15 +129,34 @@ is an error, every page carries the candidate index's `generate_time`, and every
 index comes back exactly once. `pnpm oldest-consumer` runs the same gate, and needs network
 access to npm.
 
-The sweep covers items only, not creatures, NPCs, quests or spells. So the generator pin in
-`test/data.test.ts` stays as the explicit decision point for a generator upgrade.
+The sweep covers items only, not creatures, NPCs, quests or spells. So the generator moves only
+with the server pin, and an index built by any other generator cannot publish.
 
 ### Drift
 
-`.github/workflows/drift.yml` rebuilds the index on Tuesdays and Fridays at 06:17 UTC, and
-when you run it by hand from the Actions tab. It digests the committed `index.db` with
-`scripts/index-digest.ts`, keeps a copy of it, runs `pnpm build-index`, digests the rebuilt
-index, and runs `pnpm test` against it. The run's log shows both digests.
+`.github/workflows/drift.yml` rebuilds the index on Tuesdays and Fridays at 06:17 UTC, when
+you run it by hand from the Actions tab, and when tibiawiki-mcp's release workflow sends the
+`repository_dispatch` event `server-release`, with `{"version": "<x.y.z>"}` as its payload,
+once npm accepted a server publish.
+
+Before the generator runs, its `Pin the server` step decides which server builds the index, with
+`scripts/server-pin.ts`:
+
+- A `server-release` dispatch names the version. The step checks it whole as `x.y.z`, and a
+  version above the pin moves the pin to it. One at the pin keeps it. One below the pin, such as
+  a dispatch that arrived after a newer server was pinned, is refused with a notice in the log:
+  the pin stays, and the run goes on as a scheduled run would.
+- Any other run moves the pin to the version npm lists as `latest` when that is above the pin,
+  so a release whose dispatch was lost is picked up by the next scheduled run.
+
+A move waits up to 15 minutes, checking every 30 seconds, until `npm view` lists the version's
+tarball and a `HEAD` on it answers 200, then runs `pnpm add -D --save-exact`. The step holds no
+token. It hands the `pr` job the server, whether the pin moved, and the SHA-256 of
+`package.json` and `pnpm-lock.yaml` as it built with them.
+
+The job then digests the committed `index.db` with `scripts/index-digest.ts`, keeps a copy of
+it, runs `pnpm build-index`, digests the rebuilt index, and runs `pnpm test` against it. The
+run's log shows both digests.
 
 The digest covers the whole index this package publishes: every table, and every column of
 it, generated and hidden columns included. It leaves out two things that change without the
@@ -151,24 +172,45 @@ The script refuses an index with no table or without the `version` row, and the 
 The same script digests both indexes, so a change to the script alone never opens a refresh.
 `test/index-digest.test.ts` pins what moves the digest and what does not.
 
-When the digests match, the run ends green and opens nothing. When they differ, the content
-changed, and `scripts/drift-guard.ts` compares the row counts of the kept copy with those of
-the rebuilt index. It holds the refresh for a person when:
+When the digests match and the pin stayed, the run ends green and opens nothing. When they
+differ, the content changed, and `scripts/drift-guard.ts` compares the kept copy with the
+rebuilt index. It holds the refresh for a person when:
 
 1. one of the eight main tables, `item`, `creature`, `npc`, `book`, `house`, `achievement`,
    `quest` and `spell`, lost more than 1% of its committed rows
 2. any table of the committed index is missing from the rebuilt one
 3. any table that had rows in the committed index has none
+4. any table or column of the committed index is gone from the rebuilt schema, as
+   `scripts/schema-diff.ts` finds it, since a published `^N` server can require it
 
-Growth never holds, and a table only the rebuilt index has is growth. Each reason is one line,
-one per table at most, such as `item lost 120 of 9,800 rows (1.2%)` or
-`table quest is empty, it had 370 rows`.
+Growth never holds, and a table or column only the rebuilt index has is growth. Each reason is
+one line, such as `item lost 120 of 9,800 rows (1.2%)`, `table quest is empty, it had 370 rows`
+or `creature.race_id is gone from the rebuilt index`. The row count reasons name a table once at
+most, and a table that went missing is named by both 2 and 4.
 
-The `pr` job then sets `version` to the next patch npm does not have, pushes the rebuilt
-`index.db` to the `drift/index` branch, and opens a pull request titled
+The job also reads the schema level from `scripts/schema-diff.ts`: `minor` when the rebuilt
+index added a table or a column, as [How the index is built](#how-the-index-is-built) says a minor may,
+and `patch` otherwise. A changed `SCHEMA_VERSION` fails `pnpm test`, since the package major
+must equal it, so a new major ends the run red for a person rather than opening a pull request.
+
+The `pr` job first checks each value the build job handed on whole: `changed` and `pin_moved`
+are `true` or `false`, the level is `patch` or `minor`, and the server is `x.y.z`, above `main`'s
+pin when it moved and `main`'s pin when it did not. The build job ran the generator, so the `pr`
+job takes none of its files but the index. When the pin moved, it recomputes the pin itself with
+`pnpm add --lockfile-only --ignore-scripts --ignore-pnpmfile`, which installs nothing and runs no
+dependency code, requires that the recompute changed `package.json` and `pnpm-lock.yaml` alone,
+and `package.json` only in the server's version, and requires both files to hash to what the
+build job built with. Its `pnpm/setup` installs pnpm alone and restores no cache.
+
+When the content changed, it sets `version` to the next patch or minor npm does not have, as
+the level says, pushes the rebuilt `index.db`, with the moved pin if there is one, to the
+`drift/index` branch, and opens a pull request titled
 `chore: release a refreshed index as X.Y.Z` that carries both digests, or updates the one
-already open. It pushes and opens with a token of the tibia-sh App, so the pull request's CI
-starts by itself. [The tibia-sh App](RELEASING.md#the-tibia-sh-app) says what that token can do.
+already open. When only the pin moved, the pull request carries `package.json` and
+`pnpm-lock.yaml` alone, at the version `main` has, is titled `chore: pin the server at X.Y.Z`,
+and says that merging it publishes nothing. It pushes and opens with a token of the tibia-sh
+App, so the pull request's CI starts by itself.
+[The tibia-sh App](RELEASING.md#the-tibia-sh-app) says what that token can do.
 
 After the push and the update, the job reads the pull request again. When it merged or closed
 between the lookup and the push, the job opens a new one for `drift/index` and goes on with
@@ -192,9 +234,10 @@ refresh, comments on the issue `Automation needs a look`, or opens it assigned t
 `alert.yml` comments on the same issue for a `release.yml` run that does not succeed.
 [When automation needs a look](RELEASING.md#when-automation-needs-a-look) says what to do.
 
-- A tripped gate, a failing test, a guard that cannot read an index, an unreadable registry, or
-  a `version` on `main` that npm does not list yet each end the run red before anything is
-  pushed. A pull request closed without merging, merged at another commit, left with auto-merge
+- A tripped gate, a failing test, a guard that cannot read an index, an unreadable registry, a
+  dispatch that names no `x.y.z` version, a server npm does not serve within 15 minutes, a
+  build job output or a recomputed pin the `pr` job does not accept, or a `version` on `main`
+  that npm does not list yet each end the run red before anything is pushed. A pull request closed without merging, merged at another commit, left with auto-merge
   off, or not merged within 60 minutes ends it red after the push.
 - Each run that finds a change replaces `drift/index`, so an open pull request always carries
   the newest rebuild. A held pull request you leave open is not frozen: when a later run's
@@ -211,15 +254,15 @@ refresh, comments on the issue `Automation needs a look`, or opens it assigned t
 the index, and its `serve` validates it, in `pnpm test` here and in `pnpm smoke` against
 an installed copy.
 
-**When to bump it.** It is pinned to an exact version, so it moves only by a commit, and
-a test in `test/drift-workflow.test.ts` fails on a range. Bump it whenever the server's
-indexer changes: `build-index`, its enrichment, its gates or the schema. `pnpm add -D`
-keeps the old range style of an existing entry, so write the exact version by hand, then
-run `pnpm install`.
+**How it moves.** It is pinned to an exact version, and a test in
+`test/drift-workflow.test.ts` fails on a range. The drift job moves it: each server release
+sends `server-release`, and each scheduled run picks up a newer `latest`, as [Drift](#drift)
+says. Its pull request, a refresh or a pin-only one, carries the new pin. To move it by hand,
+run `pnpm add -D --save-exact @tibia.sh/tibiawiki-mcp@X.Y.Z`.
 
-When the bump brings a new generator release, you change two pins: the exact server version in
-`package.json` and the generator version in `test/data.test.ts`. A generator bump no longer edits
-the README. The README links to the releases page of tibia.sh's copy and names no release.
+A server release that brings a new generator needs no second change: `test/data.test.ts` reads
+the generator version from the pinned server's shipped lock. The README links to the releases
+page of tibia.sh's copy and names no release.
 
 The drift job's digest is this repository's own `scripts/index-digest.ts`, so a bump never
 changes how an index is digested. When the new `build-index` produces other content, the
