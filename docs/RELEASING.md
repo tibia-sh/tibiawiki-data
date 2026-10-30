@@ -210,9 +210,10 @@ holds a refresh, comments on one issue, titled `Automation needs a look`, opened
 the run opens it. A run assigns `drptbl` only when it opens the issue, so a comment on an issue
 someone unassigned stays unassigned. Runs that write the issue take turns, so none of them is
 dropped. A run whose write fails, most often on a GitHub API error, tries again after 30, 60, 120
-and 240 seconds. Each try finds the issue again, so a write that went through before its error is
-not repeated, and the alert job ends red only when all 5 tries fail. Each comment links the run
-and says what happened:
+and 240 seconds. Each try lists the open issues again, so an issue opened before its error is
+found and commented on, and the retry never opens a second issue. At worst it repeats a comment:
+one that went through before its error is posted again. The alert job ends red only when all 5
+tries fail. Each comment links the run and says what happened:
 
 | The comment says | What to do |
 |---|---|

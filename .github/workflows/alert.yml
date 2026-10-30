@@ -31,7 +31,8 @@ jobs:
       # issue with this title that github-actions[bot] opened counts, not a pull request. A failed
       # list ends the attempt, so it never opens a second issue. bash ignores set -e in a function
       # called before &&, so each command that can fail returns by itself. Each try lists again, so
-      # a write that landed before its error is found and commented on, not opened a second time.
+      # an issue opened before its error is found and commented on, not opened a second time. At
+      # worst a comment that went through before its error is posted again.
       - name: Comment on the alert issue, or open it
         id: alert
         env:
