@@ -34,8 +34,8 @@ jobs:
   build:
     runs-on: ubuntu-latest
     # The 3.0.0 build took just under six minutes on a laptop. The rest is room for the pin
-    # step's wait of up to 15 minutes for npm, for uv, and for the wiki API's retries.
-    timeout-minutes: 60
+    # step's wait of up to 45 minutes for npm, for uv, and for the wiki API's retries.
+    timeout-minutes: 90
     # It runs the generator over content anyone can edit, so it can only read.
     permissions:
       contents: read
@@ -76,7 +76,7 @@ jobs:
           require-lockfile: true
       # The server this run builds and tests the index with, before the generator runs: the version
       # a server-release dispatch asks for, or the newest npm lists, as scripts/server-pin.ts
-      # decides. A move waits up to 15 minutes, checking every 30 seconds, until npm lists the
+      # decides. A move waits up to 45 minutes, checking every 30 seconds, until npm lists the
       # version and its tarball answers, since pnpm add fails on a version npm does not serve yet.
       # The step holds no token. The dispatch's version is data, checked whole before any use. The
       # hashes of the two manifests let the pr job require the ones this job built index.db with.
@@ -118,7 +118,7 @@ jobs:
               # How often and how long the wait polls, from the environment so the tests can
               # shorten them.
               poll=${POLL_SECONDS:-30}
-              limit=${DEADLINE_SECONDS:-900}
+              limit=${DEADLINE_SECONDS:-2700}
               for value in "$poll" "$limit"; do
                 if [[ ! $value =~ ^[0-9]+$ ]]; then
                   echo "Not a whole number of seconds: '$value'" >&2

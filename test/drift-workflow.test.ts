@@ -366,9 +366,9 @@ test('drift runs take turns in their own concurrency group, and none is cancelle
   assert.match(concurrency, /^ *cancel-in-progress: *false$/m, 'cancel-in-progress is not false');
 });
 
-test('the build job is bounded in time', () => {
+test('the build job is bounded at 90 minutes, room for the 45 minute wait for npm and the build', () => {
   // A wiki API that keeps answering 429 with a long Retry-After must end the run, red.
-  assert.match(scalar(buildJob(), 'timeout-minutes') ?? '', /^[1-9]\d*$/, 'the build job has no timeout-minutes');
+  assert.equal(scalar(buildJob(), 'timeout-minutes'), '90');
 });
 
 test('every action in the drift workflow is pinned to a full commit SHA, with its version beside it', () => {
@@ -1222,7 +1222,8 @@ type PinScenario = {
   listed?: string[];
   heads?: string[];
   pins?: boolean;
-  env?: Record<string, string>;
+  /** An undefined value leaves that variable unset, so the step falls back to its default. */
+  env?: NodeJS.ProcessEnv;
 };
 
 /** Runs the build job's pin step in a checkout that pins `pin`, against a stand-in npm, curl and pnpm. */
@@ -1282,6 +1283,12 @@ test('on its schedule, the pin step moves the pin to the latest server once npm 
     { command: 'curl', args: ['--silent', '--head', '--output', '/dev/null', '--write-out', '%{http_code}', '--max-time', '30', tarballOf('0.14.1')] },
     { command: 'pnpm', args: ['add', '-D', '--save-exact', '@tibia.sh/tibiawiki-mcp@0.14.1'] },
   ]);
+});
+
+test('the pin step waits up to 2700 seconds for npm unless told otherwise', () => {
+  const run = runPin({ latest: '0.14.1\n', listed: [`${tarballOf('0.14.1')}\n`], env: { DEADLINE_SECONDS: undefined } });
+  assert.equal(run.status, 0, run.log);
+  assert.match(run.log, /^Waiting up to 2700 seconds for npm to serve server 0\.14\.1\.$/m, 'the default deadline is not 2700 seconds');
 });
 
 test('on a server-release dispatch, the pin step waits for npm to list the version and serve its tarball, then pins it', () => {
