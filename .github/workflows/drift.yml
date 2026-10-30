@@ -896,8 +896,9 @@ jobs:
             fi
           }
 
-          # One GitHub API error would otherwise drop the alert. Each try lists again, so a write
-          # that landed before its error is found and commented on, not opened a second time.
+          # One GitHub API error would otherwise drop the alert. Each try lists again, so an issue
+          # opened before its error is found and commented on, not opened a second time. At worst a
+          # comment that went through before its error is posted again.
           for delay in 30 60 120 240; do
             write_alert && exit 0
             echo "::warning::Writing the alert issue failed. Trying again in $delay seconds."
