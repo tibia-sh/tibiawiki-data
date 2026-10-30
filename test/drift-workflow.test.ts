@@ -43,14 +43,16 @@ const PR_NO_CACHE = '.pr-job-restores-no-cache';
  * event, so the build job fetches main's tip and builds on it, and the pr job moves to the commit the build job
  * handed on once it is a commit of main no older than the event's. The build move is three lines: under bash -e a
  * failed fetch in a `fetch && switch` line would not end the script, which would then hand on the event's commit, and
- * the pr move accepts that one. A change to either has to change this test on purpose.
+ * the pr move accepts that one. The pr move fetches main's history with blob:none, not tree:0: git 2.56.0 crashes
+ * repacking a tree:0 unshallow fetch once main has moved past the checkout's commit, and the fixture tests of the pr
+ * move, which run real git, catch that on the git CI has. A change to either has to change this test on purpose.
  */
 const BUILD_MOVE_RUN = String.raw`git fetch --depth=1 origin main
 git switch --detach FETCH_HEAD
 echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 `;
 const PR_MOVE_RUN = String.raw`[[ $SHA =~ ^[0-9a-f]{40}$ ]] || { echo 'the build job handed on no full commit SHA' >&2; exit 1; }
-git fetch --filter=tree:0 --unshallow origin +refs/heads/main:refs/remotes/origin/main
+git fetch --filter=blob:none --unshallow origin +refs/heads/main:refs/remotes/origin/main
 git merge-base --is-ancestor "$SHA" refs/remotes/origin/main || { echo 'not a commit of main' >&2; exit 1; }
 git merge-base --is-ancestor "$GITHUB_SHA" "$SHA" || { echo "older than the event's commit" >&2; exit 1; }
 git fetch origin "$SHA" && git switch --detach "$SHA"
