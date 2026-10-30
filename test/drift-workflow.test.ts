@@ -411,7 +411,9 @@ test('no run script in the drift workflow interpolates an expression', () => {
 });
 
 test('every checkout keeps no credentials and takes no ref, and is the first step of its job', () => {
-  // Each checkout takes the event's commit, and the step right after it moves the job to the tip of main.
+  // Each checkout takes the event's commit. On main, the step right after it moves the build job to the tip of main,
+  // and the pr job to the commit the build job handed on, which main can have moved past since. A dispatch from
+  // another branch skips the build job's move, and runs no pr job.
   for (const [job, list] of [['build', steps(buildJob())], ['pr', steps(prJob())]] as const) {
     const checkouts = list.filter((step) => /uses: *actions\/checkout@/.test(step));
     assert.equal(checkouts.length, 1, `expected one checkout in the ${job} job`);
@@ -515,15 +517,23 @@ const moveFixture = (): MoveRepo => {
 
 /**
  * Runs one of the moves as the runner does, `bash -e` with GITHUB_SHA at the event's commit, in a checkout of that
- * commit alone, as actions/checkout leaves it. `origin` serves the repository in place of the fixture's. git is real.
+ * commit alone, as actions/checkout leaves it. `fetch` is one more commit the checkout holds before the move, and
+ * `origin` serves the repository in place of the fixture's. git is real.
  */
-const runMove = (script: string, { sha, origin }: { sha?: string; origin?: string } = {}) => {
+const runMove = (script: string, { sha, fetch, origin }: { sha?: string; fetch?: string; origin?: string } = {}) => {
   const repo = moveFixture();
   const work = moveScratch('checkout');
   gitIn(work, ['init', '--quiet']);
   gitIn(work, ['remote', 'add', 'origin', `file://${repo.origin}`]);
   gitIn(work, ['fetch', '--quiet', '--no-tags', '--depth=1', 'origin', repo.event]);
   gitIn(work, ['switch', '--quiet', '--detach', repo.event]);
+  if (fetch !== undefined) gitIn(work, ['fetch', '--quiet', '--no-tags', '--depth=1', 'origin', fetch]);
+  const has = (commit: string): boolean =>
+    spawnSync('git', ['cat-file', '-e', `${commit}^{commit}`], {
+      cwd: work,
+      env: { PATH: process.env['PATH'] ?? '', HOME: work, GIT_CONFIG_NOSYSTEM: '1', GIT_NO_LAZY_FETCH: '1' },
+    }).status === 0;
+  const held = fetch === undefined || has(fetch);
   if (origin !== undefined) gitIn(work, ['remote', 'set-url', 'origin', origin]);
   const output = join(work, '.github-output');
   writeFileSync(output, '');
@@ -544,6 +554,8 @@ const runMove = (script: string, { sha, origin }: { sha?: string; origin?: strin
     stderr: run.stderr,
     output: readFileSync(output, 'utf8'),
     head: gitIn(work, ['rev-parse', 'HEAD']),
+    /** Whether the checkout held the commit `fetch` names before the move ran. */
+    held,
     log: `${run.stdout}${run.stderr}`,
   };
 };
@@ -573,8 +585,18 @@ test("the pr move switches to a commit of main at or after the event's, and refu
     assert.equal(run.status, 0, `the move refused ${what}\n${run.log}`);
     assert.equal(run.head, sha, `the move did not switch to ${what}`);
   }
+  // A commit outside main that the checkout holds, so the ancestry check itself refuses it, without an error from git.
+  const side = runMove(script, { sha: repo.side, fetch: repo.side });
+  assert.ok(side.held, 'the checkout does not hold the side commit before the move');
+  assert.equal(side.status, 1, `the move did not end red on a commit outside main it holds\n${side.log}`);
+  assert.equal(side.head, repo.event, "the move left the event's commit on a commit outside main it holds");
+  assert.ok(side.stderr.split('\n').includes('not a commit of main'), `the move did not say not a commit of main\n${side.log}`);
+  assert.doesNotMatch(side.stderr, /fatal|error/i, `git failed on the side commit, so the ancestry check decided nothing\n${side.log}`);
+  // The move's filtered fetch makes origin a promisor, so git fetches a commit outside main it does not hold when the
+  // ancestry check asks for it, and one origin does not serve is refused as well.
   const refused: Array<[string, string, string]> = [
-    ['a commit outside main', repo.side, 'not a commit of main'],
+    ['a commit outside main the checkout does not hold', repo.side, 'not a commit of main'],
+    ['a commit origin does not serve', 'f'.repeat(40), 'not a commit of main'],
     ["a commit of main older than the event's", repo.root, "older than the event's commit"],
     ['no commit SHA', 'nope', 'the build job handed on no full commit SHA'],
     // A dispatch from another branch hands on no commit, and its pr job does not run. Were it to, it moves nowhere.
