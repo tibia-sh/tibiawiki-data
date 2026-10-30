@@ -149,7 +149,7 @@ Before the generator runs, its `Pin the server` step decides which server builds
 - Any other run moves the pin to the version npm lists as `latest` when that is above the pin,
   so a release whose dispatch was lost is picked up by the next scheduled run.
 
-A move waits up to 15 minutes, checking every 30 seconds, until `npm view` lists the version's
+A move waits up to 45 minutes, checking every 30 seconds, until `npm view` lists the version's
 tarball and a `HEAD` on it answers 200, then runs `pnpm add -D --save-exact`. The step holds no
 token. It hands the `pr` job the server, whether the pin moved, and the SHA-256 of
 `package.json` and `pnpm-lock.yaml` as it built with them.
@@ -237,7 +237,7 @@ refresh, comments on the issue `Automation needs a look`, or opens it assigned t
 [When automation needs a look](RELEASING.md#when-automation-needs-a-look) says what to do.
 
 - A tripped gate, a failing test, a guard that cannot read an index, an unreadable registry, a
-  dispatch that names no `x.y.z` version, a server npm does not serve within 15 minutes, a
+  dispatch that names no `x.y.z` version, a server npm does not serve within 45 minutes, a
   build job output or a recomputed pin the `pr` job does not accept, or a `version` on `main`
   that npm does not list yet each end the run red before anything is pushed. A pull request closed without merging, merged at another commit, left with auto-merge
   off, or not merged within 60 minutes ends it red after the push.
