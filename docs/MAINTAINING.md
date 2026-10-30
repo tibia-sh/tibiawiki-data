@@ -242,7 +242,8 @@ that. Auto-merge is turned on or off from what this read shows.
 
 A run on `main` whose `build` or `pr` job fails, times out or is cancelled, or that holds a
 refresh, comments on the issue `Automation needs a look`, or opens it assigned to `drptbl`.
-`alert.yml` comments on the same issue for a `release.yml` run that does not succeed.
+`alert.yml` comments on the same issue for a `release.yml` run that does not succeed. Both try
+again after 30, 60, 120 and 240 seconds when writing the issue fails.
 [When automation needs a look](RELEASING.md#when-automation-needs-a-look) says what to do.
 
 - A tripped gate, a failing test, a guard that cannot read an index, an unreadable registry, a
