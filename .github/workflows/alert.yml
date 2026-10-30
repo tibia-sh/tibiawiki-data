@@ -19,16 +19,19 @@ jobs:
   alert:
     if: ${{ github.event.workflow_run.conclusion != 'success' && github.event.workflow_run.conclusion != 'skipped' && github.event.workflow_run.conclusion != 'neutral' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # The step waits up to 450 seconds between its 5 tries. The rest is room for their API calls.
+    timeout-minutes: 15
     # Comments on one issue with github.token. It checks nothing out and runs no action.
     permissions:
       issues: write
     concurrency: { group: automation-alert, cancel-in-progress: false, queue: max }
     steps:
-      # The event's fields reach the shell through env. The issue is found and opened as drift.yml's
-      # alert job finds and opens it: the list, not the search API, which lags, and only an open
+      # The event's fields reach the shell through env. The issue is found, opened and tried again as
+      # drift.yml's alert job does it: the list, not the search API, which lags, and only an open
       # issue with this title that github-actions[bot] opened counts, not a pull request. A failed
-      # list ends the step, so it never opens a second issue.
+      # list ends the attempt, so it never opens a second issue. bash ignores set -e in a function
+      # called before &&, so each command that can fail returns by itself. Each try lists again, so
+      # a write that landed before its error is found and commented on, not opened a second time.
       - name: Comment on the alert issue, or open it
         id: alert
         env:
@@ -40,18 +43,26 @@ jobs:
         run: |
           title='Automation needs a look'
           text=$(printf 'Run: %s\n\nThe %s workflow did not succeed. Its conclusion is %s.' "$RUN_URL" "$WORKFLOW" "$CONCLUSION")
-          issues="$RUNNER_TEMP/issues.json"
-          gh api "repos/$GH_REPO/issues?state=open&per_page=100" --paginate --slurp > "$issues"
-          number=$(node -e '
-            const [file, title] = process.argv.slice(1);
-            const found = JSON.parse(require("node:fs").readFileSync(file, "utf8")).flat().find((issue) =>
-              issue.title === title && issue.user?.login === "github-actions[bot]" && issue.pull_request === undefined);
-            if (found) process.stdout.write(String(found.number));
-          ' "$issues" "$title")
-          if [ -n "$number" ]; then
-            gh api --method POST "repos/$GH_REPO/issues/$number/comments" -f body="$text" --jq .html_url
-          else
-            intro='The drift and release workflows comment here when a run on main does not succeed, and drift when it holds a refresh for review. Close this issue once each comment is dealt with, and the next alert opens a new one.'
-            gh api --method POST "repos/$GH_REPO/issues" -f title="$title" -f 'assignees[]=drptbl' \
-              -f body="$(printf '%s\n\n%s' "$intro" "$text")" --jq .html_url
-          fi
+          write_alert() {
+            issues="$RUNNER_TEMP/issues.json"
+            gh api "repos/$GH_REPO/issues?state=open&per_page=100" --paginate --slurp > "$issues" || return 1
+            number=$(node -e '
+              const [file, title] = process.argv.slice(1);
+              const found = JSON.parse(require("node:fs").readFileSync(file, "utf8")).flat().find((issue) =>
+                issue.title === title && issue.user?.login === "github-actions[bot]" && issue.pull_request === undefined);
+              if (found) process.stdout.write(String(found.number));
+            ' "$issues" "$title") || return 1
+            if [ -n "$number" ]; then
+              gh api --method POST "repos/$GH_REPO/issues/$number/comments" -f body="$text" --jq .html_url || return 1
+            else
+              intro='The drift and release workflows comment here when a run on main does not succeed, and drift when it holds a refresh for review. Close this issue once each comment is dealt with, and the next alert opens a new one.'
+              gh api --method POST "repos/$GH_REPO/issues" -f title="$title" -f 'assignees[]=drptbl' \
+                -f body="$(printf '%s\n\n%s' "$intro" "$text")" --jq .html_url || return 1
+            fi
+          }
+          for delay in 30 60 120 240; do
+            write_alert && exit 0
+            echo "::warning::Writing the alert issue failed. Trying again in $delay seconds."
+            sleep "$delay"
+          done
+          write_alert

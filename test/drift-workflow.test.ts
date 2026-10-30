@@ -355,7 +355,7 @@ test('the alert job runs on main alone, after both jobs, when one did not succee
     "${{ always() && github.ref == 'refs/heads/main' && (needs.build.result != 'success' || (needs.pr.result != 'success' && needs.pr.result != 'skipped') || needs.build.outputs.hold == 'true') }}",
     'the alert job is not gated on main and on a job that did not succeed or a hold');
   assert.equal(scalar(alert, 'runs-on'), 'ubuntu-latest');
-  assert.equal(scalar(alert, 'timeout-minutes'), '5', 'the alert job is not bounded at 5 minutes');
+  assert.equal(scalar(alert, 'timeout-minutes'), '15', 'the alert job is not bounded at 15 minutes');
 });
 
 test('the alert job holds exactly issues: write, checks nothing out and comments with github.token', () => {
@@ -1947,6 +1947,19 @@ test('a pin-only run proposes package.json and pnpm-lock.yaml alone, at the same
 /** The title the alert job looks for and opens its issue with. */
 const ALERT_TITLE = 'Automation needs a look';
 
+/**
+ * How each step that writes the alert issue tries again, word for word, the same in the repositories that write one. One
+ * GitHub API error would otherwise drop the alert. The waits add up to 450 seconds, inside each job's 15 minutes. A
+ * change has to change this test on purpose.
+ */
+const ALERT_RETRY = String.raw`for delay in 30 60 120 240; do
+  write_alert && exit 0
+  echo "::warning::Writing the alert issue failed. Trying again in $delay seconds."
+  sleep "$delay"
+done
+write_alert
+`;
+
 const ALERT_ENV = {
   GH_TOKEN: 'stand-in-token-value',
   BUILD_RESULT: 'success',
@@ -1967,14 +1980,55 @@ const NOT_ALERT_ISSUES = [
   { number: 33, title: `${ALERT_TITLE} again`, user: BOT },
 ];
 
-/** A stand-in gh that lists `issues` as one page, answers a write with a URL, and exits `listExit` for the list. */
-const fakeAlertGh = (issues: unknown[], listExit = 0): string =>
-  `const args = process.argv.slice(2);\n` +
-  `if (args.includes('--method')) process.stdout.write('https://github.com/tibia-sh/tibiawiki-data/issues/40\\n');\n` +
-  `else { process.stdout.write(${JSON.stringify(`${JSON.stringify([issues])}\n`)}); process.exitCode = ${listExit}; }\n`;
+/** The issue an open creates, which every list after it finds. */
+const OPENED_ISSUE = { number: 40, title: ALERT_TITLE, user: BOT };
 
-const runAlert = (issues: unknown[], env: Record<string, string> = ALERT_ENV, listExit = 0) =>
-  runStep(stepScript(workflow(), 'alert'), { commands: { gh: fakeAlertGh(issues, listExit) }, env });
+/**
+ * How the stand-in gh exits for each call of one kind, in turn, the last one repeated. A failed list still prints the
+ * issues, so a step that went on to read them would comment.
+ */
+type AlertExits = { lists?: number[]; comments?: number[]; opens?: number[] };
+
+/**
+ * A stand-in gh that lists `issues` as one page, answers a write with a URL, and exits for each call as `exits` says.
+ * An open lands even when it exits 1, as one whose answer GitHub lost does, so every list after it finds OPENED_ISSUE.
+ * Each call is a process of its own, so it keeps its counts and the open in RUNNER_TEMP.
+ */
+const fakeAlertGh = (issues: unknown[], { lists = [0], comments = [0], opens = [0] }: AlertExits = {}): string =>
+  `const fs = require('node:fs');\n` +
+  `const args = process.argv.slice(2);\n` +
+  `const opened = process.env.RUNNER_TEMP + '/alert-opened';\n` +
+  `const exit = (kind, exits) => {\n` +
+  `  const counter = process.env.RUNNER_TEMP + '/alert-' + kind;\n` +
+  `  const count = fs.existsSync(counter) ? Number(fs.readFileSync(counter, 'utf8')) : 0;\n` +
+  `  fs.writeFileSync(counter, String(count + 1));\n` +
+  `  return exits[Math.min(count, exits.length - 1)];\n` +
+  `};\n` +
+  `let code;\n` +
+  `if (!args.includes('--method')) {\n` +
+  `  code = exit('lists', ${JSON.stringify(lists)});\n` +
+  `  const issues = ${JSON.stringify(issues)};\n` +
+  `  if (fs.existsSync(opened)) issues.push(${JSON.stringify(OPENED_ISSUE)});\n` +
+  `  process.stdout.write(JSON.stringify([issues]) + '\\n');\n` +
+  `} else {\n` +
+  `  const comment = args.some((arg) => arg.endsWith('/comments'));\n` +
+  `  if (!comment) fs.writeFileSync(opened, '');\n` +
+  `  code = comment ? exit('comments', ${JSON.stringify(comments)}) : exit('opens', ${JSON.stringify(opens)});\n` +
+  `  if (code === 0) process.stdout.write('https://github.com/tibia-sh/tibiawiki-data/issues/40\\n');\n` +
+  `}\n` +
+  `if (code !== 0) { process.stderr.write('gh: Server Error (HTTP 502)\\n'); process.exitCode = code; }\n`;
+
+/** The alert's calls to gh of each kind, by their arguments, and the waits it slept, by their seconds. */
+const alertLists = (calls: Call[]): string[][] => ghCalls(calls).filter((args) => !args.includes('--method'));
+const alertComments = (calls: Call[]): string[][] =>
+  ghCalls(calls).filter((args) => args.includes('--method') && args.some((arg) => arg.endsWith('/comments')));
+const alertOpens = (calls: Call[]): string[][] =>
+  ghCalls(calls).filter((args) => args.includes('--method') && !args.some((arg) => arg.endsWith('/comments')));
+const alertSleeps = (calls: Call[]): string[] => calls.filter((call) => call.command === 'sleep').map((call) => call.args.join(' '));
+
+/** The alert with a stand-in sleep that returns at once, so a test of its retries waits for nothing. */
+const runAlert = (issues: unknown[], env: Record<string, string> = ALERT_ENV, exits: AlertExits = {}) =>
+  runStep(stepScript(workflow(), 'alert'), { commands: { gh: fakeAlertGh(issues, exits), sleep: '' }, env });
 
 test('the alert comments on the open alert issue with the run and the reasons it held', () => {
   const run = runAlert([...NOT_ALERT_ISSUES, ALERT_ISSUE]);
@@ -2030,11 +2084,13 @@ test('the alert names each job that did not succeed, and its result', () => {
   assert.doesNotMatch(flagValues(ghCalls(held.calls).find((args) => args.includes('--method'))!, '-f')[0]!, /pr job/);
 });
 
-test('the alert opens nothing when it cannot list the open issues', () => {
+test('the alert lists 5 times, waiting longer each time, and opens nothing when it cannot list the open issues', () => {
   // Opening one then would put a second alert issue beside the first.
-  const run = runAlert([ALERT_ISSUE], ALERT_ENV, 1);
+  const run = runAlert([ALERT_ISSUE], ALERT_ENV, { lists: [1] });
   assert.notEqual(run.status, 0, `the step passed when the list failed\n${run.log}`);
   assert.equal(ghCalls(run.calls).filter((args) => args.includes('--method')).length, 0, 'the step wrote after the list failed');
+  assert.equal(alertLists(run.calls).length, 5, 'the step did not list exactly 5 times');
+  assert.deepEqual(alertSleeps(run.calls), ['30', '60', '120', '240']);
 });
 
 /**
@@ -2059,8 +2115,9 @@ const RELEASE_ALERT_ENV = {
 
 const RELEASE_ALERT_TEXT = 'Run: https://github.com/tibia-sh/tibiawiki-data/actions/runs/99\n\nThe release workflow did not succeed. Its conclusion is failure.';
 
-const runReleaseAlert = (issues: unknown[], listExit = 0) =>
-  runStep(stepScript(alertWorkflow(), 'alert'), { commands: { gh: fakeAlertGh(issues, listExit) }, env: RELEASE_ALERT_ENV });
+/** alert.yml's step, with the stand-in sleep runAlert uses. */
+const runReleaseAlert = (issues: unknown[], exits: AlertExits = {}) =>
+  runStep(stepScript(alertWorkflow(), 'alert'), { commands: { gh: fakeAlertGh(issues, exits), sleep: '' }, env: RELEASE_ALERT_ENV });
 
 test('alert.yml runs for a release run, matched by release.yml\'s exact name', () => {
   // workflow_run matches a workflow by its name:, and a name that matches none runs nothing, with no error.
@@ -2081,7 +2138,7 @@ test('alert.yml grants nothing by default, and its one job comments with github.
   const job = releaseAlertJob();
   assert.deepEqual(sortedLines(under(job, 'permissions')), ['issues: write']);
   assert.equal(scalar(job, 'runs-on'), 'ubuntu-latest');
-  assert.equal(scalar(job, 'timeout-minutes'), '5', 'the alert job is not bounded at 5 minutes');
+  assert.equal(scalar(job, 'timeout-minutes'), '15', 'the alert job is not bounded at 15 minutes');
   assert.doesNotMatch(job, /^ *(?:- +)?uses:/m, 'the alert job runs an action');
   const list = steps(job);
   assert.equal(list.length, 1, 'expected exactly one alert job step');
@@ -2104,6 +2161,10 @@ test('drift and release find and open the alert issue by one rule, with one text
   assert.equal(lookup('alert.yml'), lookup('drift.yml'), 'alert.yml finds its issue by another rule');
   assert.ok(intro('drift.yml'), 'drift.yml opens its issue with no intro');
   assert.equal(intro('alert.yml'), intro('drift.yml'), 'alert.yml opens its issue with another intro');
+  // And both end by trying it again the same way, word for word.
+  for (const file of ['drift.yml', 'alert.yml']) {
+    assert.ok(stepScript(read(file), 'alert').trimEnd().endsWith(ALERT_RETRY.trimEnd()), `${file} does not end with the retry loop`);
+  }
 });
 
 test('the release alert comments on the open alert issue with the run and its conclusion', () => {
@@ -2134,8 +2195,55 @@ test('the release alert opens the issue, assigned to the maintainer, when none o
   }
 });
 
-test('the release alert opens nothing when it cannot list the open issues', () => {
-  const run = runReleaseAlert([ALERT_ISSUE], 1);
+test('the release alert lists 5 times, waiting longer each time, and opens nothing when it cannot list the open issues', () => {
+  const run = runReleaseAlert([ALERT_ISSUE], { lists: [1] });
   assert.notEqual(run.status, 0, `the step passed when the list failed\n${run.log}`);
   assert.equal(ghCalls(run.calls).filter((args) => args.includes('--method')).length, 0, 'the step wrote after the list failed');
+  assert.equal(alertLists(run.calls).length, 5, 'the step did not list exactly 5 times');
+  assert.deepEqual(alertSleeps(run.calls), ['30', '60', '120', '240']);
+});
+
+/** Both writers of the alert issue, each run against the stand-in gh with `issues` open and its exits. */
+const ALERT_WRITERS: Array<[string, (issues: unknown[], exits: AlertExits) => ReturnType<typeof runStep>]> = [
+  ['drift.yml', (issues, exits) => runAlert(issues, ALERT_ENV, exits)],
+  ['alert.yml', runReleaseAlert],
+];
+
+test('each alert lists again after a failed list, and comments once it finds the issue', () => {
+  for (const [file, run] of ALERT_WRITERS) {
+    const result = run([ALERT_ISSUE], { lists: [1, 0] });
+    assert.equal(result.status, 0, `${file}\n${result.log}`);
+    assert.equal(alertLists(result.calls).length, 2, `${file} did not list again`);
+    assert.deepEqual(alertComments(result.calls).map((args) => args.find((arg) => arg.endsWith('/comments'))),
+      ['repos/tibia-sh/tibiawiki-data/issues/30/comments'], `${file} did not comment once on issue 30`);
+    assert.equal(alertOpens(result.calls).length, 0, `${file} opened an issue`);
+    assert.deepEqual(alertSleeps(result.calls), ['30'], `${file} did not wait 30 seconds once`);
+    assert.match(result.log, /::warning::Writing the alert issue failed\. Trying again in 30 seconds\./, `${file} did not warn`);
+  }
+});
+
+test('each alert lists again after a failed comment, and comments on the issue it finds', () => {
+  for (const [file, run] of ALERT_WRITERS) {
+    const result = run([ALERT_ISSUE], { comments: [1, 0] });
+    assert.equal(result.status, 0, `${file}\n${result.log}`);
+    assert.equal(alertLists(result.calls).length, 2, `${file} did not list again`);
+    assert.deepEqual(alertComments(result.calls).map((args) => args.find((arg) => arg.endsWith('/comments'))),
+      ['repos/tibia-sh/tibiawiki-data/issues/30/comments', 'repos/tibia-sh/tibiawiki-data/issues/30/comments'],
+      `${file} did not comment again on issue 30`);
+    assert.equal(alertOpens(result.calls).length, 0, `${file} opened an issue`);
+    assert.deepEqual(alertSleeps(result.calls), ['30'], `${file} did not wait 30 seconds once`);
+  }
+});
+
+test('each alert comments on the issue a failed open created, and never opens a second one', () => {
+  // GitHub can create the issue and still answer with an error. The next attempt lists again and finds it.
+  for (const [file, run] of ALERT_WRITERS) {
+    const result = run([], { opens: [1] });
+    assert.equal(result.status, 0, `${file}\n${result.log}`);
+    assert.equal(alertOpens(result.calls).length, 1, `${file} did not open exactly one issue`);
+    assert.equal(alertLists(result.calls).length, 2, `${file} did not list again`);
+    assert.deepEqual(alertComments(result.calls).map((args) => args.find((arg) => arg.endsWith('/comments'))),
+      ['repos/tibia-sh/tibiawiki-data/issues/40/comments'], `${file} did not comment once on the issue it opened`);
+    assert.deepEqual(alertSleeps(result.calls), ['30'], `${file} did not wait 30 seconds once`);
+  }
 });

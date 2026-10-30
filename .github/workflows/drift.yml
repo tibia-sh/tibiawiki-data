@@ -833,7 +833,8 @@ jobs:
     # changed or the build job did not succeed.
     if: ${{ always() && github.ref == 'refs/heads/main' && (needs.build.result != 'success' || (needs.pr.result != 'success' && needs.pr.result != 'skipped') || needs.build.outputs.hold == 'true') }}
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # The step waits up to 450 seconds between its 5 tries. The rest is room for their API calls.
+    timeout-minutes: 15
     # Comments on one issue with github.token. It checks nothing out and runs no action. It takes
     # turns with alert.yml, which writes the same issue, and none of their waiting runs is replaced,
     # so no alert is dropped and no second issue is opened.
@@ -873,21 +874,33 @@ jobs:
 
           # The list, not the search API, which lags. A pull request is an issue to this endpoint,
           # and anyone can open an issue with this title, so only one github-actions[bot] opened
-          # counts. A failed list ends the step here, so it never opens a second issue. The pages go
+          # counts. A failed list ends the attempt, so it never opens a second issue. The pages go
           # to a file, since a page of issue bodies can be longer than one argument may be.
-          # alert.yml finds and opens the issue with this same program and intro.
-          issues="$RUNNER_TEMP/issues.json"
-          gh api "repos/$GITHUB_REPOSITORY/issues?state=open&per_page=100" --paginate --slurp > "$issues"
-          number=$(node -e '
-            const [file, title] = process.argv.slice(1);
-            const found = JSON.parse(require("node:fs").readFileSync(file, "utf8")).flat().find((issue) =>
-              issue.title === title && issue.user?.login === "github-actions[bot]" && issue.pull_request === undefined);
-            if (found) process.stdout.write(String(found.number));
-          ' "$issues" "$title")
-          if [ -n "$number" ]; then
-            gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$number/comments" -f body="$text" --jq .html_url
-          else
-            intro='The drift and release workflows comment here when a run on main does not succeed, and drift when it holds a refresh for review. Close this issue once each comment is dealt with, and the next alert opens a new one.'
-            gh api --method POST "repos/$GITHUB_REPOSITORY/issues" -f title="$title" -f 'assignees[]=drptbl' \
-              -f body="$(printf '%s\n\n%s' "$intro" "$text")" --jq .html_url
-          fi
+          # alert.yml finds and opens the issue with this same program and intro. bash ignores set -e
+          # in a function called before &&, so each command that can fail returns by itself.
+          write_alert() {
+            issues="$RUNNER_TEMP/issues.json"
+            gh api "repos/$GITHUB_REPOSITORY/issues?state=open&per_page=100" --paginate --slurp > "$issues" || return 1
+            number=$(node -e '
+              const [file, title] = process.argv.slice(1);
+              const found = JSON.parse(require("node:fs").readFileSync(file, "utf8")).flat().find((issue) =>
+                issue.title === title && issue.user?.login === "github-actions[bot]" && issue.pull_request === undefined);
+              if (found) process.stdout.write(String(found.number));
+            ' "$issues" "$title") || return 1
+            if [ -n "$number" ]; then
+              gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$number/comments" -f body="$text" --jq .html_url || return 1
+            else
+              intro='The drift and release workflows comment here when a run on main does not succeed, and drift when it holds a refresh for review. Close this issue once each comment is dealt with, and the next alert opens a new one.'
+              gh api --method POST "repos/$GITHUB_REPOSITORY/issues" -f title="$title" -f 'assignees[]=drptbl' \
+                -f body="$(printf '%s\n\n%s' "$intro" "$text")" --jq .html_url || return 1
+            fi
+          }
+
+          # One GitHub API error would otherwise drop the alert. Each try lists again, so a write
+          # that landed before its error is found and commented on, not opened a second time.
+          for delay in 30 60 120 240; do
+            write_alert && exit 0
+            echo "::warning::Writing the alert issue failed. Trying again in $delay seconds."
+            sleep "$delay"
+          done
+          write_alert

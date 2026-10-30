@@ -209,7 +209,10 @@ holds a refresh, comments on one issue, titled `Automation needs a look`, opened
 `main` that does not succeed. An assignee is subscribed to the issue. When no such issue is open,
 the run opens it. A run assigns `drptbl` only when it opens the issue, so a comment on an issue
 someone unassigned stays unassigned. Runs that write the issue take turns, so none of them is
-dropped. Each comment links the run and says what happened:
+dropped. A run whose write fails, most often on a GitHub API error, tries again after 30, 60, 120
+and 240 seconds. Each try finds the issue again, so a write that went through before its error is
+not repeated, and the alert job ends red only when all 5 tries fail. Each comment links the run
+and says what happened:
 
 | The comment says | What to do |
 |---|---|
