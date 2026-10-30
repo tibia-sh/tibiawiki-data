@@ -1,7 +1,10 @@
-import { test } from 'node:test';
+import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { APP_TOKEN_ACTION, appTokenInputs, type Call, code, keys, read, runScripts, runStep, scalar, sortedLines, stepBody, stepIf, stepOutputs, stepIndex, stepInputs, stepName, steps, stepScript, under } from './workflow.ts';
 
 /**
@@ -34,6 +37,24 @@ const RECOMPUTE_ADD = 'pnpm add -D --save-exact --lockfile-only --ignore-scripts
  * the generator, could have planted the archive. So the job that gets the App token restores and saves no cache.
  */
 const PR_NO_CACHE = '.pr-job-restores-no-cache';
+
+/**
+ * The moves to the tip of main, word for word. A run that waited behind another one is given main as it was at its
+ * event, so the build job fetches main's tip and builds on it, and the pr job moves to the commit the build job
+ * handed on once it is a commit of main no older than the event's. The build move is three lines: under bash -e a
+ * failed fetch in a `fetch && switch` line would not end the script, which would then hand on the event's commit, and
+ * the pr move accepts that one. A change to either has to change this test on purpose.
+ */
+const BUILD_MOVE_RUN = String.raw`git fetch --depth=1 origin main
+git switch --detach FETCH_HEAD
+echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+`;
+const PR_MOVE_RUN = String.raw`[[ $SHA =~ ^[0-9a-f]{40}$ ]] || { echo 'the build job handed on no full commit SHA' >&2; exit 1; }
+git fetch --filter=tree:0 --unshallow origin +refs/heads/main:refs/remotes/origin/main
+git merge-base --is-ancestor "$SHA" refs/remotes/origin/main || { echo 'not a commit of main' >&2; exit 1; }
+git merge-base --is-ancestor "$GITHUB_SHA" "$SHA" || { echo "older than the event's commit" >&2; exit 1; }
+git fetch origin "$SHA" && git switch --detach "$SHA"
+`;
 
 /**
  * The scripts of the pr job's steps that check what the build job handed on, word for word. The build job runs
@@ -389,13 +410,181 @@ test('no run script in the drift workflow interpolates an expression', () => {
   }
 });
 
-test('every checkout keeps no credentials and takes the commit that triggered the run', () => {
-  // The build job rebuilds that commit, and the pr job commits on top of the same one.
-  const checkouts = [...steps(buildJob()), ...steps(prJob())].filter((step) => /uses: *actions\/checkout@/.test(step));
-  assert.equal(checkouts.length, 2, 'expected one checkout in each job');
-  for (const step of checkouts) {
-    assert.match(step, /^ *persist-credentials: *false$/m, 'a checkout leaves the token in .git/config');
-    assert.doesNotMatch(step, /^ *ref:/m, 'a checkout takes a ref instead of the triggering commit');
+test('every checkout keeps no credentials and takes no ref, and is the first step of its job', () => {
+  // Each checkout takes the event's commit, and the step right after it moves the job to the tip of main.
+  for (const [job, list] of [['build', steps(buildJob())], ['pr', steps(prJob())]] as const) {
+    const checkouts = list.filter((step) => /uses: *actions\/checkout@/.test(step));
+    assert.equal(checkouts.length, 1, `expected one checkout in the ${job} job`);
+    assert.match(list[0]!, /uses: *actions\/checkout@/, `the ${job} job's first step is not its checkout`);
+    assert.match(checkouts[0]!, /^ *persist-credentials: *false$/m, `the ${job} job's checkout leaves the token in .git/config`);
+    assert.doesNotMatch(checkouts[0]!, /^ *ref:/m, `the ${job} job's checkout takes a ref instead of the event's commit`);
+  }
+});
+
+test('the build job moves to the tip of main right after its checkout, on main alone, and hands that commit on', () => {
+  // A run that waited behind another one is given main as it was at its event, which the run before it can have
+  // moved. The move comes before the install and every script, so all of them read the tip. A dispatch from another
+  // branch builds that branch, and hands on no commit, since the pr job runs on main alone.
+  const list = steps(buildJob());
+  const move = stepIndex(list, 'main');
+  assert.equal(move, 1, 'the move to the tip of main is not the first step after the checkout');
+  assert.equal(scalar(stepBody(list[move]!), 'name'), 'Move to the tip of main');
+  assert.equal(stepIf(list[move]!), "${{ github.ref == 'refs/heads/main' }}", 'the move does not run exactly on main');
+  assert.equal(stepScript(workflow(), 'main'), BUILD_MOVE_RUN, 'the move runs another script');
+  assert.equal(under(stepBody(list[move]!), 'env'), '', 'the move gets an env');
+  assert.doesNotMatch(list[move]!, /\bsecrets\b|\bgithub\.token\b|\bsteps\.token\b|_TOKEN\b/, 'the move holds a token');
+  assert.equal(scalar(under(buildJob(), 'outputs'), 'sha'), '${{ steps.main.outputs.sha }}', 'the build job hands on another commit');
+});
+
+test("the pr job moves to the build job's commit right after its checkout, before anything reads the checkout", () => {
+  // The build job runs the generator, so the commit it hands on is data: the move checks it whole, and switches to it
+  // only once it is a commit of main that descends from the event's. Every step after the move reads that commit.
+  const list = steps(prJob());
+  const move = stepIndex(list, 'move');
+  assert.equal(move, 1, "the move to the build job's commit is not the first step after the checkout");
+  assert.equal(scalar(stepBody(list[move]!), 'name'), "Move to the build job's commit");
+  assert.equal(stepIf(list[move]!), undefined, 'the move runs only sometimes');
+  assert.equal(stepScript(workflow(), 'move'), PR_MOVE_RUN, 'the move runs another script');
+  assert.deepEqual(sortedLines(under(stepBody(list[move]!), 'env')), ['SHA: ${{ needs.build.outputs.sha }}'],
+    'the move gets more than the commit the build job handed on');
+  // The steps that read HEAD, the working tree or commit, by what they run.
+  const readers = list.flatMap((step, index) => (/\bgit\b|\bHEAD\b|package\.json/.test(step) && index !== move ? [index] : []));
+  assert.ok(readers.length >= 3, 'the pr job has fewer steps that read the checkout than this test expects');
+  for (const index of readers) {
+    assert.ok(index > move, `${stepName(list[index]!)} reads the checkout before the move`);
+  }
+});
+
+/** Runs git in `dir` with a fixed identity and none of the user's or the system's config. */
+const gitIn = (dir: string, args: string[]): string =>
+  execFileSync('git', args, {
+    cwd: dir,
+    encoding: 'utf8',
+    env: {
+      PATH: process.env['PATH'] ?? '',
+      HOME: dir,
+      GIT_CONFIG_NOSYSTEM: '1',
+      GIT_AUTHOR_NAME: 'Drift Test',
+      GIT_AUTHOR_EMAIL: 'drift-test@example.com',
+      GIT_COMMITTER_NAME: 'Drift Test',
+      GIT_COMMITTER_EMAIL: 'drift-test@example.com',
+    },
+  }).trim();
+
+/**
+ * A repository served as origin, as GitHub serves this one: main at `root`, `event` and `tip`, in that order, and a
+ * side branch with one commit, `side`, on `event`. A run whose event was at `event` waited while `tip` landed.
+ */
+type MoveRepo = { origin: string; root: string; event: string; tip: string; side: string };
+
+let moveDir: string | undefined;
+let moveRepo: MoveRepo | undefined;
+after(() => {
+  if (moveDir !== undefined) rmSync(moveDir, { recursive: true, force: true });
+});
+
+/** A new directory under the one the move tests share, which is removed once the file's tests end. */
+const moveScratch = (name: string): string => {
+  moveDir ??= mkdtempSync(join(tmpdir(), 'tibiawiki-data-move-'));
+  return mkdtempSync(join(moveDir, `${name}-`));
+};
+
+const moveFixture = (): MoveRepo => {
+  if (moveRepo !== undefined) return moveRepo;
+  const origin = moveScratch('origin');
+  gitIn(origin, ['init', '--quiet', '--bare', '--initial-branch=main']);
+  // The pr move fetches with a filter, which a file:// origin refuses with a warning unless this allows it.
+  gitIn(origin, ['config', 'uploadpack.allowFilter', 'true']);
+  const src = moveScratch('src');
+  gitIn(src, ['init', '--quiet', '--initial-branch=main']);
+  const commit = (name: string): string => {
+    writeFileSync(join(src, `${name}.txt`), `${name}\n`);
+    gitIn(src, ['add', '--all']);
+    gitIn(src, ['commit', '--quiet', '--message', name]);
+    return gitIn(src, ['rev-parse', 'HEAD']);
+  };
+  const root = commit('root');
+  const event = commit('event');
+  const tip = commit('tip');
+  gitIn(src, ['switch', '--quiet', '--detach', event]);
+  const side = commit('side');
+  gitIn(src, ['push', '--quiet', `file://${origin}`, `${tip}:refs/heads/main`, `${side}:refs/heads/side`]);
+  moveRepo = { origin, root, event, tip, side };
+  return moveRepo;
+};
+
+/**
+ * Runs one of the moves as the runner does, `bash -e` with GITHUB_SHA at the event's commit, in a checkout of that
+ * commit alone, as actions/checkout leaves it. `origin` serves the repository in place of the fixture's. git is real.
+ */
+const runMove = (script: string, { sha, origin }: { sha?: string; origin?: string } = {}) => {
+  const repo = moveFixture();
+  const work = moveScratch('checkout');
+  gitIn(work, ['init', '--quiet']);
+  gitIn(work, ['remote', 'add', 'origin', `file://${repo.origin}`]);
+  gitIn(work, ['fetch', '--quiet', '--no-tags', '--depth=1', 'origin', repo.event]);
+  gitIn(work, ['switch', '--quiet', '--detach', repo.event]);
+  if (origin !== undefined) gitIn(work, ['remote', 'set-url', 'origin', origin]);
+  const output = join(work, '.github-output');
+  writeFileSync(output, '');
+  const run = spawnSync('bash', ['-e', '-c', script], {
+    cwd: work,
+    encoding: 'utf8',
+    env: {
+      PATH: process.env['PATH'] ?? '',
+      HOME: work,
+      GIT_CONFIG_NOSYSTEM: '1',
+      GITHUB_SHA: repo.event,
+      GITHUB_OUTPUT: output,
+      ...(sha === undefined ? {} : { SHA: sha }),
+    },
+  });
+  return {
+    status: run.status,
+    stderr: run.stderr,
+    output: readFileSync(output, 'utf8'),
+    head: gitIn(work, ['rev-parse', 'HEAD']),
+    log: `${run.stdout}${run.stderr}`,
+  };
+};
+
+test('the build move takes a checkout of the event commit to the tip of main, and hands the tip on', () => {
+  const { tip } = moveFixture();
+  const run = runMove(stepScript(workflow(), 'main'));
+  assert.equal(run.status, 0, run.log);
+  assert.equal(run.head, tip, 'the build job did not move to the tip of main');
+  assert.equal(run.output, `sha=${tip}\n`);
+});
+
+test('the build move ends red, and hands no commit on, when it cannot fetch main', () => {
+  // A failed fetch must not go on to hand on the event's commit, which the pr move would accept.
+  const { event } = moveFixture();
+  const run = runMove(stepScript(workflow(), 'main'), { origin: `file://${moveScratch('missing')}/nowhere.git` });
+  assert.notEqual(run.status, 0, `the move passed when the fetch failed\n${run.log}`);
+  assert.equal(run.output, '', 'the move handed a commit on when the fetch failed');
+  assert.equal(run.head, event);
+});
+
+test("the pr move switches to a commit of main at or after the event's, and refuses any other", () => {
+  const repo = moveFixture();
+  const script = stepScript(workflow(), 'move');
+  for (const [what, sha] of [['the tip of main', repo.tip], ["the event's commit", repo.event]] as const) {
+    const run = runMove(script, { sha });
+    assert.equal(run.status, 0, `the move refused ${what}\n${run.log}`);
+    assert.equal(run.head, sha, `the move did not switch to ${what}`);
+  }
+  const refused: Array<[string, string, string]> = [
+    ['a commit outside main', repo.side, 'not a commit of main'],
+    ["a commit of main older than the event's", repo.root, "older than the event's commit"],
+    ['no commit SHA', 'nope', 'the build job handed on no full commit SHA'],
+    // A dispatch from another branch hands on no commit, and its pr job does not run. Were it to, it moves nowhere.
+    ['nothing', '', 'the build job handed on no full commit SHA'],
+  ];
+  for (const [what, sha, message] of refused) {
+    const run = runMove(script, { sha });
+    assert.equal(run.status, 1, `the move did not end red on ${what}\n${run.log}`);
+    assert.equal(run.head, repo.event, `the move left the event's commit on ${what}`);
+    assert.ok(run.stderr.split('\n').includes(message), `the move did not say ${message} on ${what}\n${run.log}`);
   }
 });
 
@@ -575,7 +764,7 @@ test('every output and step value the jobs pass along is one that is written', (
     .map((match) => [match[1]!, { step: match[2]!, name: match[3]! }]));
   assert.equal(outputs.split('\n').filter((line) => line.trim() !== '').length, declared.size, 'the build job declares an output this test cannot read');
   assert.deepEqual([...declared.keys()].sort(),
-    ['changed', 'committed', 'hold', 'level', 'package_json_sha256', 'pin_moved', 'pnpm_lock_sha256', 'reasons', 'rebuilt', 'server', 'sha256']);
+    ['changed', 'committed', 'hold', 'level', 'package_json_sha256', 'pin_moved', 'pnpm_lock_sha256', 'reasons', 'rebuilt', 'server', 'sha', 'sha256']);
   // The guard and the schema level run only when the content changed, and a skipped step's output is
   // empty, so hold falls back to false and level to patch. Nothing else may fall back.
   assert.equal(scalar(outputs, 'hold'), "${{ steps.guard.outputs.hold || 'false' }}", 'hold does not fall back to false');
@@ -1403,6 +1592,7 @@ test('the schema level fails, and hands nothing on, when the schemas cannot be c
 /** The pr job's steps, each named by its id, or by the action it uses when it has none. */
 const PR_STEPS = [
   'actions/checkout',
+  'move',
   'actions/setup-node',
   'check',
   'pnpm/setup',

@@ -1,16 +1,16 @@
 name: drift
 
-# Pins the newest server, rebuilds index.db with it from the live wiki and compares its content
-# with the committed index. When the content changed, it pushes drift/index with the rebuilt
-# index and the next patch version, or the next minor when the schema grew, opens or updates its
-# pull request as the tibia-sh App, turns on auto-merge and waits for the merge. The ruleset
-# merges it once test and oldest-consumer pass, and that merge publishes through release.yml.
-# When only the pin moved, the pull request carries package.json and pnpm-lock.yaml alone, at the
-# same version, and its merge publishes nothing. Nothing here publishes by itself. A refresh that
-# loses rows, or a table or column, as scripts/drift-guard.ts decides, is held instead: its pull
-# request stays open with auto-merge off until a person merges or closes it. A run on main that
-# fails or holds a refresh comments on the one alert issue, which alert.yml also writes for
-# release.yml, assigned to the maintainer.
+# Pins the newest server, rebuilds index.db with it from the live wiki on the tip of main and
+# compares its content with the committed index. When the content changed, it pushes drift/index
+# with the rebuilt index and the next patch version, or the next minor when the schema grew, opens
+# or updates its pull request as the tibia-sh App, turns on auto-merge and waits for the merge.
+# The ruleset merges it once test and oldest-consumer pass, and that merge publishes through
+# release.yml. When only the pin moved, the pull request carries package.json and pnpm-lock.yaml
+# alone, at the same version, and its merge publishes nothing. Nothing here publishes by itself. A
+# refresh that loses rows, or a table or column, as scripts/drift-guard.ts decides, is held
+# instead: its pull request stays open with auto-merge off until a person merges or closes it. A
+# run on main that fails or holds a refresh comments on the one alert issue, which alert.yml also
+# writes for release.yml, assigned to the maintainer.
 
 on:
   schedule:
@@ -25,7 +25,9 @@ on:
 permissions: {}
 
 # Runs take turns, so two cannot push drift/index at once. One in progress is never
-# cancelled. The group is not release.yml's, so a drift run never holds up a publish.
+# cancelled. The group is not release.yml's, so a drift run never holds up a publish. A run
+# that waited is still given main as it was at its event, and the run before it may have merged
+# since, so the build job moves to the tip of main and the pr job to the build job's commit.
 concurrency:
   group: drift
   cancel-in-progress: false
@@ -40,6 +42,9 @@ jobs:
     permissions:
       contents: read
     outputs:
+      # The commit the job built on, the tip of main when it started. A dispatch from another branch
+      # skips the move and hands on nothing, which is safe only while the pr job runs on main alone.
+      sha: ${{ steps.main.outputs.sha }}
       committed: ${{ steps.digests.outputs.committed }}
       rebuilt: ${{ steps.digests.outputs.rebuilt }}
       sha256: ${{ steps.digests.outputs.sha256 }}
@@ -59,6 +64,19 @@ jobs:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
+      # The move to the tip of main, before the install and the scripts read anything, so a run that
+      # waited behind another one builds on what that run merged. The checkout kept no credentials,
+      # and the fetch needs none, since the repository is public. Three lines, not one joined with
+      # &&: under bash -e a failed fetch there would not end the step, which would then hand on the
+      # event's commit, and the pr job accepts that one. A dispatch from another branch builds that
+      # branch as it was.
+      - name: Move to the tip of main
+        id: main
+        if: ${{ github.ref == 'refs/heads/main' }}
+        run: |
+          git fetch --depth=1 origin main
+          git switch --detach FETCH_HEAD
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       # No cache, restored or saved, but pnpm/setup's lockfile-verification record. A cache saved
       # after the generator ran would carry whatever that run left into later runs. This setup-node
       # caches by itself whenever package.json names a packageManager, so it is switched off by name.
@@ -299,10 +317,30 @@ jobs:
       contents: read         # the checkout. The App token does every write.
       pull-requests: read    # the wait for the merge, which reads with github.token
     steps:
-      # No ref: the commit that triggered the run, which is the one the build job rebuilt.
+      # No ref: the checkout takes the event's commit, which main can have moved past while the run
+      # waited. The build job built index.db on the tip of main, so the job moves to that commit
+      # next, and commits on top of the main the refresh was built from.
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
+      # Before any step reads the checkout. A job output is data, so it is checked whole before git
+      # reads it. The build job runs the generator, which could hand on any commit a fetch by SHA
+      # reaches, a pull request's head or an older commit of main among them, and this job commits
+      # on it with the App token. The build job moved to main's tip after the event, so before the
+      # switch the commit must be in main's history and descend from GITHUB_SHA, the event's commit,
+      # which the runner sets. The shallow checkout reaches back to the event's commit only, so the
+      # history is fetched whole, commits without their trees, and the switch fetches the trees it
+      # needs.
+      - name: Move to the build job's commit
+        id: move
+        env:
+          SHA: ${{ needs.build.outputs.sha }}
+        run: |
+          [[ $SHA =~ ^[0-9a-f]{40}$ ]] || { echo 'the build job handed on no full commit SHA' >&2; exit 1; }
+          git fetch --filter=tree:0 --unshallow origin +refs/heads/main:refs/remotes/origin/main
+          git merge-base --is-ancestor "$SHA" refs/remotes/origin/main || { echo 'not a commit of main' >&2; exit 1; }
+          git merge-base --is-ancestor "$GITHUB_SHA" "$SHA" || { echo "older than the event's commit" >&2; exit 1; }
+          git fetch origin "$SHA" && git switch --detach "$SHA"
       # Switched off by name here too. Left on, it would restore a pnpm store cache.
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:

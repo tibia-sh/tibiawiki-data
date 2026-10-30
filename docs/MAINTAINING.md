@@ -139,6 +139,11 @@ you run it by hand from the Actions tab, and when tibiawiki-mcp's release workfl
 `repository_dispatch` event `server-release`, with `{"version": "<x.y.z>"}` as its payload,
 once npm accepted a server publish.
 
+Runs take turns, and a run that waited is given `main` as it was at its event, which the run
+before it can have moved with a merge. So the build job's first step after its checkout fetches
+the tip of `main` and switches to it, before the install and every script, and hands that commit
+to the `pr` job. A run on another branch builds that branch as it is.
+
 Before the generator runs, its `Pin the server` step decides which server builds the index, with
 `scripts/server-pin.ts`:
 
@@ -193,14 +198,18 @@ index added a table or a column, as [How the index is built](#how-the-index-is-b
 and `patch` otherwise. A changed `SCHEMA_VERSION` fails `pnpm test`, since the package major
 must equal it, so a new major ends the run red for a person rather than opening a pull request.
 
-The `pr` job first checks each value the build job handed on whole: `changed` and `pin_moved`
-are `true` or `false`, the level is `patch` or `minor`, and the server is `x.y.z`, above `main`'s
-pin when it moved and `main`'s pin when it did not. The build job ran the generator, so the `pr`
-job takes none of its files but the index. When the pin moved, it recomputes the pin itself with
-`pnpm add --lockfile-only --ignore-scripts --ignore-pnpmfile`, which installs nothing and runs no
-dependency code, requires that the recompute changed `package.json` and `pnpm-lock.yaml` alone,
-and `package.json` only in the server's version, and requires both files to hash to what the
-build job built with. Its `pnpm/setup` installs pnpm alone and restores no cache.
+The `pr` job first moves to the commit the build job built on, before any step reads its
+checkout. It switches only once the commit is a full SHA, is in `main`'s history and descends
+from the commit of the run's event, so it never commits on a commit outside `main` or on one
+older than the event's. It then checks each value the build job handed on whole: `changed` and
+`pin_moved` are `true` or `false`, the level is `patch` or `minor`, and the server is `x.y.z`,
+above `main`'s pin when it moved and `main`'s pin when it did not. The build job ran the
+generator, so the `pr` job takes none of its files but the index. When the pin moved, it
+recomputes the pin itself with `pnpm add --lockfile-only --ignore-scripts --ignore-pnpmfile`,
+which installs nothing and runs no dependency code, requires that the recompute changed
+`package.json` and `pnpm-lock.yaml` alone, and `package.json` only in the server's version, and
+requires both files to hash to what the build job built with. Its `pnpm/setup` installs pnpm
+alone and restores no cache.
 
 When the content changed, it sets `version` to the next patch or minor npm does not have, as
 the level says, pushes the rebuilt `index.db`, with the moved pin if there is one, to the
@@ -237,10 +246,11 @@ refresh, comments on the issue `Automation needs a look`, or opens it assigned t
 [When automation needs a look](RELEASING.md#when-automation-needs-a-look) says what to do.
 
 - A tripped gate, a failing test, a guard that cannot read an index, an unreadable registry, a
-  dispatch that names no `x.y.z` version, a server npm does not serve within 45 minutes, a
-  build job output or a recomputed pin the `pr` job does not accept, or a `version` on `main`
-  that npm does not list yet each end the run red before anything is pushed. A pull request closed without merging, merged at another commit, left with auto-merge
-  off, or not merged within 60 minutes ends it red after the push.
+  fetch of `main` that fails, a dispatch that names no `x.y.z` version, a server npm does not
+  serve within 45 minutes, a build job commit, output or recomputed pin the `pr` job does not
+  accept, or a `version` on `main` that npm does not list yet each end the run red before
+  anything is pushed. A pull request closed without merging, merged at another commit, left with
+  auto-merge off, or not merged within 60 minutes ends it red after the push.
 - Each run that finds a change replaces `drift/index`, so an open pull request always carries
   the newest rebuild. A held pull request you leave open is not frozen: when a later run's
   guard finds no reason to hold, that run turns auto-merge on and it merges by itself.
